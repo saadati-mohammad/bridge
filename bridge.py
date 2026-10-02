@@ -5536,6 +5536,42 @@ def probe_models(kind: str, base_url: str, api_key: str) -> List[str]:
     return ids[:300]
 
 
+def remember_project(cfg: Dict[str, Any], project: Any, *, persist: bool = True) -> Path:
+    """Make the selected project the bridge-wide active project and remember it.
+
+    This is deliberately separate from Claude Code's process cwd: the dashboard and
+    the swarm page need the same canonical project context as the launcher.
+    """
+    raw = str(project or "").strip().strip('"').strip("'")
+    if not raw:
+        raise ValueError("project folder is required")
+    path = Path(raw).expanduser().resolve()
+    if not path.is_dir():
+        raise ValueError(f"not a folder: {path}")
+    value = str(path)
+    cfg["project_dir"] = value
+    recent = [str(x) for x in (cfg.get("recent_projects") or []) if str(x) != value]
+    cfg["recent_projects"] = [value, *recent][:8]
+    if persist:
+        save_config(cfg)
+    return path
+
+
+def set_project_context(pool: Any, project: Any) -> Dict[str, Any]:
+    """Update the running bridge's canonical project context.
+
+    Used when a second launcher process starts while the bridge is already alive;
+    the running bridge, not the short-lived launcher process, is the source of truth
+    for the dashboard.
+    """
+    path = remember_project(pool.cfg, project, persist=True)
+    try:
+        pool.event("info", f"active project changed to {path}")
+    except Exception:
+        pass
+    return {"ok": True, "project": str(path)}
+
+
 def dash_action(pool: Any, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
     if pool is None or not hasattr(pool, "snapshot"):
         raise ValueError("the account pool is not available")
@@ -5608,6 +5644,8 @@ def dash_action(pool: Any, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": True, "restart": restart, "settings": settings_view(pool.cfg)}
     elif action == "launch":
         return launch_claude_from_panel(pool, data)
+    elif action == "project_context":
+        return set_project_context(pool, data.get("project", ""))
     elif action == "fs":
         return {"ok": True, **fs_list(str(data.get("path", "")))}
     elif action == "mkdir":
@@ -5620,10 +5658,13 @@ def dash_action(pool: Any, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
     elif action == "task":
         return run_task(pool, str(data.get("name", "")))
     elif action == "swarm_start":
-        run = pool.swarm.start(str(data.get("goal", "")), str(data.get("project", "")), data.get("agents", "auto"),
+        swarm_project = str(data.get("project", ""))
+        run = pool.swarm.start(str(data.get("goal", "")), swarm_project, data.get("agents", "auto"),
                                str(data.get("verify", "auto")), str(data.get("review", "")), str(data.get("mode", "")),
                                str(data.get("tasks", "")), bool(data.get("strict")), bool(data.get("init_git", True)))
-        return {"ok": True, "id": run.id}
+        remember_project(pool.cfg, swarm_project, persist=True)
+        pool.event("info", f"swarm project selected: {run.project}")
+        return {"ok": True, "id": run.id, "project": run.project}
     elif action in ("swarm_stop", "swarm_agents", "swarm_apply", "swarm_cleanup"):
         run = pool.swarm.runs.get(str(data.get("run", "")))
         if run is None:
@@ -5863,10 +5904,7 @@ def launch_claude_from_panel(pool: Any, opts: Dict[str, Any]) -> Dict[str, Any]:
     if dry:
         return {"ok": True, "preview": b["preview"], "project": b["project"], "mode": b["mode"]}
     where = spawn_terminal(b["cmd"], b["project"], b["diff"], b["env"])
-    cfg["project_dir"] = b["project"]
-    recent = [p for p in (cfg.get("recent_projects") or []) if p != b["project"]]
-    cfg["recent_projects"] = ([b["project"]] + recent)[:8]
-    save_config(cfg)
+    remember_project(cfg, b["project"], persist=True)
     pool.event("ok", f"Claude Code started in {where}: {b['project']} [{b['mode']}]")
     return {"ok": True, "where": where, "project": b["project"], "mode": b["mode"]}
 
@@ -6026,6 +6064,24 @@ def install_claude_commands() -> None:
             f.write_text(text, encoding="utf-8")
     except Exception as exc:
         _warn_once("claude_cmds", f"could not install the /ds slash commands ({exc})")
+
+
+def ctl_project(cfg: Dict[str, Any], project: Any) -> int:
+    """Tell the already-running bridge which project the new launcher selected."""
+    import urllib.request
+    url = f"http://127.0.0.1:{cfg['port']}/dash/api/project_context"
+    req = urllib.request.Request(url, data=json.dumps({"project": str(project)}).encode(), method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Authorization": "Bearer " + str(cfg["api_key"])})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            result = json.loads(r.read().decode("utf-8", "replace"))
+        if result.get("project"):
+            print(C.green(f"[project] running bridge context updated: {result['project']}"))
+        return 0
+    except Exception as exc:
+        print(C.red(f"[project] could not update the running bridge context on port {cfg['port']} ({exc})"))
+        return 1
 
 
 def ctl_client(cfg: Dict[str, Any], command: str) -> int:
@@ -6508,15 +6564,15 @@ function setDock(on){$("#app").classList.toggle("dock",on);localStorage.dsb_dock
 /* ---------- swarm (parallel agents) ---------- */
 let swSel="",swMeta={runs:[],capacity:1},swOpen=new Set(),swPrev={},SW=null,swTimer=null;
 const beep=()=>{try{const a=new (window.AudioContext||window.webkitAudioContext)(),o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);o.frequency.value=880;g.gain.value=.06;o.start();setTimeout(()=>{o.stop();a.close()},180)}catch{}};
-function swForm(){const I=INFO||{};$("#swf").innerHTML=`<div class="box"><h3>🐝 ${t("swNew")}</h3><div class="fg"><textarea class="inp" id="sg" rows="3" placeholder="${esc(t("swGoalPh"))}"></textarea>
-<div class="fg2"><label>${t("lProj")}<div style="display:flex;gap:8px"><input class="inp mono" id="sp" value="${esc(LS.project||I.project||"")}"><button class="btn" id="sbrowse">${t("browse")}</button></div></label>
+function swForm(){const I=INFO||{};const project=I.project||LS.project||"";$("#swf").innerHTML=`<div class="box"><h3>🐝 ${t("swNew")}</h3><div class="fg"><textarea class="inp" id="sg" rows="3" placeholder="${esc(t("swGoalPh"))}"></textarea>
+<div class="fg2"><label>${t("lProj")}<div style="display:flex;gap:8px"><input class="inp mono" id="sp" data-auto-project="1" value="${esc(project)}"><button class="btn" id="sbrowse">${t("browse")}</button></div></label>
 <label>${t("swAgents")} <span class="tip" id="scap"></span><input class="inp" id="sa" type="number" min="1" max="32" placeholder="${t("swAuto")}"></label></div>
 <div class="fg2"><label>${t("swVerify")}<select class="inp" id="sv2" style="width:100%"><option value="auto">${t("swAuto")}</option><option value="off">${t("swOff")}</option></select></label>
 <label>${t("swReview")}<select class="inp" id="sr" style="width:100%"><option value="">${t("swAuto")}</option><option value="on">${t("swOn")}</option><option value="off">${t("swOff")}</option></select></label></div>
 <div class="row" style="margin:0"><label><span class="sw"><input type="checkbox" id="sst"><i></i></span> ${t("swStrict")}</label><label><span class="sw"><input type="checkbox" id="sgi" checked><i></i></span> ${t("swInit")}</label></div>
 <details><summary class="tip" style="cursor:pointer">${t("swManual")}</summary><textarea class="inp mono" id="stk" rows="4" placeholder="${esc(t("swManualPh"))}" style="margin-top:8px"></textarea></details>
 <div class="rowb" style="justify-content:flex-start"><button class="btn pri" id="sgo">🚀 ${t("swStart")}</button><span class="tip">${t("swTip")}</span></div></div></div>`}
-function enterSwarm(){loadInfo().catch(()=>{});if(!$("#sg"))swForm();pollSwarm();clearInterval(swTimer);swTimer=setInterval(pollSwarm,1500)}
+async function enterSwarm(){try{await loadInfo(true)}catch{};if(!$("#sg"))swForm();else if($("#sp")&&$("#sp").dataset.autoProject!=="0")$("#sp").value=INFO&&INFO.project?INFO.project:($("#sp").value||LS.project||"");pollSwarm();clearInterval(swTimer);swTimer=setInterval(pollSwarm,1500)}
 const sgp=s=>`<span class="stp sg-${s}">${t("sg_"+s)}</span>`;
 async function pollSwarm(){if(page!=="swarm"){clearInterval(swTimer);return}try{swMeta=await api("swarm");$("#scap").textContent=`(${t("capacity")}: ${swMeta.capacity})`;if(!swSel&&swMeta.runs[0])swSel=swMeta.runs[0].id;SW=swSel&&swMeta.runs.find(r=>r.id===swSel)?await api("swarm_run?id="+swSel):null;renderRuns()}catch{}}
 function renderRuns(){const R=SW,box=$("#swr");let h=`<div class="runs">${swMeta.runs.map(r=>`<div class="rn ${r.id===swSel?"on":""}" data-r="${r.id}">${sgp(r.status)} <b>${esc(r.id)}</b> <span class="tip">${esc(r.goal.slice(0,34))}</span></div>`).join("")||`<div class="tip">${t("swNone")}</div>`}</div>`;
@@ -6531,8 +6587,9 @@ ${R.contracts?`<details data-o="c" ${swOpen.has("c")?"open":""}><summary class="
 <details data-o="e" ${swOpen.has("e")?"open":""}><summary class="tip" style="cursor:pointer;margin-top:6px">📜 ${t("events")}</summary><div class="ev">${R.events.map(e=>`<div><time>${new Date(e.t*1e3).toLocaleTimeString()}</time>${esc(e.msg)}</div>`).join("")}</div></details></div>`}
 if(box.dataset.h!==h){box.dataset.h=h;box.innerHTML=h}}
 $("#swr").addEventListener("toggle",e=>{const d=e.target;if(d.dataset&&d.dataset.o){d.open?swOpen.add(d.dataset.o):swOpen.delete(d.dataset.o)}},true);
+$("#p-swarm").addEventListener("input",e=>{if(e.target.id==="sp")e.target.dataset.autoProject="0"});
 $("#p-swarm").addEventListener("click",async e=>{const rn=e.target.closest("[data-r]");if(rn){swSel=rn.dataset.r;$("#swr").dataset.h="";pollSwarm();return}
-if(e.target.id==="sbrowse"){const p=await pickFolder($("#sp").value);if(p)$("#sp").value=p;return}
+if(e.target.id==="sbrowse"){const p=await pickFolder($("#sp").value);if(p){$("#sp").value=p;$("#sp").dataset.autoProject="0"}return}
 if(e.target.id==="sgo"){const d={goal:$("#sg").value,project:$("#sp").value,agents:$("#sa").value||"auto",verify:$("#sv2").value,review:$("#sr").value,strict:$("#sst").checked,init_git:$("#sgi").checked,tasks:$("#stk").value};
 const r=await act("swarm_start",d);if(r){swSel=r.id;$("#swr").dataset.h="";toast("🐝 "+r.id);LS.project=d.project;pollSwarm()}return}
 const sa=e.target.closest("[data-sa]");if(sa&&SW){await act("swarm_agents",{run:SW.id,n:SW.max_agents+ +sa.dataset.sa});pollSwarm();return}
@@ -7546,6 +7603,34 @@ def self_test() -> None:
             assert pick_project_dir(cfg_t, "/definitely/not/here", False, here=True) == SCRIPT_DIR
             if not (sys.stdin and sys.stdin.isatty()):
                 assert _ask_project_dir(cfg_t) == SCRIPT_DIR and cfg_t["project_dir"] == str(SCRIPT_DIR)
+
+            # Active project context must be shared by the launcher, dashboard and swarm.
+            project_cfg = {"project_dir": str(SCRIPT_DIR), "recent_projects": [str(SCRIPT_DIR), str(Path(td))]}
+            remembered = remember_project(project_cfg, td, persist=False)
+            assert remembered == Path(td).resolve()
+            assert project_cfg["project_dir"] == str(Path(td).resolve())
+            assert project_cfg["recent_projects"][0] == str(Path(td).resolve())
+            assert project_cfg["recent_projects"].count(str(Path(td).resolve())) == 1
+
+            class _ProjectPool:
+                def __init__(self, cfg):
+                    self.cfg = cfg
+                    self.events = []
+                def snapshot(self):
+                    return {}
+                def event(self, level, msg):
+                    self.events.append((level, msg))
+
+            pp = _ProjectPool({"project_dir": str(SCRIPT_DIR), "recent_projects": []})
+            rctx = set_project_context(pp, td)
+            assert rctx["project"] == str(Path(td).resolve())
+            assert pp.cfg["project_dir"] == str(Path(td).resolve())
+            assert pp.events and str(Path(td).resolve()) in pp.events[-1][1]
+
+            # Regression guard for the dashboard's Team Agent project selector:
+            # the live bridge project must beat stale localStorage from an older launch.
+            assert 'const project=I.project||LS.project||""' in DASH_HTML
+            assert 'async function enterSwarm(){try{await loadInfo(true)}' in DASH_HTML
         finally:
             CONFIG_PATH = old_cfg_path
             if old_env_mode is not None:
@@ -8424,6 +8509,16 @@ def _selftest_swarm() -> None:
 
         def show(rev, path): return git(["show", f"{rev}:{path}"], proj, check=False)
         try:
+            # ---- project context regression: dashboard must follow the project selected by the launcher.
+            other = Path(td) / "other-project"
+            other.mkdir()
+            s, d = call("POST", "/dash/api/project_context", {"project": str(other)})
+            assert s == 200 and json.loads(d)["project"] == str(other.resolve())
+            s, d = call("GET", "/dash/api/info")
+            assert s == 200 and json.loads(d)["project"] == str(other.resolve())
+            s, d = call("POST", "/dash/api/project_context", {"project": str(proj)})
+            assert s == 200 and json.loads(d)["project"] == str(proj.resolve())
+
             # ---- activity feed + commands
             n0 = len(ACTIVITY)
             s, d = call("POST", "/s/swX.a9/v1/messages", {"model": "claude-sonnet-4", "max_tokens": 50, "messages": [{"role": "user", "content": "hello feed"}]})
@@ -9232,14 +9327,23 @@ def main() -> int:
             return 1
     if not ensure_dependencies(cfg, need_claude=not args.terminal):
         return 1
-    if not args.terminal and bridge_already_running(int(cfg["port"])):
-        # A second double-click: reuse the running bridge, just open another Claude Code.
+    bridge_reused = (not args.terminal and bridge_already_running(int(cfg["port"])))
+    if bridge_reused:
+        # A second launch must synchronize the selected project into the already-running
+        # bridge, because its in-memory config is what the dashboard exposes.
+        if project is not None:
+            if ctl_project(cfg, project) != 0:
+                # Keep the launcher process's saved context correct as a fallback.
+                # The running bridge remains the canonical source when the RPC succeeds.
+                remember_project(cfg, project, persist=True)
         for nm in args.add_account or []:
             ctl_client(cfg, "add " + nm)
         print(C.green(f"Bridge already running on port {cfg['port']}; starting another Claude Code."))
         print(C.dim(f"Project: {project}\nPermissions: {permission_mode_text(mode, mode_src, claude_extra)}"))
         return launch_claude(cfg, f"http://127.0.0.1:{cfg['port']}", project, claude_extra, mode)
 
+    if project is not None and not bridge_reused:
+        remember_project(cfg, project, persist=True)
     BRIDGE = Pool(cfg)
     for nm in args.add_account or []:
         BRIDGE.add_account(nm, start=False)
