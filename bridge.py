@@ -287,7 +287,7 @@ def _env_bool(name: str, default: bool) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
 
 
-VERSION = "6.3"
+VERSION = "6.4"
 SCRIPT_DIR = Path(__file__).resolve().parent
 CHAT_URL = os.getenv("DS_BRIDGE_CHAT_URL", "https://chat.deepseek.com/")
 # Absolute + anchored to the script so the login survives different cwd's.
@@ -362,6 +362,25 @@ CHARS_PER_TOKEN = _env_float("DS_BRIDGE_CHARS_PER_TOKEN", 4.0)
 PRIORITY_MAIN = 0
 PRIORITY_SIDE = 5
 
+BROWSER_STATES = ("CREATED", "STARTING", "LOGIN_REQUIRED", "READY", "BUSY",
+                  "WAITING_RESPONSE", "RECOVERING", "FAILED", "CLOSED")
+PARALLEL_MODES = ("serial", "light", "full", "auto")
+PARALLEL_MODE = os.getenv("DS_BRIDGE_PARALLEL_MODE", "auto").strip().lower()
+if PARALLEL_MODE not in PARALLEL_MODES:
+    PARALLEL_MODE = "auto"
+UI_MODE = os.getenv("DS_BRIDGE_UI_MODE", "beginner").strip().lower()
+if UI_MODE not in ("beginner", "pro"):
+    UI_MODE = "beginner"
+
+CLAUDE_HOOK_EVENT_UNION = (
+    "PreToolUse", "PermissionRequest", "PermissionDenied", "PostToolUse", "PostToolUseFailure",
+    "PostToolBatch", "Notification", "UserPromptSubmit", "UserPromptExpansion", "SessionStart",
+    "SessionEnd", "Stop", "StopFailure", "SubagentStart", "SubagentStop", "PreCompact", "PostCompact",
+    "TeammateIdle", "TaskCreated", "TaskCompleted", "Elicitation", "ElicitationResult", "ConfigChange",
+    "CwdChanged", "DirectoryAdded", "FileChanged", "WorktreeCreate", "WorktreeRemove",
+    "InstructionsLoaded", "Setup", "MessageDisplay", "PreModelSwitch", "PostModelSwitch",
+)
+
 
 # ============================================================================
 # ANSI colours + logging
@@ -403,24 +422,52 @@ LOG_FILE = None  # set in Claude mode so bridge logs never corrupt Claude's TUI
 
 LOG_RING: "deque" = deque(maxlen=3000)
 _LOG_SEQ = itertools.count(1)
+_LOG_SECRET_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"),
+    re.compile(r"(?i)(x-ds-bridge-hook-key\s*[:=]\s*)[^\s,;]+"),
+    re.compile(r"(?i)(api[_ -]?key\s*[:=]\s*)[^\s,;]+"),
+    re.compile(r"sk-ds-local-[A-Za-z0-9_-]+"),
+    re.compile(r"dsb-hook-[A-Za-z0-9_-]+"),
+)
+
+def _redact_log_text(text: Any) -> str:
+    s = str(text)
+    for pat in _LOG_SECRET_PATTERNS:
+        s = pat.sub(lambda m: ((m.group(1) if m.lastindex else "") + "[REDACTED]"), s)
+    return s[:2000]
 
 
-def log(msg: str, color: Optional[Callable[[Any], str]] = None) -> None:
+def log(msg: str, color: Optional[Callable[[Any], str]] = None, *,
+        provider: str = "", account: str = "", lane: str = "", project: str = "",
+        request_id: str = "", event: str = "") -> None:
     lvl = {"red": "error", "yellow": "warn", "green": "ok"}.get(getattr(color, "__name__", ""), "info")
+    safe_msg = _redact_log_text(msg)
+    context: Dict[str, str] = {}
+    for name, value in (("provider", provider), ("account", account), ("lane", lane),
+                        ("project", project), ("request_id", request_id), ("event", event)):
+        if value:
+            context[name] = _redact_log_text(value)
     seq = next(_LOG_SEQ)
-    LOG_RING.append((seq, time.time(), lvl, str(msg)))
+    now = time.time()
+    LOG_RING.append((seq, now, lvl, safe_msg))
     try:
-        emit_dash_event("console", {"n": seq, "t": time.time(), "level": lvl, "message": str(msg)[:500]})
+        item = {"n": seq, "t": now, "level": lvl, "message": safe_msg}
+        if context:
+            item["context"] = context
+        emit_dash_event("console", item)
     except Exception:
         pass
+    line = time.strftime("%H:%M:%S ") + safe_msg
+    if context:
+        line += " " + " ".join(f"{k}={v!r}" for k, v in context.items())
     if LOG_FILE is not None:
         try:
-            LOG_FILE.write(time.strftime("%H:%M:%S ") + msg + "\n")
+            LOG_FILE.write(line + "\n")
             LOG_FILE.flush()
         except Exception:
             pass
         return
-    print(color(msg) if color else msg, flush=True)
+    print(color(line) if color else line, flush=True)
 
 
 _dump_counter = itertools.count(1)
@@ -578,22 +625,22 @@ def save_config(cfg: Dict[str, Any]) -> None:
 
 
 def load_config() -> Dict[str, Any]:
-    cfg: Dict[str, Any] = {"port": DEFAULT_PORT, "api_key": None}
+    cfg: Dict[str, Any] = {"port": DEFAULT_PORT, "api_key": None, "hook_key": None}
     if CONFIG_PATH.exists():
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
-            if isinstance(loaded, dict):
-                cfg.update(loaded)
-        except Exception:
-            pass
+            if isinstance(loaded, dict): cfg.update(loaded)
+        except Exception as exc:
+            _warn_once("load_config", f"could not read {CONFIG_PATH} ({exc}); using defaults where needed")
+    changed = False
     if not cfg.get("api_key"):
-        cfg["api_key"] = "sk-ds-local-" + secrets.token_hex(24)
-        save_config(cfg)
-    try:
-        cfg["port"] = int(cfg.get("port", DEFAULT_PORT))
-    except Exception:
-        cfg["port"] = DEFAULT_PORT
+        cfg["api_key"] = "sk-ds-local-" + secrets.token_hex(24); changed = True
+    if not cfg.get("hook_key"):
+        cfg["hook_key"] = "dsb-hook-" + secrets.token_urlsafe(32); changed = True
+    try: cfg["port"] = int(cfg.get("port", DEFAULT_PORT))
+    except Exception: cfg["port"] = DEFAULT_PORT; changed = True
+    if changed: save_config(cfg)
     return cfg
 
 
@@ -2528,6 +2575,38 @@ class DeepSeekWeb:
         self._did_login = False
         self.last_timings: Dict[str, float] = {}
         self._warned_dom = False
+        self.lifecycle_state = "CREATED"
+        self.lifecycle_state_since = time.time()
+        self.lifecycle_reason = ""
+        self._lifecycle_lock = threading.RLock()
+
+    def _transition(self, state: str, reason: str = "") -> None:
+        if state not in BROWSER_STATES:
+            raise ValueError(f"unknown browser lifecycle state: {state}")
+        allowed = {
+            "CREATED": {"STARTING", "CLOSED"},
+            "STARTING": {"LOGIN_REQUIRED", "READY", "RECOVERING", "FAILED", "CLOSED"},
+            "LOGIN_REQUIRED": {"STARTING", "READY", "RECOVERING", "FAILED", "CLOSED"},
+            "READY": {"BUSY", "WAITING_RESPONSE", "RECOVERING", "FAILED", "CLOSED"},
+            "BUSY": {"WAITING_RESPONSE", "READY", "RECOVERING", "FAILED", "CLOSED"},
+            "WAITING_RESPONSE": {"READY", "BUSY", "RECOVERING", "FAILED", "CLOSED"},
+            "RECOVERING": {"STARTING", "READY", "FAILED", "CLOSED"},
+            "FAILED": {"STARTING", "RECOVERING", "CLOSED"},
+            "CLOSED": {"STARTING", "CLOSED"},
+        }
+        with self._lifecycle_lock:
+            if state != self.lifecycle_state and state not in allowed.get(self.lifecycle_state, set()):
+                raise RuntimeError(f"invalid browser lifecycle transition {self.lifecycle_state} -> {state}")
+            self.lifecycle_state = state
+            self.lifecycle_state_since = time.time()
+            self.lifecycle_reason = str(reason or "")[:240]
+        status_map = {"CREATED":"stopped","STARTING":"starting","LOGIN_REQUIRED":"login_needed",
+                      "READY":"ready","BUSY":"busy","WAITING_RESPONSE":"busy",
+                      "RECOVERING":"starting","FAILED":"error","CLOSED":"stopped"}
+        try:
+            if self.on_state: self.on_state(status_map[state])
+        except Exception:
+            pass
 
     @property
     def think_pref(self) -> bool:
@@ -2656,6 +2735,8 @@ class DeepSeekWeb:
 
     def _boot(self, headless: bool, login_wait: int, announce: bool = False) -> bool:
         try:
+            if self.lifecycle_state not in ("STARTING", "RECOVERING"):
+                self._transition("STARTING", "browser boot")
             self.ctx = self._launch(headless)
             self.ctx.add_init_script(HOOK_JS)
             pages = list(self.ctx.pages)
@@ -2678,9 +2759,10 @@ class DeepSeekWeb:
             self.scratch = page
             self.headless = headless
             if self._logged_in(page):
+                self._transition("READY", "session already authenticated")
                 return True
             if announce:
-                self._state("login")
+                self._transition("LOGIN_REQUIRED", "provider login required")
                 log(f"[login:{self.name or 'account'}] Please log in to {self._provider_name()} in the opened Chrome window "
                     f"(waiting up to {login_wait // 60} minutes)...", C.bold)
             end = time.time() + login_wait
@@ -2690,7 +2772,7 @@ class DeepSeekWeb:
                     if self._logged_in(page):
                         self._did_login = self._did_login or announce
                         if announce:
-                            self._state("starting")
+                            self._transition("READY", "login detected; session saved")
                             log("[login] detected; session saved in the persistent profile.", C.green)
                             time.sleep(1.5)
                         return True
@@ -2700,8 +2782,12 @@ class DeepSeekWeb:
                     last_report = time.time()
                     log(f"  ...still waiting ({int(login_wait - (end - time.time()))}s)", C.dim)
                 time.sleep(1.0)
+            try: self._transition("FAILED", "login timeout")
+            except Exception: pass
             return False
         except Exception as exc:
+            try: self._transition("FAILED", str(exc))
+            except Exception: pass
             log(f"[startup] launch failed ({'headless' if headless else 'headed'}): {exc}", C.yellow)
             return False
 
@@ -2714,6 +2800,7 @@ class DeepSeekWeb:
 
     def start(self, known_login: bool = True) -> bool:
         from playwright.sync_api import sync_playwright  # lazy: self-test needs no browser
+        self._transition("STARTING", "start requested")
         self.pw = sync_playwright().start()
         self._minimize = bool(known_login and not self.headed_pref)
         allow_headless = HEADLESS_MODE != "0" and not self.headed_pref
@@ -2750,9 +2837,13 @@ class DeepSeekWeb:
         except Exception:
             pass
         self.pw = None
+        try: self._transition("CLOSED", "stopped")
+        except Exception: self.lifecycle_state = "CLOSED"
 
     def restart(self) -> None:
         log("[browser] restarting browser session...", C.yellow)
+        try: self._transition("RECOVERING", "browser restart")
+        except Exception: pass
         self._close()
         self.epoch += 1
         if not self._boot(self.headless, HEADLESS_READY_TIMEOUT):
@@ -3160,8 +3251,20 @@ class DeepSeekWeb:
         if len(prompt) > MAX_PROMPT_CHARS + 20_000:
             raise BridgeError(f"prompt too large ({len(prompt):,} chars)", "bad_request")
         self.ensure_alive()
+        self._transition("BUSY", "request accepted")
         if self.provider != "deepseek_web":
-            return self._exchange_generic(page, prompt, cancel, on_partial, files)
+            try:
+                self._transition("WAITING_RESPONSE", "waiting for provider response")
+                result = self._exchange_generic(page, prompt, cancel, on_partial, files)
+                self._transition("READY", "request complete")
+                return result
+            except BridgeCancelled:
+                self._transition("READY", "request cancelled")
+                raise
+            except Exception as exc:
+                try: self._transition("RECOVERING", str(exc))
+                except Exception: pass
+                raise
         if page.is_closed():
             raise BridgeError("the browser tab was closed", "upstream")
         if not self._has_token(page):
@@ -3195,6 +3298,7 @@ class DeepSeekWeb:
         n = self._inject(page, sel, prompt)
         inj = time.perf_counter() - t_inj
         if hook:
+            self._transition("WAITING_RESPONSE", "provider generation active")
             self._submit(page, sel, seq0, cancel, UPLOAD_TIMEOUT if files else None)
         else:
             page.keyboard.press("Enter")
@@ -3240,6 +3344,7 @@ class DeepSeekWeb:
         self.last_timings = {"prompt_chars": float(len(prompt)), "inject_s": inj,
                              "total_s": total, "reply_chars": float(len(text))}
         log(f"[reply] {len(text):,} chars in {total:.2f}s", C.green)
+        self._transition("READY", "request complete")
         return Exchange(text=text, session_id=session_id, seconds=total)
 
 
@@ -3379,6 +3484,7 @@ class Engine:
         self.generic_side_ready = False
         self.term_page = None
         self.term_ready = False
+        self._lane_locks: Dict[str, threading.RLock] = {}
 
     # ---- housekeeping -----------------------------------------------------
 
@@ -3736,8 +3842,26 @@ class Engine:
 
     # ---- main entry ---------------------------------------------------------
 
+    def _lane_lock_key(self, req: NormReq) -> str:
+        project = claude_cwd(req) if not getattr(req, "side", False) else ""
+        tag = getattr(req, "tag", "") or "main"
+        provider = getattr(self.ds, "provider", "deepseek_web")
+        account = getattr(self.acct, "id", "") or getattr(self.ds, "name", "account")
+        kind = "side" if getattr(req, "side", False) else "main"
+        return f"{project}|{provider}|{account}|{tag}|{kind}"
+
     def process(self, req: NormReq, cancel, on_partial) -> Outcome:
+        key = self._lane_lock_key(req)
+        lock = self._lane_locks.setdefault(key, threading.RLock())
+        with lock:
+            return self._process_impl(req, cancel, on_partial)
+
+    def _process_impl(self, req: NormReq, cancel, on_partial) -> Outcome:
         self._sync_epoch()
+        lane_key = self._lane_lock_key(req)
+        log("request start", C.dim, provider=getattr(self.ds, "provider", ""),
+            account=getattr(self.acct, "id", "") or getattr(self.ds, "name", ""),
+            lane=lane_key, project=claude_cwd(req), request_id=getattr(req, "id", ""), event="request.start")
         if req.side:
             return self._process_side(req, cancel, on_partial)
         conv = self._find_conv(req)
@@ -3923,6 +4047,11 @@ class Bridge:
     def _status(self, status: str, err: str = "") -> None:
         if self.acct is not None and not self.stopping:
             self.acct.set_status(status, err)
+            state = {"starting":"STARTING","login":"LOGIN_REQUIRED","login_needed":"LOGIN_REQUIRED",
+                     "ready":"READY","busy":"BUSY","error":"FAILED","stopped":"CLOSED"}.get(status)
+            if state:
+                try: self.acct.set_browser_state(state, err)
+                except Exception: pass
 
     def _run(self) -> None:
         a = self.acct
@@ -4751,8 +4880,10 @@ class Swarm:
         with self.lock:
             self._n += 1
             rid = f"sw{self._n}-{secrets.token_hex(2)}"
-        n = SWARM_AGENTS if str(agents) in ("auto", "", "0") and SWARM_AGENTS > 0 else \
-            (self.pool.capacity() if str(agents) in ("auto", "", "0") else int(agents))
+        if str(agents) in ("auto", "", "0"):
+            n = SWARM_AGENTS if SWARM_AGENTS > 0 else self.pool.parallel_capacity(selected_accounts, PARALLEL_MODE)
+        else:
+            n = int(agents)
         n = max(1, min(SWARM_MAX_AGENTS, n or 1))
         run = SwarmRun(rid, goal, top, base, branch, {"agents": n, "mode": mode or _norm_mode(self.pool.cfg.get("permission_mode")) or DEFAULT_MODE,
                                                        "strict": bool(strict), "tasks_text": tasks_text,
@@ -5354,7 +5485,8 @@ class Account:
         self.id = str(d["id"])
         self.name = str(d.get("name") or self.id)
         self.profile = Path(d.get("profile") or (ACCOUNTS_DIR / self.id))
-        self.enabled = bool(d.get("enabled", True))
+        self.deleted = bool(d.get("deleted", False))
+        self.enabled = bool(d.get("enabled", True)) and not self.deleted
         self.headed = bool(d.get("headed", False))          # keep the browser window visible
         self.logged_in = bool(d.get("logged_in", False))
         self.kind = str(d.get("kind") or "web")                  # web | openai | anthropic
@@ -5376,6 +5508,9 @@ class Account:
         self.created = float(d.get("created") or time.time())
         self.stats = AcctStats()
         self.status = "stopped"      # starting | login | login_needed | ready | error | disabled | stopped
+        self.browser_state = "CLOSED" if self.deleted else "CREATED"
+        self.browser_state_since = time.time()
+        self.browser_state_reason = "soft-deleted" if self.deleted else ""
         self.status_since = time.time()
         self.status_err = ""
         self.cooldown_until = 0.0
@@ -5393,7 +5528,7 @@ class Account:
 
     def to_cfg(self) -> Dict[str, Any]:
         return {"id": self.id, "name": self.name, "profile": str(self.profile), "enabled": self.enabled,
-                "headed": self.headed, "logged_in": self.logged_in, "created": self.created,
+                "deleted": self.deleted, "headed": self.headed, "logged_in": self.logged_in, "created": self.created,
                 "kind": self.kind, "provider": self.provider, "base_url": self.base_url, "api_key": self.api_key,
                 "model": self.model, "tier": self.tier, "max_parallel": self.max_parallel,
                 "price_in": self.price_in, "price_out": self.price_out, "budget": self.budget}
@@ -5403,6 +5538,14 @@ class Account:
             self.status, self.status_since = status, time.time()
         if err:
             self.status_err = err
+
+    def set_browser_state(self, state: str, reason: str = "") -> None:
+        if state not in BROWSER_STATES:
+            raise ValueError(f"unknown browser state: {state}")
+        if state != self.browser_state:
+            self.browser_state, self.browser_state_since = state, time.time()
+        if reason:
+            self.browser_state_reason = str(reason)[:240]
 
     def mark_logged_in(self) -> None:
         if not self.logged_in:
@@ -5423,6 +5566,8 @@ class Account:
                     and self.cooldown_until <= now and not self.over_budget())
 
     def state(self, now: float) -> str:
+        if self.deleted:
+            return "deleted"
         if not self.enabled:
             return "disabled"
         if self.status == "ready":
@@ -5432,6 +5577,76 @@ class Account:
                 return "cooldown"
             return "busy" if self.inflight else "ready"
         return self.status
+
+
+class ResourceGovernor:
+    """Small cached resource sampler; it never runs on the request hot path more often than every 3s."""
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last = 0.0
+        self._snapshot: Dict[str, Any] = {"level":"normal","browser_count":0,"page_count":0,
+                                          "active_requests":0,"queue_length":0,"cpu_pressure":None,
+                                          "ram_pressure":None,"recommended":1}
+
+    @staticmethod
+    def _ram_pressure() -> Optional[float]:
+        try:
+            if os.name == "nt":
+                import ctypes
+                class _MEM(ctypes.Structure):
+                    _fields_=[("dwLength",ctypes.c_ulong),("dwMemoryLoad",ctypes.c_ulong),
+                              ("ullTotalPhys",ctypes.c_ulonglong),("ullAvailPhys",ctypes.c_ulonglong),
+                              ("ullTotalPageFile",ctypes.c_ulonglong),("ullAvailPageFile",ctypes.c_ulonglong),
+                              ("ullTotalVirtual",ctypes.c_ulonglong),("ullAvailVirtual",ctypes.c_ulonglong),
+                              ("ullAvailExtendedVirtual",ctypes.c_ulonglong)]
+                m=_MEM(); m.dwLength=ctypes.sizeof(_MEM)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                    return float(m.dwMemoryLoad)/100.0
+            mem=Path("/proc/meminfo")
+            if mem.exists():
+                vals={}
+                for line in mem.read_text(errors="ignore").splitlines():
+                    if ":" in line:
+                        k,v=line.split(":",1); mt=re.search(r"\d+",v)
+                        if mt: vals[k]=int(mt.group())
+                total,avail=vals.get("MemTotal"),vals.get("MemAvailable")
+                if total and avail is not None: return max(0.0,min(1.0,1.0-avail/total))
+        except Exception:
+            pass
+        return None
+
+    def snapshot(self, pool: "Pool") -> Dict[str, Any]:
+        now=time.time()
+        with self._lock:
+            if now-self._last < 3.0: return dict(self._snapshot)
+            browsers=pages=active=queues=0
+            for a in list(pool.accounts):
+                if a.deleted: continue
+                active += max(0,int(a.inflight))
+                w=a.worker
+                if not w: continue
+                try: queues += int(w.jobs.qsize()) if hasattr(w,"jobs") else 0
+                except Exception: pass
+                if a.kind == "web":
+                    try:
+                        if w.ok: browsers += 1
+                        ctx=getattr(getattr(w.engine,"ds",None),"ctx",None)
+                        if ctx is not None: pages += len(getattr(ctx,"pages",[]) or [])
+                    except Exception: pass
+            cpu=None
+            try:
+                if hasattr(os,"getloadavg"): cpu=max(0.0,min(2.0,os.getloadavg()[0]/max(1,os.cpu_count() or 2)))
+            except Exception: pass
+            ram=self._ram_pressure()
+            high=(cpu is not None and cpu>=0.9) or (ram is not None and ram>=0.90) or active>=max(2,browsers+1)
+            low=browsers<=1 and active==0 and queues==0 and (ram is None or ram<0.65)
+            level="high" if high else ("low" if low else "normal")
+            cap=max(1,pool.capacity())
+            rec=1 if level=="high" else min(2 if level=="low" else 3,cap)
+            self._snapshot={"level":level,"browser_count":browsers,"page_count":pages,"active_requests":active,
+                            "queue_length":queues,"cpu_pressure":cpu,"ram_pressure":ram,"recommended":rec}
+            self._last=now
+            return dict(self._snapshot)
 
 
 class Pool:
@@ -5448,6 +5663,7 @@ class Pool:
         self._last_route: Optional[str] = None
         self._stop = threading.Event()
         self._usage_saved = 0.0
+        self.governor = ResourceGovernor()
         raw_pa = cfg.get("project_accounts")
         self.project_accounts: Dict[str, List[str]] = {str(k): [str(x) for x in v if str(x)]
                                                          for k, v in raw_pa.items() if isinstance(v, list)} if isinstance(raw_pa, dict) else {}
@@ -5470,7 +5686,10 @@ class Pool:
     def _load_accounts(self) -> None:
         raw = self.cfg.get("accounts")
         items = [d for d in raw if isinstance(d, dict) and d.get("id")] if isinstance(raw, list) else []
-        if not items:                                   # first run of V6: adopt the old single profile
+        # Backward compatibility: only a truly missing `accounts` key means an older
+        # pre-multi-account config. An explicit [] is an intentional empty account pool
+        # and must stay empty (critical for explicit Multi-AI / Dashboard startup).
+        if raw is None:
             try:
                 had = PROFILE_DIR.exists() and any(PROFILE_DIR.iterdir())
             except Exception:
@@ -5481,8 +5700,11 @@ class Pool:
             a = Account(d)
             a.on_change = self._save
             self.accounts.append(a)
-        if not self.get_by_id(self.routing.get("pinned")):
-            self.routing["pinned"] = self.accounts[0].id
+        if self.accounts:
+            if not self.get_by_id(self.routing.get("pinned")):
+                self.routing["pinned"] = self.accounts[0].id
+        else:
+            self.routing["pinned"] = None
         self._save()
 
     def _save(self) -> None:
@@ -5554,8 +5776,10 @@ class Pool:
     # ---- lifecycle ----------------------------------------------------------------
 
     def start_account(self, a: Account, force_login: bool = False) -> None:
-        if not a.enabled:
+        if a.deleted or not a.enabled:
             a.set_status("disabled")
+            try: a.set_browser_state("CLOSED", "disabled")
+            except Exception: pass
             return
         a.set_status("starting")
         a.worker = Bridge(a, self, force_login) if a.kind == "web" else ApiWorker(a, self)
@@ -5753,6 +5977,19 @@ class Pool:
         now = time.time()
         return sum(a.max_parallel for a in self.accounts if a.usable(now))
 
+    def parallel_capacity(self, account_ids: Optional[List[str]] = None, mode: str = "auto") -> int:
+        mode = str(mode or "auto").lower()
+        if mode not in PARALLEL_MODES: mode = "auto"
+        now=time.time()
+        chosen=[a for a in self.accounts if a.enabled and not a.deleted and a.status=="ready"
+                and a.cooldown_until<=now and not a.over_budget() and (not account_ids or a.id in account_ids)]
+        if not chosen: return 0
+        if mode=="serial": return 1
+        if mode=="light": return max(1,len({a.provider for a in chosen}))
+        full=max(1,sum(a.max_parallel for a in chosen))
+        if mode=="full": return full
+        return min(full,max(1,int(self.governor.snapshot(self)["recommended"])))
+
     def ask(self, prompt: str, role: str = "planner", system: str = "", max_tokens: int = 4096,
             tag: Optional[str] = None, timeout: float = 900) -> str:
         """One internal question to the model pool (used by the swarm planner / reviewer)."""
@@ -5764,26 +6001,43 @@ class Pool:
         req.role, req.tag = role, tag
         return self.dispatch(req, None, None, None, PRIORITY_MAIN).result(timeout=timeout).text
 
-    def remove_account(self, a: Account, purge: bool = True) -> None:
-        with self.lock:
-            if len(self.accounts) <= 1:
-                raise ValueError("at least one account must remain")
-            self.accounts.remove(a)
-            if self.routing.get("pinned") == a.id:
-                self.routing["pinned"] = self.accounts[0].id
-            self._save()
-        self.event("warn", f"account '{a.name}' removed")
-
-        def bg() -> None:
-            w = a.worker
-            if w is not None:
-                w.stop()
+    def remove_account(self, a: Account, purge: bool = False) -> None:
+        """Soft-delete by default; explicit purge may permanently remove a profile."""
+        if a is None: raise ValueError("account not found")
+        if purge:
+            with self.lock:
+                active=[x for x in self.accounts if not x.deleted]
+                if a.deleted: return
+                if len(active)<=1: raise ValueError("at least one active account must remain")
+                a.deleted=True; a.enabled=False; a.set_browser_state("CLOSED","hard purge requested")
+                self.project_accounts={k:[x for x in ids if x!=a.id] for k,ids in self.project_accounts.items()}
+                self._save()
             try:
-                if purge and ACCOUNTS_DIR in a.profile.resolve().parents:
-                    shutil.rmtree(a.profile, ignore_errors=True)
-            except Exception:
-                pass
-        threading.Thread(target=bg, daemon=True).start()
+                if a.worker is not None: threading.Thread(target=a.worker.stop,daemon=True,name=f"purge-stop-{a.id}").start()
+                if a.profile.exists(): shutil.rmtree(a.profile,ignore_errors=False)
+            except Exception as exc:
+                self.event("error", f"account '{a.name}' profile purge failed: {exc}")
+                raise
+            self.event("warn", f"account '{a.name}' permanently purged")
+            return
+        with self.lock:
+            active=[x for x in self.accounts if not x.deleted]
+            if a.deleted: return
+            if len(active)<=1: raise ValueError("at least one active account must remain")
+            a.deleted=True; a.enabled=False; a.set_browser_state("CLOSED","soft-deleted; profile retained")
+            self.project_accounts={k:[x for x in ids if x!=a.id] for k,ids in self.project_accounts.items()}
+            self._save()
+        if a.worker is not None: threading.Thread(target=a.worker.stop,daemon=True,name=f"soft-stop-{a.id}").start()
+        self.event("warn", f"account '{a.name}' soft-deleted; profile retained and restorable")
+
+    def restore_account(self, a: Account, start: bool = False) -> None:
+        if a is None: raise ValueError("account not found")
+        with self.lock:
+            a.deleted=False; a.enabled=True; a.status="stopped"; a.status_since=time.time()
+            a.set_browser_state("CREATED","restored"); self._save()
+        self.event("info", f"account '{a.name}' restored; profile preserved")
+        if start:
+            self.start_account(a, force_login=False)
 
     def rename(self, a: Account, name: str) -> None:
         name = (name or "").strip()[:40]
@@ -5912,7 +6166,9 @@ class Pool:
             if (len(enabled) == 1 and enabled[0].status == "ready" and enabled[0].worker is not None
                     and enabled[0].worker.ok and enabled[0].id not in exclude):
                 return enabled[0], "only account"
-            return None, "no account is ready"
+            configured = sorted({a.provider for a in accts if a.enabled and not a.deleted})
+            providers = ", ".join(configured) if configured else "none"
+            return None, f"no selected provider account is ready (configured: {providers})"
         elig_all = list(elig)
         if self.routing.get("smart_routing", True):
             elig = self._tier_filter(elig, self._need(req))
@@ -6110,7 +6366,7 @@ class Pool:
                 chats = len(eng.convs) if eng is not None else 0
             except Exception:
                 chats = 0
-            accts.append({"id": a.id, "name": a.name, "idx": i + 1, "enabled": a.enabled, "headed": a.headed,
+            accts.append({"id": a.id, "name": a.name, "idx": i + 1, "enabled": a.enabled, "deleted": a.deleted, "headed": a.headed,
                           "state": a.state(now), "status_err": a.status_err if a.status in ("error", "login_needed") else "",
                           "state_for": round(now - a.status_since, 1),
                           "cooldown_left": max(0, int(a.cooldown_until - now)), "cooldown_reason": a.cooldown_reason,
@@ -6125,7 +6381,8 @@ class Pool:
         ready = sum(1 for a in accts if a["state"] in ("ready", "busy"))
         return {"version": VERSION, "now": now, "uptime": round(now - self.started, 1),
                 "settings": dict(self.routing), "totals": tot, "current": self.current, "ready": ready,
-                "accounts": accts, "capacity": self.capacity(), "events": list(self.events)[-60:][::-1]}
+                "accounts": accts, "capacity": self.capacity(), "resources": self.governor.snapshot(self),
+                "parallel_mode": PARALLEL_MODE, "events": list(self.events)[-60:][::-1]}
 
     def status_text(self) -> str:
         snap = self.snapshot()
@@ -6421,7 +6678,10 @@ def dash_action(pool: Any, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
                                int(data.get("tier") or 0), bool(data.get("headed", True)), True)
         return {"ok": True, "id": a.id}
     if action == "remove":
-        pool.remove_account(acct(), bool(data.get("purge", True)))
+        # Destructive purge is opt-in; the default UI operation is a reversible soft-delete.
+        pool.remove_account(acct(), bool(data.get("purge", False)))
+    elif action == "restore":
+        pool.restore_account(acct(), start=bool(data.get("start", False)))
     elif action == "rename":
         pool.rename(acct(), str(data.get("name", "")))
     elif action == "enable":
@@ -6593,6 +6853,8 @@ SETTINGS_SCHEMA: Tuple[Tuple[Any, ...], ...] = (
     ("DELETE_OLD_CHATS", "bool", "browser", "Delete old chats on chat.deepseek.com", "حذف چت‌های قدیمی در سایت دیپ‌سیک", 0, 0, "live"),
     ("HEADLESS_MODE", "choice", "browser", "Browser windows: auto / always hidden / always visible", "پنجره مرورگر: خودکار / همیشه مخفی / همیشه نمایان", ["auto", "1", "0"], 0, "browser"),
     ("THINK_MODE", "bool", "browser", "Native thinking for DeepSeek and ChatGPT (default off)", "تفکر بومی برای DeepSeek و ChatGPT (پیش‌فرض خاموش)", 0, 0, "live"),
+    ("PARALLEL_MODE", "choice", "swarm", "Scheduler: serial / light / full / auto", "زمان‌بندی موازی: تک‌به‌تک / سبک / کامل / خودکار", list(PARALLEL_MODES), 0, "live"),
+    ("UI_MODE", "choice", "panel", "UI detail level: beginner / pro", "سطح جزئیات رابط: مبتدی / حرفه‌ای", ["beginner", "pro"], 0, "live"),
     ("UI_PERFORMANCE_MODE", "choice", "panel", "Panel performance: automatic / balanced / lightweight / maximum", "کارایی پنل: خودکار / متعادل / سبک / حداکثر", ["auto", "balanced", "light", "max"], 0, "live"),
     ("UPLOAD_TIMEOUT", "int", "browser", "Wait for file uploads up to (s)", "انتظار برای آپلود فایل (ثانیه)", 10, 1800, "live"),
     ("CHARS_PER_TOKEN", "float", "panel", "Characters per token (for the estimates)", "کاراکتر در هر توکن (برای تخمین)", 1.0, 10.0, "live"),
@@ -6861,7 +7123,7 @@ def panel_info(pool: Any) -> Dict[str, Any]:
             "deepseek_model": "deepseek-v4-pro", "port": port, "platform": sys.platform,
             "claude": shutil.which("claude") or "", "project": cfg.get("project_dir") or str(SCRIPT_DIR),
             "recent": cfg.get("recent_projects") or [], "mode": mode, "mode_src": src, "run_mode": RUN_MODE,
-            "ui_performance_mode": UI_PERFORMANCE_MODE,
+            "ui_performance_mode": UI_PERFORMANCE_MODE, "ui_mode": UI_MODE, "parallel_mode": PARALLEL_MODE,
             "script": str(Path(__file__).resolve()), "log": str(SCRIPT_DIR / "bridge.log"), "config": str(CONFIG_PATH),
             "profiles": str(ACCOUNTS_DIR), "home": str(Path.home()), "settings": settings_view(cfg),
             "providers": PROVIDERS, "tiers": TIER_NAMES, "routing": dict(pool.routing),
@@ -6987,22 +7249,22 @@ DASH_HTML = r"""<!doctype html>
 [data-theme=dark]{--bg:#090c16;--p:#101627;--p2:#172038;--ln:#232d4a;--tx:#e9edfb;--mut:#8d99bd;--glass:rgba(16,22,39,.8);color-scheme:dark}
 [data-theme=light]{--bg:#f2f4fb;--p:#fff;--p2:#eef1fb;--ln:#dce1f3;--tx:#182041;--mut:#5b668f;--glass:rgba(255,255,255,.85);color-scheme:light}
 *{box-sizing:border-box;margin:0}[hidden]{display:none!important}
-body{background:radial-gradient(900px 520px at 88% -8%,color-mix(in srgb,var(--ac) 20%,transparent),transparent 62%),radial-gradient(760px 460px at -6% 108%,color-mix(in srgb,var(--ac2) 16%,transparent),transparent 62%),var(--bg);background-attachment:fixed;color:var(--tx);font:14px/1.6 Vazirmatn,"Segoe UI",Tahoma,system-ui,sans-serif;min-height:100vh}
+body{background:var(--bg);background-attachment:fixed;color:var(--tx);font:14px/1.6 Vazirmatn,"Segoe UI",Tahoma,system-ui,sans-serif;min-height:100vh}
 button,input,select,textarea{font:inherit;color:inherit}::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:var(--ln);border-radius:9px}
 .mono,code,pre,#p-chat,#cw{font-family:ui-monospace,"Cascadia Mono",Consolas,Menlo,monospace}
 #app{display:flex;min-height:100vh}
 #rail{width:80px;flex:none;position:sticky;top:0;height:100vh;display:flex;flex-direction:column;align-items:center;gap:6px;padding:14px 8px;background:var(--glass);backdrop-filter:blur(16px);border-inline-end:1px solid var(--ln);z-index:30}
-.logo{width:44px;height:44px;border-radius:14px;background:linear-gradient(135deg,var(--ac),var(--ac2));display:grid;place-items:center;font-size:22px;margin-bottom:10px;box-shadow:0 10px 28px -10px var(--ac)}
+.logo{width:44px;height:44px;border-radius:14px;background:var(--ac);display:grid;place-items:center;font-size:22px;margin-bottom:10px;box-shadow:0 10px 28px -10px var(--ac)}
 .nb{width:64px;padding:8px 0;border-radius:14px;border:0;background:none;cursor:pointer;display:grid;gap:1px;justify-items:center;color:var(--mut);transition:.18s;font-size:10.5px}
 .nb i{font-style:normal;font-size:20px;transition:.18s}.nb:hover{background:var(--p2);color:var(--tx)}.nb:hover i{transform:scale(1.15)}
-.nb.on{background:linear-gradient(135deg,var(--ac),var(--ac2));color:#fff;box-shadow:0 10px 24px -10px var(--ac)}.sp{flex:1}
+.nb.on{background:var(--ac);color:#fff;box-shadow:0 10px 24px -10px var(--ac)}.sp{flex:1}
 #main{flex:1;min-width:0;display:flex;flex-direction:column}
 #top{display:flex;align-items:center;gap:12px;padding:12px 22px;border-bottom:1px solid var(--ln);position:sticky;top:0;background:var(--glass);backdrop-filter:blur(16px);z-index:20;flex-wrap:wrap}
 #top h1{font-size:18px}.chip{background:var(--p2);border:1px solid var(--ln);border-radius:99px;padding:3px 11px;font-size:12px;color:var(--mut);display:inline-flex;gap:6px;align-items:center}
 .dot{width:8px;height:8px;border-radius:9px;background:var(--ok);box-shadow:0 0 10px var(--ok)}.dot.off{background:var(--bad);box-shadow:0 0 10px var(--bad)}
 #off{background:var(--bad);color:#fff;text-align:center;padding:5px;display:none}
 .btn{background:var(--p2);border:1px solid var(--ln);border-radius:10px;padding:7px 13px;cursor:pointer;transition:.15s;display:inline-flex;gap:6px;align-items:center;white-space:nowrap}
-.btn:hover{border-color:var(--ac);transform:translateY(-1px)}.btn:active{transform:none}.btn.pri{background:linear-gradient(135deg,var(--ac),var(--ac2));border:0;color:#fff;font-weight:600;box-shadow:0 8px 20px -10px var(--ac)}
+.btn:hover{border-color:var(--ac);transform:translateY(-1px)}.btn:active{transform:none}.btn.pri{background:var(--ac);border:0;color:#fff;font-weight:600;box-shadow:0 8px 20px -10px var(--ac)}
 .btn.sm{padding:4px 10px;font-size:12px;border-radius:8px}.btn.dng:hover{border-color:var(--bad);color:var(--bad)}.btn.wide{width:100%;justify-content:center}.btn[disabled]{opacity:.5;pointer-events:none}
 .ib{background:none;border:0;cursor:pointer;font-size:17px;padding:4px 8px;border-radius:8px;color:var(--mut)}.ib:hover{background:var(--p2);color:var(--tx)}
 .inp,select.inp,textarea.inp{background:var(--p2);border:1px solid var(--ln);border-radius:10px;padding:8px 11px;width:100%;outline:0;transition:.15s}.inp:focus{border-color:var(--ac);box-shadow:0 0 0 3px color-mix(in srgb,var(--ac) 22%,transparent)}
@@ -7012,7 +7274,7 @@ select.inp{width:auto}.page{display:none;padding:22px;max-width:1340px;margin:0 
 .box h3{font-size:13px;color:var(--mut);font-weight:600;margin-bottom:12px;display:flex;gap:8px;align-items:center}.tip{color:var(--mut);font-size:12px}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:16px}
 .tile{background:var(--p);border:1px solid var(--ln);border-radius:var(--r);padding:14px 16px;position:relative;overflow:hidden}
-.tile:before{content:"";position:absolute;inset-inline-end:-30px;top:-30px;width:90px;height:90px;border-radius:50%;background:linear-gradient(135deg,var(--ac),var(--ac2));opacity:.14}
+.tile:before{content:"";position:absolute;inset-inline-end:-30px;top:-30px;width:90px;height:90px;border-radius:50%;background:var(--ac);opacity:.14}
 .tile b{display:block;font-size:26px}.tile span{color:var(--mut);font-size:12px}
 .seg{display:flex;gap:10px;flex-wrap:wrap}.seg label{flex:1;min-width:160px;background:var(--p2);border:1px solid var(--ln);border-radius:12px;padding:10px 13px;cursor:pointer;transition:.15s}
 .seg label:hover{border-color:var(--ac)}.seg label:has(input:checked){border-color:var(--ac);box-shadow:0 0 0 1px var(--ac) inset,0 8px 24px -14px var(--ac)}.seg input{display:none}.seg b{display:block}.seg small{color:var(--mut)}
@@ -7021,12 +7283,12 @@ select.inp{width:auto}.page{display:none;padding:22px;max-width:1340px;margin:0 
 .card{background:var(--p);border:1px solid var(--ln);border-radius:18px;padding:15px;position:relative;transition:.2s}.card:hover{transform:translateY(-2px)}
 .card.cur{border-color:var(--ac);box-shadow:0 0 0 1px var(--ac) inset,0 18px 40px -22px var(--ac)}.card.off{opacity:.6}
 .ch{display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap}.ch b{font-size:15px}.idx{color:var(--mut)}
-.tag{font-size:10px;padding:2px 8px;border-radius:99px;font-weight:700}.tag.live{background:linear-gradient(135deg,var(--ac),var(--ac2));color:#fff}.tag.pin{background:#3a2f63;color:#cdbbff}
+.tag{font-size:10px;padding:2px 8px;border-radius:99px;font-weight:700}.tag.live{background:var(--ac);color:#fff}.tag.pin{background:#3a2f63;color:#cdbbff}
 .pill{margin-inline-start:auto;font-size:11px;padding:3px 10px;border-radius:99px;border:1px solid}
 .st-ready{color:var(--ok);border-color:#1c6b51;background:#10302a}.st-busy,.st-starting,.st-login{color:var(--info);border-color:#1c5a77;background:#0f2a38}
 .st-cooldown{color:var(--warn);border-color:#7a5a1f;background:#33270f}.st-login_needed,.st-error{color:var(--bad);border-color:#7a2a36;background:#33121a}.st-disabled,.st-stopped{color:var(--mut);border-color:var(--ln)}
 .kv{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:8px 0}.kv div{background:var(--p2);border-radius:11px;padding:7px 10px}.kv span{display:block;color:var(--mut);font-size:11px}.kv b{font-size:14px}
-.bar{height:6px;background:var(--p2);border-radius:9px;overflow:hidden;margin:6px 0}.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--ac),var(--ac2));transition:width .6s}
+.bar{height:6px;background:var(--p2);border-radius:9px;overflow:hidden;margin:6px 0}.bar i{display:block;height:100%;width:0;background:var(--ac);transition:width .6s}
 svg.sp{width:100%;height:38px;display:block}.err{color:var(--bad);font-size:12px;margin:6px 0;word-break:break-word}.err:empty{display:none}
 .act{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;align-items:center}
 .more{position:relative}.more summary{list-style:none;cursor:pointer}.more summary::-webkit-details-marker{display:none}
@@ -7039,7 +7301,7 @@ svg.sp{width:100%;height:38px;display:block}.err{color:var(--bad);font-size:12px
 .mdl{background:var(--p);border:1px solid var(--ln);border-radius:18px;padding:20px;width:min(520px,100%);max-height:88vh;overflow:auto;box-shadow:0 30px 80px -30px #000;transform:translateY(10px);transition:.18s}.ov.on .mdl{transform:none}.mdl.big{width:min(680px,100%)}
 .mdl h3{margin-bottom:10px}.rowb{display:flex;gap:8px;justify-content:flex-end;margin-top:14px;flex-wrap:wrap}.mdl p{margin-bottom:8px}
 .sw{position:relative;display:inline-block;width:42px;height:24px}.sw input{opacity:0;width:0;height:0}.sw i{position:absolute;inset:0;background:var(--ln);border-radius:24px;cursor:pointer;transition:.2s}
-.sw i:before{content:"";position:absolute;width:18px;height:18px;inset-inline-start:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}.sw input:checked+i{background:linear-gradient(135deg,var(--ac),var(--ac2))}.sw input:checked+i:before{transform:translateX(18px)}[dir=rtl] .sw input:checked+i:before{transform:translateX(-18px)}
+.sw i:before{content:"";position:absolute;width:18px;height:18px;inset-inline-start:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}.sw input:checked+i{background:var(--ac)}.sw input:checked+i:before{transform:translateX(18px)}[dir=rtl] .sw input:checked+i:before{transform:translateX(-18px)}
 /* chat */
 #p-chat{padding:0;max-width:none;height:calc(100vh - 62px)}#p-chat.on{display:grid;grid-template-columns:250px 1fr}
 #cl{border-inline-end:1px solid var(--ln);padding:12px;overflow:auto;background:var(--glass)}#clist{margin-top:10px;display:grid;gap:4px}
@@ -7054,7 +7316,7 @@ svg.sp{width:100%;height:38px;display:block}.err{color:var(--bad);font-size:12px
 .th{max-height:120px;border-radius:8px;display:block;margin:4px 0}.fc{display:inline-flex;gap:6px;align-items:center;background:var(--p);border:1px solid var(--ln);border-radius:9px;padding:2px 9px;margin:2px;font-size:12px}
 .stat{color:var(--ac);display:flex;gap:8px;align-items:center}.stat .dim{color:var(--mut)}.spin{display:inline-block;animation:sp 1.2s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}
 #cbar{padding:10px 16px 14px;position:relative}#cbox{max-width:900px;margin:0 auto;display:flex;gap:8px;align-items:flex-end;border:1px solid var(--ln);border-radius:16px;padding:8px 10px;background:var(--p);transition:.15s}#cbox:focus-within{border-color:var(--ac);box-shadow:0 0 0 3px color-mix(in srgb,var(--ac) 20%,transparent)}
-#cbox .pr{color:var(--ac);font-weight:700;padding-bottom:6px}#cin{flex:1;background:none;border:0;outline:0;resize:none;max-height:200px;padding:5px 0;direction:auto}.snd{background:linear-gradient(135deg,var(--ac),var(--ac2));color:#fff!important;border-radius:11px}
+#cbox .pr{color:var(--ac);font-weight:700;padding-bottom:6px}#cin{flex:1;background:none;border:0;outline:0;resize:none;max-height:200px;padding:5px 0;direction:auto}.snd{background:var(--ac);color:#fff!important;border-radius:11px}
 #chips2{max-width:900px;margin:0 auto 6px;display:flex;gap:6px;flex-wrap:wrap}.ach{display:flex;gap:6px;align-items:center;background:var(--p2);border:1px solid var(--ln);border-radius:10px;padding:3px 8px;font-size:12px}.ach img{height:30px;border-radius:5px}.ach button{background:none;border:0;cursor:pointer;color:var(--mut)}
 #pal{position:absolute;bottom:100%;inset-inline:16px;max-width:900px;margin:0 auto;background:var(--p);border:1px solid var(--ln);border-radius:12px;padding:5px;box-shadow:0 20px 50px -20px #000;z-index:5}.pi{padding:6px 10px;border-radius:8px;cursor:pointer;display:flex;gap:12px}.pi:hover,.pi.on{background:var(--p2)}.pi b{color:var(--ac)}.pi span{color:var(--mut)}
 #p-chat.drag:after{content:"＋";position:absolute;inset:0;display:grid;place-items:center;font-size:80px;background:color-mix(in srgb,var(--ac) 18%,transparent);border:3px dashed var(--ac);z-index:9}
@@ -7075,7 +7337,7 @@ svg.sp{width:100%;height:38px;display:block}.err{color:var(--bad);font-size:12px
 .fh{display:flex;gap:8px;flex-wrap:wrap;color:var(--mut);font-size:11px;align-items:center}.bd{padding:1px 8px;border-radius:99px;background:var(--p2);color:var(--tx);font-weight:600}.fu{color:var(--mut);margin-top:4px;overflow-wrap:anywhere}
 .fr{margin-top:3px;overflow-wrap:anywhere;white-space:pre-wrap;max-height:3.3em;overflow:hidden}.fcard.x .fr{max-height:none}.fcs{display:flex;gap:5px;flex-wrap:wrap;margin-top:5px}.fcs span{background:var(--p2);border-radius:7px;padding:1px 8px;font:11px ui-monospace,monospace}
 .pvg{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.pv{background:var(--p2);border:1px solid var(--ln);border-radius:14px;padding:12px;cursor:pointer;transition:.15s;display:grid;gap:2px}.pv:hover{border-color:var(--ac);transform:translateY(-2px)}.pv i{font-style:normal;font-size:26px}.pv small{color:var(--mut)}
-.fg{display:grid;gap:10px}.fg label{display:grid;gap:3px;color:var(--mut);font-size:12px}.fg2{display:grid;grid-template-columns:1fr 1fr;gap:10px}.tb2{display:inline-block;width:fit-content;padding:1px 9px;border-radius:99px;background:linear-gradient(135deg,var(--ac),var(--ac2));color:#fff;font-size:10px;font-weight:700}
+.fg{display:grid;gap:10px}.fg label{display:grid;gap:3px;color:var(--mut);font-size:12px}.fg2{display:grid;grid-template-columns:1fr 1fr;gap:10px}.tb2{display:inline-block;width:fit-content;padding:1px 9px;border-radius:99px;background:var(--ac);color:#fff;font-size:10px;font-weight:700}
 .sub{color:var(--mut);font-size:12px;margin:-4px 0 8px}.st-budget{color:var(--warn);border-color:#7a5a1f;background:#33270f}
 .runs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.rn{padding:6px 12px;border-radius:12px;background:var(--p2);border:1px solid var(--ln);cursor:pointer}.rn.on{border-color:var(--ac)}
 .ags{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px;margin-top:12px}.ag{background:var(--p2);border:1px solid var(--ln);border-radius:14px;padding:12px;cursor:pointer;transition:.15s}.ag:hover{border-color:var(--ac)}.ag .act2{color:var(--info);font-size:12px;margin-top:6px;min-height:1.4em;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
@@ -7138,6 +7400,15 @@ body{background:var(--bg);background-attachment:scroll}
   #ccmirror{margin-bottom:8px}.ccm{padding:9px}.ccmrow{gap:6px}.ccmagents{gap:4px}
   .mdl,.mdl.big{width:100%;max-height:92vh;padding:14px}
 }
+
+/* V6.4 low-resource / responsive UI hardening */
+html[data-ux="beginner"] .pro-only{display:none!important}
+html[data-ux="pro"] .pro-only{display:block}
+.top,.topbar,.modal,.drawer-overlay{backdrop-filter:none!important;-webkit-backdrop-filter:none!important}
+.tile,.card,.panel,.box,.fcard,.modal-card{background-image:none!important}
+pre,code,.path,.url,.mono{direction:ltr!important;text-align:left!important;unicode-bidi:plaintext}
+@media (max-width:430px){.wrap{padding:10px!important}.top{min-height:46px!important}.top button,.btn,.iconbtn{min-width:40px;min-height:40px}.table-wrap,.list-wrap,.grid-scroll{overflow-x:auto!important;max-width:100%!important}.modal,.modal-card{max-width:calc(100vw - 20px)!important;width:auto!important;margin:10px!important}#rail{width:min(82vw,280px)!important}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 </style></head><body>
 <div id="app"><aside id="rail"><div class="logo" aria-label="DeepSeek Bridge">DB</div>
 <button class="nb" data-go="dash"><i>⌂</i><span data-t="n_dash"></span></button><button class="nb" data-go="live"><i>◉</i><span data-t="n_live"></span></button><button class="nb" data-go="chat"><i>▱</i><span data-t="n_chat"></span></button><button class="nb" data-go="swarm"><i>✣</i><span data-t="n_swarm"></span></button>
@@ -7158,6 +7429,8 @@ body{background:var(--bg);background-attachment:scroll}
 <div id="navshade" hidden></div><div id="toast"></div><input type="file" id="cfile" multiple hidden><input type="file" id="sfiles" multiple hidden>
 <script>
 "use strict";
+/* Storage can be denied in hardened/opaque browser contexts. Never let that abort the entire UI boot. */
+const localStorage=(()=>{try{return window.localStorage}catch(_){const mem=Object.create(null);return new Proxy({getItem:k=>Object.prototype.hasOwnProperty.call(mem,k)?mem[k]:null,setItem:(k,v)=>{mem[k]=String(v)},removeItem:k=>{delete mem[k]},clear:()=>{for(const k of Object.keys(mem))delete mem[k]},key:i=>Object.keys(mem)[i]||null},{get:(t,k)=>k in t?t[k]:mem[k],set:(_t,k,v)=>{mem[k]=String(v);return true},deleteProperty:(_t,k)=>{delete mem[k];return true},ownKeys:()=>Reflect.ownKeys(mem),getOwnPropertyDescriptor:(_t,k)=>({enumerable:true,configurable:true,value:mem[k]})})}})();
 /* Define live-mirror state before any boot-time callback can touch it. */
 var CC_SESSION=window.CC_SESSION={cwd:"",model:"",tool:"",text:"",event:"",status:"idle"},CC_AGENTS={},CC_SWARM={},CC_LOGS=[];
 const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
@@ -7171,10 +7444,10 @@ balancedD:["گفتگوی جدید به کم‌مصرف‌ترین اکانت؛ �
 tin:["توکن ورودی","tokens in"],tout:["توکن خروجی","tokens out"],ready:["آماده","Ready"],accounts:["اکانت آماده","accounts ready"],msgs:["پیام","messages"],up:["مدت کارکرد","uptime"],
 k_tin:["ورودی ~","in ~"],k_tout:["خروجی ~","out ~"],k_today:["امروز","today"],k_msgs:["پیام","msgs"],k_errs:["خطا / محدودیت","errors / limits"],k_avg:["میانگین","avg"],k_active:["زمان فعالیت","active time"],k_streak:["استفاده پیوسته","continuous use"],k_last:["آخرین استفاده","last used"],
 inuse:["در حال استفاده","IN USE"],pin:["قفل‌شده","PINNED"],use:["استفاده","Use"],test:["تست","Test"],login:["ورود مجدد","Re-login"],show:["نمایش پنجره","Show window"],hide:["مخفی‌سازی","Hide window"],restart:["ریستارت","Restart"],enable:["فعال کردن","Enable"],disable:["غیرفعال","Disable"],
-reset_convs:["ریست چت‌ها","Reset chats"],purge:["حذف چت‌ها","Purge chats"],rename:["تغییر نام","Rename"],remove:["حذف","Remove"],chatw:["گفتگو","Chat"],conn:["اتصال","Connect"],chats:["چت باز","open chats"],ago:["پیش","ago"],never:["—","—"],
+reset_convs:["ریست چت‌ها","Reset chats"],purge:["حذف چت‌ها","Purge chats"],rename:["تغییر نام","Rename"],remove:["حذف","Remove"],restore:["بازگردانی","Restore"],chatw:["گفتگو","Chat"],conn:["اتصال","Connect"],chats:["چت باز","open chats"],ago:["پیش","ago"],never:["—","—"],
 s_ready:["آماده","Ready"],s_busy:["در حال پاسخ","Generating"],s_cooldown:["استراحت","Cooling"],s_starting:["در حال اجرا","Starting"],s_login:["منتظر ورود","Waiting for login"],s_login_needed:["نیاز به ورود","Login needed"],s_error:["خطا","Error"],s_disabled:["غیرفعال","Disabled"],s_stopped:["متوقف","Stopped"],
 addTitle:["افزودن اکانت جدید","Add a new account"],addTip:["یک پنجره کروم باز می‌شود؛ در آن وارد DeepSeek شوید.","A Chrome window opens - log in to DeepSeek there."],create:["ساخت و ورود","Create & log in"],
-confirmRm:["این اکانت حذف شود؟ (اطلاعات ورودش هم پاک می‌شود)","Remove this account? (its saved login is deleted too)"],confirmPurge:["همه چت‌های ساخته‌شده توسط bridge در سایت DeepSeek حذف شوند؟","Delete every chat the bridge created on DeepSeek?"],
+confirmRm:["این اکانت غیرفعال و حذف منطقی شود؟ پروفایل ورود نگه داشته می‌شود و امکان بازگردانی دارد.","Soft-delete this account? Its login profile will be retained and the account can be restored."],confirmPurge:["همه چت‌های ساخته‌شده توسط bridge در سایت DeepSeek حذف شوند؟","Delete every chat the bridge created on DeepSeek?"],
 testing:["در حال تست…","Testing…"],okTest:["سالم","OK"],newName:["نام جدید","New name"],offline:["ارتباط با bridge قطع است","Lost connection to the bridge"],keyPrompt:["API key را وارد کنید","Enter the API key"],
 newchat:["گفتگوی جدید","New chat"],export:["خروجی","Export"],autoAcct:["خودکار (متعادل)","Auto (balanced)"],cph:["پیام بنویسید…  ( / برای دستورها )","Message…  ( / for commands )"],
 chint:["Enter ارسال · Shift+Enter خط جدید · / دستورها · فایل را بکشید و رها کنید یا Ctrl+V · Esc توقف","Enter send · Shift+Enter newline · / commands · drop files or Ctrl+V · Esc stop"],
@@ -7236,7 +7509,8 @@ const i=$("#mi",o);i.focus();i.select();const done=v=>{o.close();res(v)};o.oncli
 const copyText=async s=>{try{await navigator.clipboard.writeText(s)}catch{const x=document.createElement("textarea");x.value=s;document.body.append(x);x.select();document.execCommand("copy");x.remove()}toast(t("copied"))};
 const mk=h=>{const d=document.createElement("div");d.innerHTML=h.trim();return d.firstChild};
 /* ---------- theme / language / router ---------- */
-function applyTheme(){document.documentElement.dataset.theme=localStorage.dsb_theme||"dark";document.documentElement.dataset.acc=localStorage.dsb_acc||"sky"}
+function applyTheme(){document.documentElement.dataset.theme=localStorage.dsb_theme||"light";document.documentElement.dataset.acc=localStorage.dsb_acc||"sky"}
+function applyUiMode(){document.documentElement.dataset.ux=localStorage.dsb_ux||((INFO&&INFO.ui_mode)==="pro"?"pro":"beginner")}
 let S=null,INFO=null,page="dash";const PAGES=["dash","live","chat","swarm","launch","console","connect","settings"];
 let dashStream=null,dashStreamReady=false,dashReconnectTimer=null;
 
@@ -7308,7 +7582,7 @@ function applyDashEvent(kind,data){
 function connectDashStream(){if(!KEY||dashStream||document.hidden)return;try{dashStream=new EventSource("/dash/api/stream?key="+encodeURIComponent(KEY));dashStreamReady=false;for(const k of ["activity","agent","swarm","pool","console","request","project","settings","attachment","prompt_improved","claude"])dashStream.addEventListener(k,e=>{try{applyDashEvent(k,JSON.parse(e.data||"{}"))}catch{}});dashStream.onopen=()=>{dashStreamReady=true;syncFeed()};dashStream.onerror=()=>{dashStreamReady=false;if(dashStream){dashStream.close();dashStream=null}if(!dashReconnectTimer&&!document.hidden)dashReconnectTimer=setTimeout(()=>{dashReconnectTimer=null;connectDashStream()},2500)}}catch{dashStream=null;dashStreamReady=false}}
 function closeDashStream(){if(dashReconnectTimer){clearTimeout(dashReconnectTimer);dashReconnectTimer=null}if(dashStream){dashStream.close();dashStream=null}dashStreamReady=false}
 document.addEventListener("visibilitychange",()=>{if(document.hidden)closeDashStream();else{connectDashStream();tick()}});
-async function loadInfo(force){if(!INFO||force){INFO=await api("info");applyUiPerformance()}connectDashStream();return INFO}
+async function loadInfo(force){if(!INFO||force){INFO=await api("info");applyUiPerformance();applyUiMode()}connectDashStream();return INFO}
 function applyLang(){document.documentElement.lang=L;document.documentElement.dir=L==="fa"?"rtl":"ltr";$("#blang span").textContent=L==="fa"?"EN":"فا";
 $$("[data-t]").forEach(e=>e.textContent=t(e.dataset.t));$("#cin").placeholder=t("cph");$("#chint").textContent=t("chint");for(const k in cards){cards[k].remove();delete cards[k]}segKey="";go(page,true)}
 function go(p,again){if(!PAGES.includes(p))p="dash";page=p;document.querySelector("#app")?.classList.remove("navopen");const ns=document.querySelector("#navshade");if(ns)ns.hidden=true;$$(".page").forEach(e=>e.classList.toggle("on",e.id==="p-"+p));$$('.nb[data-go]').forEach(e=>e.classList.toggle('on',e.dataset.go===p));
@@ -7317,19 +7591,19 @@ $("#ttl").textContent=t("n_"+p);history.replaceState(null,"","#/"+p);if(p!=="con
 /* ---------- state poll + dashboard ---------- */
 let segKey="";const cards={};
 function cardTpl(a){return `<div class="card" data-id="${a.id}"><div class="ch"><span class="idx" data-f="idx"></span><b data-f="name"></b><span class="tag live" data-f="live">${t("inuse")}</span><span class="tag pin" data-f="pin">${t("pin")}</span><span class="pill" data-f="pill"></span></div><div class="sub" data-f="sub"></div>
-<div class="kv">${["tin","tout","today","msgs","errs","avg","active","streak","last"].map(k=>`<div><span>${t("k_"+k)}</span><b data-f="kv_${k}"></b></div>`).join("")}</div>
+<div class="kv pro-only">${["tin","tout","today","msgs","errs","avg","active","streak","last"].map(k=>`<div><span>${t("k_"+k)}</span><b data-f="kv_${k}"></b></div>`).join("")}</div>
 <div class="bar"><i data-f="bar"></i></div><div data-f="spark"></div><div class="err" data-f="err"></div><div class="tip" data-f="chats"></div>
 <div class="act"><button class="btn sm pri" data-a="use">${t("use")}</button><button class="btn sm" data-a="chat">» ${t("chatw")}</button><button class="btn sm" data-a="connect">⌁ ${t("conn")}</button><button class="btn sm" data-a="test">${t("test")}</button>
 <details class="more"><summary class="btn sm">⋯</summary><div class="menu"><button data-a="edit">${t("editAcc")}</button><button data-a="login" data-web>${t("login")}</button><button data-a="show" data-f="bshow">${t("show")}</button><button data-a="hide" data-f="bhide">${t("hide")}</button><button data-a="restart">${t("restart")}</button>
-<button data-a="enable" data-f="ben">${t("enable")}</button><button data-a="disable" data-f="bdis">${t("disable")}</button><button data-a="reset_convs" data-web>${t("reset_convs")}</button><button data-a="purge" data-web>${t("purge")}</button><button data-a="rename">${t("rename")}</button><button data-a="up">▲</button><button data-a="down">▼</button><button class="dng" data-a="remove">${t("remove")}</button></div></details></div></div>`}
+<button data-a="enable" data-f="ben">${t("enable")}</button><button data-a="disable" data-f="bdis">${t("disable")}</button><button data-a="reset_convs" data-web>${t("reset_convs")}</button><button data-a="purge" data-web>${t("purge")}</button><button data-a="rename">${t("rename")}</button><button data-a="up">▲</button><button data-a="down">▼</button><button class="dng" data-a="remove" data-f="remove">${t("remove")}</button><button data-a="restore" data-f="restore">${t("restore")}</button></div></details></div></div>`}
 const F=(el,f)=>el.querySelector(`[data-f=${f}]`),setf=(el,f,v)=>{const n=F(el,f);if(n&&n.textContent!==String(v))n.textContent=v};
 const pvIcon=id=>{const p=((INFO&&INFO.providers)||[]).find(x=>x.id===id);return p?p.icon:"⌁"};
 function spark(v){const m=Math.max(1,...v),w=240,H=34;return `<svg class="sp" viewBox="0 0 ${w} ${H}" preserveAspectRatio="none"><polyline fill="none" stroke="var(--ac)" stroke-width="1.7" stroke-linejoin="round" points="${v.map((x,i)=>(i*w/59).toFixed(1)+","+(H-2-x/m*(H-6)).toFixed(1)).join(" ")}"/></svg>`}
-function updCard(el,a,tt){const s=a.stats;el.classList.toggle("cur",a.current);el.classList.toggle("off",!a.enabled);setf(el,"idx","#"+a.idx);setf(el,"name",a.name);
+function updCard(el,a,tt){const s=a.stats;el.classList.toggle("cur",a.current);el.classList.toggle("off",!a.enabled);el.classList.toggle("deleted",!!a.deleted);setf(el,"idx","#"+a.idx);setf(el,"name",a.name);
 F(el,"live").hidden=!a.current;F(el,"pin").hidden=!(S.settings.strategy==="pinned"&&a.pinned);const p=F(el,"pill");p.className="pill st-"+a.state;p.textContent=t("s_"+a.state)+(a.state==="cooldown"?" "+dur(a.cooldown_left):"");
 const v={tin:tok(s.in_tok),tout:tok(s.out_tok),today:tok(s.today_in+s.today_out),msgs:s.req,errs:s.err+" / "+s.rate_limits,avg:s.avg_s+"s",active:dur(s.active_s),streak:dur(s.streak_s)+(s.streak_live?" •":""),last:s.last_used_ago==null?t("never"):dur(s.last_used_ago)+" "+t("ago")};
 for(const k in v)setf(el,"kv_"+k,v[k]);F(el,"bar").style.width=((s.in_tok+s.out_tok)/tt*100).toFixed(0)+"%";F(el,"spark").innerHTML=spark(s.spark);
-setf(el,"err",a.status_err||(s.last_error&&s.last_error_ago<1800?s.last_error:""));const web=a.kind==="web";setf(el,"sub",pvIcon(a.provider)+" "+(web?"DeepSeek":a.model)+" · T"+a.tier+" "+stars(a.tier));
+setf(el,"err",a.status_err||(s.last_error&&s.last_error_ago<1800?s.last_error:""));const web=a.kind==="web";setf(el,"sub",pvIcon(a.provider)+" "+(web?"DeepSeek":a.model)+" · T"+a.tier+" "+stars(a.tier));const rm=F(el,"remove"),rs=F(el,"restore");if(rm)rm.hidden=!!a.deleted;if(rs)rs.hidden=!a.deleted;
 setf(el,"chats",web?a.chats+" "+t("chats")+(a.headed?" · □":""):"⚡ ×"+a.max_parallel+(a.cost>0||a.budget>0?" · $"+a.cost.toFixed(4)+(a.budget>0?" / $"+a.budget:""):""));
 el.querySelectorAll("[data-web]").forEach(b=>b.hidden=!web);F(el,"bshow").hidden=!web||a.headed;F(el,"bhide").hidden=!web||!a.headed;F(el,"ben").hidden=a.enabled;F(el,"bdis").hidden=!a.enabled}
 function renderDash(){const T=S.totals,A=S.accounts,st=S.settings;
@@ -7690,6 +7964,14 @@ class APIHandler(BaseHTTPRequestHandler):
             return True
         return False
 
+    def _check_hook_auth(self) -> bool:
+        supplied=self.headers.get("Authorization","").strip()
+        supplied=supplied[7:].strip() if supplied.lower().startswith("bearer ") else supplied
+        if not supplied: supplied=self.headers.get("x-ds-bridge-hook-key","").strip()
+        expected=str((getattr(BRIDGE,"cfg",{}) or {}).get("hook_key") or "")
+        if not expected or not supplied: return False
+        return secrets.compare_digest(supplied.encode("utf-8","ignore"),expected.encode("utf-8"))
+
     def _check_auth(self) -> bool:
         auth = self.headers.get("Authorization", "").strip()
         supplied = auth[7:].strip() if auth.lower().startswith("bearer ") else auth
@@ -7753,11 +8035,17 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         try:
+            origin=self.headers.get("Origin","").strip()
+            allow=""
+            if origin and (urllib.parse.urlsplit(origin).hostname or "").lower() in ("127.0.0.1","localhost","::1"):
+                allow=origin
             self.send_response(204)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Content-Length", "0")
+            if allow:
+                self.send_header("Access-Control-Allow-Origin",allow)
+                self.send_header("Vary","Origin")
+                self.send_header("Access-Control-Allow-Headers","Authorization, Content-Type, X-Api-Key, X-Ds-Bridge-Hook-Key, anthropic-api-key")
+                self.send_header("Access-Control-Allow-Methods","GET, POST, OPTIONS")
+            self.send_header("Content-Length","0")
             self.end_headers()
         except Exception:
             pass
@@ -7795,7 +8083,15 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self._route_path()
-        if not self._check_auth():
+        is_hook = path == "/dash/api/claude-hook"
+        if is_hook:
+            if not self._dash_host_ok():
+                return
+            if not self._check_hook_auth():
+                log("[claude-hook] authentication failed", C.red, event="hook_auth_failed")
+                self._err(401, "authentication_error", "invalid hook key")
+                return
+        elif not self._check_auth():
             log("[http] authentication failed", C.red)
             self._err(401, "authentication_error", "invalid api key")
             return
@@ -7810,8 +8106,6 @@ class APIHandler(BaseHTTPRequestHandler):
             self._err(400, "invalid_request_error", str(exc))
             return
         if path == "/dash/api/claude-hook":
-            if not self._dash_host_ok():
-                return
             try:
                 data = json.loads(body) if body else {}
                 if not isinstance(data, dict):
@@ -7955,6 +8249,10 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
@@ -8318,6 +8616,8 @@ def _selftest_multiauth() -> None:
     assert WEB_RECIPES["chatgpt_web"]["login_url"].startswith("https://chatgpt.com/auth/login")
     assert WEB_RECIPES["grok_web"]["url"].startswith("https://grok.com")
     assert any(s[0]=="THINK_MODE" and s[1]=="bool" and s[7]=="live" for s in SETTINGS_SCHEMA)
+    assert any(s[0]=="PARALLEL_MODE" and s[1]=="choice" and s[7]=="live" for s in SETTINGS_SCHEMA)
+    assert any(s[0]=="UI_MODE" and s[1]=="choice" and s[7]=="live" for s in SETTINGS_SCHEMA)
     assert 'account_ids' in DASH_HTML and 'add_web' in DASH_HTML and 'swAccounts' in DASH_HTML
     class P:
         def __init__(self):
@@ -8395,6 +8695,162 @@ def _selftest_multiauth() -> None:
 
 
 
+def _selftest_master_hardening() -> None:
+    """Focused regression tests for the implementation gates added in V6.4."""
+    import inspect
+    import types
+
+    # Browser lifecycle is explicit and rejects arbitrary state jumps.
+    d = DeepSeekWeb(profile_dir=Path(tempfile.gettempdir()) / "dsb-lifecycle-test", provider="deepseek_web")
+    assert d.lifecycle_state == "CREATED"
+    d._transition("STARTING", "test")
+    d._transition("READY", "test")
+    d._transition("BUSY", "test")
+    d._transition("WAITING_RESPONSE", "test")
+    d._transition("READY", "test")
+    try:
+        d._transition("LOGIN_REQUIRED", "illegal test transition")
+        raise AssertionError("invalid browser lifecycle transition was accepted")
+    except RuntimeError:
+        pass
+
+    # Hook authentication is intentionally separate from the public API key.
+    cfg = {"api_key": "api-secret", "hook_key": "hook-secret", "port": 8788}
+    env = claude_env(cfg, "http://127.0.0.1:8788")
+    assert env["DS_BRIDGE_HOOK_KEY"] == "hook-secret" and env["DS_BRIDGE_HOOK_KEY"] != cfg["api_key"]
+
+    old_env_events = os.environ.get("DS_BRIDGE_CLAUDE_HOOK_EVENTS")
+    try:
+        os.environ["DS_BRIDGE_CLAUDE_HOOK_EVENTS"] = "MessageDisplay,DefinitelyNotAClaudeHook"
+        events = _claude_hook_events()
+        assert "MessageDisplay" in events and "DefinitelyNotAClaudeHook" not in events
+    finally:
+        if old_env_events is None:
+            os.environ.pop("DS_BRIDGE_CLAUDE_HOOK_EVENTS", None)
+        else:
+            os.environ["DS_BRIDGE_CLAUDE_HOOK_EVENTS"] = old_env_events
+
+    # A localhost-only, non-wildcard CORS policy is part of the dashboard boundary.
+    opts_src = inspect.getsource(APIHandler.do_OPTIONS)
+    assert 'Access-Control-Allow-Origin", "*"' not in opts_src and "allow-origin: *" not in opts_src.lower()
+
+    # The hook endpoint uses the dedicated hook key.
+    class _HookHandler:
+        headers = {"Authorization": "Bearer hook-secret"}
+    old_bridge = globals().get("BRIDGE")
+    try:
+        class _HookPool:
+            cfg = {"hook_key": "hook-secret"}
+        globals()["BRIDGE"] = _HookPool()
+        assert APIHandler._check_hook_auth(_HookHandler()) is True
+        _HookHandler.headers = {"Authorization": "Bearer wrong"}
+        assert APIHandler._check_hook_auth(_HookHandler()) is False
+    finally:
+        globals()["BRIDGE"] = old_bridge
+
+    # An explicit empty account list must remain empty; it must not resurrect the legacy
+    # DeepSeek profile or crash while assigning the pinned account.
+    empty_cfg = {"accounts": [], "routing": {}}
+    empty_pool = Pool(empty_cfg, autostart=False)
+    assert empty_pool.accounts == [] and empty_pool.routing.get("pinned") is None
+    assert startup_prepare_accounts(empty_pool, {"mode": "multi", "full": False}) == []
+
+    # Restoring an account with start=True must leave the newly started worker alive.
+    with tempfile.TemporaryDirectory() as td:
+        old_config_path = globals()["CONFIG_PATH"]
+        try:
+            globals()["CONFIG_PATH"] = Path(td) / "restore-config.json"
+            restore_pool = Pool({
+                "api_key": "k", "hook_key": "h",
+                "accounts": [{"id": "r1", "name": "Restored", "enabled": False,
+                              "deleted": True, "kind": "api", "provider": "custom_openai",
+                              "api_key": "x", "base_url": "http://127.0.0.1", "model": "m"}],
+                "routing": {}
+            }, autostart=False)
+            restored = restore_pool.get_by_id("r1")
+            assert restored is not None and restored.deleted is True
+            calls: List[Tuple[str, bool]] = []
+            class _RestoreWorker:
+                ok = True
+                def __init__(self): self.stopped = False
+                def stop(self): self.stopped = True
+            def fake_restore_start(account: Account, force_login: bool = False) -> None:
+                calls.append((account.id, force_login))
+                account.worker = _RestoreWorker()
+                account.status = "starting"
+            restore_pool.start_account = fake_restore_start  # type: ignore[method-assign]
+            restore_pool.restore_account(restored, start=True)
+            assert calls == [("r1", False)]
+            assert restored.worker is not None and not restored.worker.stopped
+            restore_pool.stop()
+        finally:
+            globals()["CONFIG_PATH"] = old_config_path
+
+    # Deterministic lane ownership is stable and independent of request IDs.
+    eg = Engine.__new__(Engine)
+    eg.ds = types.SimpleNamespace(provider="chatgpt_web", name="ChatGPT 1")
+    eg.acct = types.SimpleNamespace(id="chatgpt-1")
+    eg._lane_locks = {}
+    req1 = types.SimpleNamespace(side=False, tag="agent-17", system_text="Primary working directory: C:/Project")
+    req2 = types.SimpleNamespace(side=False, tag="agent-17", system_text="Primary working directory: C:/Project")
+    req3 = types.SimpleNamespace(side=False, tag="agent-18", system_text="Primary working directory: C:/Project")
+    assert eg._lane_lock_key(req1) == eg._lane_lock_key(req2)
+    assert eg._lane_lock_key(req1) != eg._lane_lock_key(req3)
+
+    # Dashboard-only / selection-driven startup must not auto-start saved browser accounts.
+    with tempfile.TemporaryDirectory() as td:
+        old_accounts_dir = globals().get("ACCOUNTS_DIR")
+        try:
+            cfg_path = Path(td) / "cfg.json"
+            cfg_local = {"api_key":"k", "hook_key":"h", "accounts":[{"id":"saved","name":"Saved",
+                          "enabled":True,"kind":"web","provider":"deepseek_web","profile":str(Path(td)/"saved")}],
+                          "routing":{}, "settings":{}}
+            pp = Pool(cfg_local, autostart=False)
+            assert pp.get_by_id("saved") is not None and pp.get_by_id("saved").worker is None
+            pp.stop()
+        finally:
+            if old_accounts_dir is not None:
+                ACCOUNTS_DIR = old_accounts_dir
+
+    # Scheduler modes are deterministic and resource-aware.
+    class _Gov:
+        def snapshot(self, pool): return {"recommended": 2}
+    p = types.SimpleNamespace(accounts=[], governor=_Gov(), capacity=lambda: 6)
+    for provider, aid, mp in (("chatgpt_web", "g1", 2), ("deepseek_web", "d1", 1), ("grok_web", "x1", 3)):
+        a = types.SimpleNamespace(id=aid, provider=provider, enabled=True, deleted=False, status="ready",
+                                 cooldown_until=0, budget=0.0, max_parallel=mp, worker=object(),
+                                 inflight=0)
+        a.over_budget=lambda: False
+        p.accounts.append(a)
+    assert Pool.parallel_capacity(p, None, "serial") == 1
+    assert Pool.parallel_capacity(p, None, "light") == 3
+    assert Pool.parallel_capacity(p, None, "full") == 6
+    assert Pool.parallel_capacity(p, None, "auto") == 2
+
+    # Generated hook settings contain only an absolute localhost URL and no secret query string.
+    hs = claude_mirror_settings()
+    assert hs.get("hooks")
+    for groups in hs["hooks"].values():
+        hook = groups[0]["hooks"][0]
+        assert hook["url"].startswith("http://127.0.0.1:") and "?" not in hook["url"]
+        assert hook["headers"]["Authorization"] == "Bearer $DS_BRIDGE_HOOK_KEY"
+
+    log("Authorization: Bearer super-secret", C.dim, provider="chatgpt_web", account="g1",
+        lane="lane-test", project="C:/Project", request_id="req-test", event="test.redaction")
+    assert "super-secret" not in LOG_RING[-1][3] and "[REDACTED]" in LOG_RING[-1][3]
+
+    # UI invariants guarding the initialization race and lightweight mobile behavior.
+    assert 'var CC_SESSION=window.CC_SESSION={cwd:"",model:"",tool:"",text:"",event:"",status:"idle"}' in DASH_HTML
+    assert 'const localStorage=(()=>{try{return window.localStorage}' in DASH_HTML
+    assert 'prefers-reduced-motion' in DASH_HTML and 'width:min(82vw,280px)' in DASH_HTML
+    assert 'background-image:none!important' in DASH_HTML
+
+    # The dashboard performs authenticated write actions in-browser; make it impossible to embed/clickjack.
+    html_src = inspect.getsource(APIHandler._send_html)
+    assert 'X-Frame-Options", "DENY"' in html_src
+    assert "Content-Security-Policy\", \"frame-ancestors 'none'" in html_src
+
+
 def _selftest_startup_menu() -> None:
     items = _startup_provider_items({"accounts": []})
     assert len(items) == 6 and items[0][0] == "ChatGPT" and items[1][0] == "DeepSeek" and items[2][0] == "Grok"
@@ -8422,13 +8878,16 @@ def _selftest_startup_menu() -> None:
                 self.accounts.append(a); return a
         f = FakePool()
         ids = startup_prepare_accounts(f, {"mode": "multi", "full": False})
-        assert ids == ["g2", "d1", "grok_web-new"], ids
+        assert ids == ["g2", "d1"], ids
+        assert len(f.accounts) == 3, "multi mode must not create surprise provider profiles"
         f2 = FakePool()
         ids2 = startup_prepare_accounts(f2, {"mode": "multi", "full": True})
-        assert ids2 == ["g1", "g2", "d1", "grok_web-new"], ids2
+        assert ids2 == ["g1", "g2", "d1"], ids2
+        assert len(f2.accounts) == 3
 
 
 def self_test() -> None:
+    _selftest_master_hardening()
     _selftest_startup_menu()
     # 1. Original failure: malformed <tool_call> JSON + DSML residue.
     malformed = (
@@ -9227,7 +9686,9 @@ def _selftest_multi() -> None:
         pool.move(na, -1)
         assert pool.accounts[2] is na
         pool.remove_account(na, purge=False)
-        assert len(pool.accounts) == 3 and pool.get("Work") is None
+        assert len(pool.accounts) == 4 and na.deleted and not na.enabled and pool.get("Work") is na
+        pool.restore_account(na, start=False)
+        assert not na.deleted and na.enabled and pool.get("Work") is na
 
         # ---- dashboard over real HTTP (auth, host / origin guard, actions, /ds interception)
         old_b, old_k = BRIDGE, API_KEY
@@ -9249,7 +9710,7 @@ def _selftest_multi() -> None:
             assert s == 200 and b"DeepSeek Bridge" in d and b"/dash/api/" in d and b'api("state")' in d
             assert call("GET", "/dash/api/state", headers={"Authorization": "Bearer nope"})[0] == 401
             s, d = call("GET", "/dash/api/state")
-            assert s == 200 and len(json.loads(d)["accounts"]) == 3
+            assert s == 200 and len(json.loads(d)["accounts"]) == 4
             assert call("GET", "/dash/api/state", headers={"Host": "evil.example"})[0] == 403
             assert call("POST", "/dash/api/use", {"id": "c"}, {"Origin": "http://evil.example"})[0] == 403
             assert call("POST", "/dash/api/use", {"id": "c"})[0] == 200 and pool.routing["pinned"] == "c"
@@ -10137,11 +10598,9 @@ _SAFE_BASH_DENY = (
 _SAFE_BASH_DENY_WILDCARD = ("git log*--output*", "git show*--output*")
 
 
-# Claude Code 2.1.112 (the version currently used by the launcher) rejects newer hook
-# event names such as MessageDisplay / PreModelSwitch and does not interpolate environment
-# variables inside the URL field. Keep the mirror conservative and put the secret only in
-# the HTTP header, where Claude Code explicitly supports allowedEnvVars.
-_CLAUDE_MIRROR_EVENTS = (
+# Conservative default for older CLI releases. Newer installations may opt in to additional
+# documented hook events by setting DS_BRIDGE_CLAUDE_HOOK_EVENTS to a comma/space separated list.
+_CLAUDE_MIRROR_EVENTS_SAFE = (
     "PreToolUse", "PostToolUse", "PostToolUseFailure", "Notification", "UserPromptSubmit",
     "SessionStart", "SessionEnd", "Stop", "StopFailure", "SubagentStart", "SubagentStop",
     "PreCompact", "PostCompact", "PermissionRequest", "PermissionDenied", "Setup",
@@ -10149,6 +10608,18 @@ _CLAUDE_MIRROR_EVENTS = (
     "ConfigChange", "WorktreeCreate", "WorktreeRemove", "InstructionsLoaded", "CwdChanged",
     "FileChanged",
 )
+
+def _claude_hook_events() -> Tuple[str, ...]:
+    raw=os.getenv("DS_BRIDGE_CLAUDE_HOOK_EVENTS","").strip()
+    if not raw or raw.lower()=="safe": return _CLAUDE_MIRROR_EVENTS_SAFE
+    requested=tuple(dict.fromkeys(x.strip() for x in re.split(r"[,\s]+",raw) if x.strip()))
+    invalid=[x for x in requested if x not in CLAUDE_HOOK_EVENT_UNION]
+    if invalid:
+        _warn_once("hook-events","ignoring unknown Claude hook events: "+", ".join(invalid[:8]))
+        requested=tuple(x for x in requested if x in CLAUDE_HOOK_EVENT_UNION)
+    return requested or _CLAUDE_MIRROR_EVENTS_SAFE
+
+_CLAUDE_MIRROR_EVENTS = _claude_hook_events()
 
 
 def _claude_hook_url() -> str:
@@ -10165,8 +10636,9 @@ def _claude_hook_url() -> str:
 def claude_mirror_settings() -> Dict[str, Any]:
     """Non-blocking semantic event bridge from Claude Code into the dashboard.
 
-    Only events known to work on the supported Claude Code baseline are emitted here.
-    The hook never returns a decision and therefore cannot block Claude.
+    The default event set is conservative for old Claude Code clients. The optional event override
+    is validated against CLAUDE_HOOK_EVENT_UNION before it is emitted. The hook never returns a decision
+    and therefore cannot block Claude.
     """
     url = _claude_hook_url()
     groups: Dict[str, Any] = {}
@@ -10369,7 +10841,7 @@ def claude_env(cfg: Dict[str, Any], url: str) -> Dict[str, str]:
         "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "DS_BRIDGE_HOOK_URL": f"http://127.0.0.1:{cfg.get('port', DEFAULT_PORT)}/dash/api/claude-hook",
-        "DS_BRIDGE_HOOK_KEY": cfg["api_key"],
+        "DS_BRIDGE_HOOK_KEY": cfg.get("hook_key") or cfg["api_key"],
     })
     for k, v in (("API_TIMEOUT_MS", CLIENT_API_TIMEOUT_MS),
                  ("BASH_DEFAULT_TIMEOUT_MS", CLIENT_BASH_DEFAULT_TIMEOUT_MS),
@@ -10629,7 +11101,13 @@ def _run(cmd: List[str]) -> bool:
 
 
 def ensure_dependencies(cfg: Dict[str, Any], need_claude: bool) -> bool:
-    """Everything the old .bat did, but only when something is really missing."""
+    """Install only dependencies required by an already-selected workflow.
+
+    The startup menu must remain cheap: this helper is intentionally called only
+    after the user has selected a mode/account that actually needs a browser or
+    Claude Code. A system Chromium/Chrome binary is accepted before attempting a
+    network-backed Playwright browser download.
+    """
     global BROWSER_CHANNEL
     import importlib
     try:
@@ -10640,15 +11118,21 @@ def ensure_dependencies(cfg: Dict[str, Any], need_claude: bool) -> bool:
             print(C.red("[setup] could not install playwright."))
             return False
         importlib.invalidate_caches()
+
     if not find_system_chrome():
-        BROWSER_CHANNEL = ""                      # no Chrome: use Playwright's own Chromium
-        if not cfg.get("chromium_installed"):
-            print(C.yellow("[setup] Google Chrome not found; installing Playwright Chromium..."), flush=True)
-            if not _run([sys.executable, "-m", "playwright", "install", "chromium"]):
-                print(C.red("[setup] could not install a browser. Install Google Chrome and retry."))
-                return False
-            cfg["chromium_installed"] = True
-            save_config(cfg)
+        system_browser = (shutil.which("chromium") or shutil.which("chromium-browser") or
+                          shutil.which("google-chrome") or shutil.which("chrome"))
+        if system_browser:
+            BROWSER_CHANNEL = ""
+        else:
+            BROWSER_CHANNEL = ""                      # use Playwright's own Chromium
+            if not cfg.get("chromium_installed"):
+                print(C.yellow("[setup] no supported system browser found; installing Playwright Chromium..."), flush=True)
+                if not _run([sys.executable, "-m", "playwright", "install", "chromium"]):
+                    print(C.red("[setup] could not install a browser. Install Chrome/Chromium and retry."))
+                    return False
+                cfg["chromium_installed"] = True
+                save_config(cfg)
     if need_claude and not shutil.which("claude"):
         npm = shutil.which("npm")
         if not npm:
@@ -10742,7 +11226,12 @@ def _startup_key() -> str:
         tty.setraw(fd)
         ch = sys.stdin.read(1)
         if ch == "\x1b":
-            seq = sys.stdin.read(2)
+            seq = ""
+            try:
+                ready, _, _ = select.select([fd], [], [], 0.06)
+                if ready: seq = sys.stdin.read(2)
+            except Exception:
+                seq = ""
             if seq == "[A": return "up"
             if seq == "[B": return "down"
             if seq == "[C": return "right"
@@ -10784,9 +11273,8 @@ def _startup_menu(title: str, items: List[Tuple[str, str]], selected: int = 0,
         print()
         for i, (name, sub) in enumerate(items):
             marker = ">" if i == idx else " "
-            print(f" {marker} {i + 1}. {name}")
-            if sub:
-                print(f"      {C.dim(sub)}")
+            compact_sub = f"  • {sub}" if sub else ""
+            print(f" {marker} {i + 1}. {name}{C.dim(compact_sub)}")
         print()
         hint = "↑↓ انتخاب  •  Enter تأیید"
         if allow_space:
@@ -10874,10 +11362,10 @@ def startup_prepare_accounts(pool: "Pool", choice: Dict[str, Any], headed: bool 
         providers = list(STARTUP_WEB_PROVIDERS)
         selected: List[str] = []
         for provider in providers:
-            candidates = [a for a in pool.accounts if a.enabled and a.kind == "web" and a.provider == provider]
+            candidates = [a for a in pool.accounts if a.enabled and not a.deleted and a.kind == "web" and a.provider == provider]
+            # Multi-AI is explicit: it never creates a surprise browser profile.
             if not candidates:
-                a = pool.add_web_account(provider, name=f"{_startup_provider_name(provider)} 1", headed=headed, start=False)
-                candidates = [a]
+                continue
             if choice.get("full"):
                 selected.extend(a.id for a in candidates)
             else:
@@ -10894,7 +11382,7 @@ def startup_prepare_accounts(pool: "Pool", choice: Dict[str, Any], headed: bool 
 def main() -> int:
     global BRIDGE, API_KEY, DEBUG_DIR, HEADLESS_MODE, LOG_FILE, RUN_MODE, PANEL_ONLY, SERVER
     ap = argparse.ArgumentParser(
-        description=f"DeepSeek V{VERSION} bridge. By default it starts the bridge AND Claude Code in this window.",
+        description=f"DeepSeek V{VERSION} bridge. Start explicitly from the lightweight AI selector or use --ai/--panel.",
         epilog="Unknown arguments are passed to Claude Code (e.g. --continue, --resume).")
     ap.add_argument("project", nargs="?", help="project folder for Claude Code (drag a folder onto this file)")
     ap.add_argument("--terminal", action="store_true", help="bridge only, with the interactive terminal (no Claude Code)")
@@ -10975,6 +11463,22 @@ def main() -> int:
 
     if os.name == "nt":
         os.system("title DeepSeek Bridge + Claude Code")
+    # Explicit startup selection comes before project/dependency work. Dashboard-only is genuinely cheap.
+    if args.panel:
+        startup_choice = {"mode":"dashboard"}
+    elif args.ai:
+        startup_choice = {"mode":"dashboard" if args.ai=="dashboard" else "multi" if args.ai=="multi" else "provider",
+                          **({} if args.ai in ("dashboard","multi") else {"provider":args.ai+"_web"}),
+                          **({"full":False} if args.ai=="multi" else {})}
+    elif args.terminal:
+        # --terminal is already an explicit startup choice; preserve legacy non-interactive use
+        # without invoking a keyboard menu or silently selecting a different provider.
+        startup_choice = {"mode": "provider", "provider": "deepseek_web"}
+    else:
+        startup_choice = startup_ai_menu(cfg)
+    if startup_choice.get("mode")=="exit":
+        print(C.dim("[startup] cancelled.")); return 0
+    startup_menu_done=time.perf_counter()
     project = None
     if not args.terminal:
         project = pick_project_dir(cfg, args.project, args.choose_project, args.here)
@@ -10991,8 +11495,6 @@ def main() -> int:
         except Exception as exc:
             print(C.red(f"[prompt] cannot use --prompt-file: {exc}"))
             return 1
-    if not ensure_dependencies(cfg, need_claude=not args.terminal):
-        return 1
     bridge_reused = (not args.terminal and bridge_already_running(int(cfg["port"])))
     if bridge_reused:
         # A second launch must synchronize the selected project into the already-running
@@ -11010,24 +11512,27 @@ def main() -> int:
 
     if project is not None and not bridge_reused:
         remember_project(cfg, project, persist=True)
-    # Explicit startup choice: never open DeepSeek (or any other web AI) implicitly.
-    if args.panel:
-        startup_choice = {"mode": "dashboard"}
-    elif args.ai:
-        startup_choice = {"mode": "dashboard" if args.ai == "dashboard" else
-                          "multi" if args.ai == "multi" else "provider",
-                          **({} if args.ai in ("dashboard", "multi") else {"provider": args.ai + "_web"}),
-                          **({"full": False} if args.ai == "multi" else {})}
-    else:
-        startup_choice = startup_ai_menu(cfg)
-    if startup_choice.get("mode") == "exit":
-        print(C.dim("[startup] cancelled."))
-        return 0
-
-    BRIDGE = Pool(cfg)
+    # Startup is selection-driven: constructing the pool must never start saved browsers
+    # before the user-selected mode is known. Selected accounts are started explicitly below.
+    BRIDGE = Pool(cfg, autostart=False)
     for nm in args.add_account or []:
         BRIDGE.add_account(nm, start=False)
     selected_ids = startup_prepare_accounts(BRIDGE, startup_choice, headed=bool(args.headed))
+
+    # Dependency installation is deliberately after account selection. Dashboard-only,
+    # empty Multi-AI, and other no-op selections must not trigger browser downloads.
+    selected_accounts = [BRIDGE.get_by_id(aid) for aid in selected_ids]
+    selected_web = any(a is not None and getattr(a, "kind", "") == "web" for a in selected_accounts)
+    need_claude = not args.terminal and startup_choice.get("mode") != "dashboard"
+    if (selected_web or (need_claude and bool(selected_ids))) and not ensure_dependencies(cfg, need_claude=need_claude):
+        BRIDGE.stop()
+        return 1
+
+    if startup_choice.get("mode") != "dashboard" and not selected_ids:
+        log("[startup] the selected mode has no ready/configured account; nothing was started", C.yellow)
+        BRIDGE.stop()
+        return 1
+
     if startup_choice.get("mode") == "dashboard":
         # Dashboard-only means exactly that: no AI worker and no Claude Code process.
         args.terminal, PANEL_ONLY = True, True
@@ -11035,7 +11540,11 @@ def main() -> int:
         log("[main] starting Bridge without starting an AI browser (Dashboard only).", C.dim)
     else:
         names = [BRIDGE.get_by_id(aid).name for aid in selected_ids if BRIDGE.get_by_id(aid)]
-        log(f"[main] starting selected AI account(s): {', '.join(names) or 'none'}", C.dim)
+        log(f"[main] starting selected AI account(s): {', '.join(names) or 'none'} (selection latency {((time.perf_counter()-startup_menu_done)*1000):.0f}ms)", C.dim)
+        if not selected_ids:
+            log(f"[error] startup selection '{startup_choice.get('mode')}' has no eligible account; configure that provider explicitly in the dashboard.", C.red)
+            BRIDGE.stop()
+            return 1
         BRIDGE.start_selected(selected_ids)
         if not BRIDGE.wait_selected_ready(selected_ids, LOGIN_WAIT_SECONDS + 120):
             log("[error] no selected AI account could be started / logged in.", C.red)
