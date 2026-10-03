@@ -287,7 +287,7 @@ def _env_bool(name: str, default: bool) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
 
 
-VERSION = "6.2"
+VERSION = "6.3"
 SCRIPT_DIR = Path(__file__).resolve().parent
 CHAT_URL = os.getenv("DS_BRIDGE_CHAT_URL", "https://chat.deepseek.com/")
 # Absolute + anchored to the script so the login survives different cwd's.
@@ -298,10 +298,11 @@ BROWSER_CHANNEL = os.getenv("DS_BRIDGE_CHANNEL", "chrome")
 # auto = try real headless first, fall back to a visible window; 1 = force
 # headless; 0 = always visible window.
 HEADLESS_MODE = os.getenv("DS_BRIDGE_HEADLESS", "auto").strip().lower()
-
 DEFAULT_PORT = _env_int("DS_BRIDGE_PORT", 8788)
 LOGIN_WAIT_SECONDS = _env_int("DS_BRIDGE_LOGIN_WAIT", 600)
 HEADLESS_READY_TIMEOUT = _env_int("DS_BRIDGE_READY_TIMEOUT", 20)
+# Native provider thinking is opt-in and intentionally disabled by default.
+THINK_MODE = _env_bool("DS_BRIDGE_THINK_MODE", False)
 
 # Prompt budgets (characters).
 MAX_PROMPT_CHARS = _env_int("DS_BRIDGE_MAX_PROMPT_CHARS", 800_000)
@@ -406,7 +407,12 @@ _LOG_SEQ = itertools.count(1)
 
 def log(msg: str, color: Optional[Callable[[Any], str]] = None) -> None:
     lvl = {"red": "error", "yellow": "warn", "green": "ok"}.get(getattr(color, "__name__", ""), "info")
-    LOG_RING.append((next(_LOG_SEQ), time.time(), lvl, str(msg)))
+    seq = next(_LOG_SEQ)
+    LOG_RING.append((seq, time.time(), lvl, str(msg)))
+    try:
+        emit_dash_event("console", {"n": seq, "t": time.time(), "level": lvl, "message": str(msg)[:500]})
+    except Exception:
+        pass
     if LOG_FILE is not None:
         try:
             LOG_FILE.write(time.strftime("%H:%M:%S ") + msg + "\n")
@@ -2299,6 +2305,26 @@ JS_SET_TEXT = r"""
 }
 """
 
+JS_SET_GENERIC_TEXT = r"""
+({selector, text}) => {
+  const el = document.querySelector(selector);
+  if (!el) return {ok:false,len:0};
+  el.focus();
+  if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
+    const proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    const d = Object.getOwnPropertyDescriptor(proto, "value");
+    if (d && d.set) d.set.call(el, text); else el.value = text;
+  } else if (el.isContentEditable) {
+    const sel=window.getSelection(); const range=document.createRange(); range.selectNodeContents(el); sel.removeAllRanges(); sel.addRange(range);
+    if (!document.execCommand("insertText", false, text)) { el.textContent=text; }
+  } else return {ok:false,len:0};
+  el.dispatchEvent(new InputEvent("input", {bubbles:true, inputType:"insertText", data:null}));
+  el.dispatchEvent(new Event("change", {bubbles:true}));
+  const val=el.value !== undefined ? el.value : (el.innerText || el.textContent || "");
+  return {ok:val===text,len:val.length};
+}
+"""
+
 JS_TA_LEN = r"""
 (selector) => { const ta = document.querySelector(selector) || document.querySelector('textarea'); if (ta) ta.focus(); return ta ? ta.value.length : -1; }
 """
@@ -2372,14 +2398,121 @@ class Exchange:
     seconds: float
 
 
+JS_GENERIC_COMPOSER = r"""() => {
+  const sels = [
+    'textarea[placeholder*="message" i]', 'textarea[aria-label*="message" i]',
+    'textarea[placeholder*="prompt" i]', 'textarea',
+    '[contenteditable="true"][role="textbox"]', '[contenteditable="true"]'
+  ];
+  for (const s of sels) {
+    for (const el of document.querySelectorAll(s)) {
+      const r = el.getBoundingClientRect(), st = getComputedStyle(el);
+      if (r.width > 0 && r.height > 0 && st.visibility !== 'hidden' && st.display !== 'none' && !el.disabled) return s;
+    }
+  }
+  return null;
+}"""
+
+JS_GENERIC_SEND = r"""(selector) => {
+  const root = document.querySelector(selector);
+  if (!root) return false;
+  let p = root;
+  for (let i = 0; i < 8 && p; i++, p = p.parentElement) {
+    const bs = [...p.querySelectorAll('button,[role="button"]')];
+    const b = bs.find(x => {
+      const r=x.getBoundingClientRect(), st=getComputedStyle(x), s=((x.getAttribute('aria-label')||'')+' '+(x.getAttribute('title')||'')+' '+(x.textContent||'')).trim();
+      return r.width>0&&r.height>0&&st.visibility!=='hidden'&&st.display!=='none'&&!x.disabled && /^(send|submit|ارسال|فرستادن)\b/i.test(s);
+    });
+    if (b) { b.click(); return true; }
+  }
+  return false;
+}"""
+
+# Start a new conversation in the SAME browser tab when explicitly requested. This is never
+# used on the normal hot path; normal requests intentionally reuse the current web chat.
+JS_GENERIC_NEW_CHAT = r"""() => {
+  const vis=x=>{const r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width>0&&r.height>0&&s.visibility!=="hidden"&&s.display!=="none"&&!x.disabled};
+  const text=x=>((x.getAttribute("aria-label")||"")+" "+(x.getAttribute("title")||"")+" "+(x.textContent||"")).replace(/\s+/g," ").trim();
+  const re=/^(new\s+(chat|conversation)|start\s+(a\s+)?new\s+(chat|conversation)|new\s+thread|گفتگوی\s+جدید|چت\s+جدید)$/i;
+  const c=[...document.querySelectorAll("button,[role=button]")].filter(vis).filter(x=>re.test(text(x)));
+  if(!c.length)return false;
+  c[0].click(); return true;
+}"""
+
+JS_SET_NATIVE_THINK = r"""(arg) => {
+  const cfg=typeof arg==="object"&&arg!==null?arg:{enabled:!!arg,provider:""};
+  const want=!!cfg.enabled, provider=String(cfg.provider||"");
+  const vis=x=>{const r=x.getBoundingClientRect(),s=getComputedStyle(x);return r.width>0&&r.height>0&&s.visibility!=="hidden"&&s.display!=="none"&&!x.disabled};
+  const label=x=>((x.getAttribute("aria-label")||"")+" "+(x.getAttribute("title")||"")+" "+(x.textContent||"")).replace(/\s+/g," ").trim();
+  const state=x=>{const s=String(x.getAttribute("aria-pressed")||x.getAttribute("aria-selected")||x.getAttribute("aria-current")||x.dataset.state||x.dataset.selected||"").toLowerCase();return s==="true"||s==="selected"||s==="checked"||s==="on"};
+  const isAutoSwitch=s=>/auto\s*[- ]?switch.*(thinking|reasoning|تفکر|استدلال)/i.test(s);
+  const isThink=s=>!isAutoSwitch(s)&&/\b(deep\s*think|thinking|reasoning|think|medium|high|extra\s+high|تفکر|استدلال|متوسط|بالا)\b/i.test(s);
+  const isFast=s=>/\b(instant|fast|standard|quick|سریع|فوری)\b/i.test(s);
+  const controls=()=>[...document.querySelectorAll("button,[role=button],[aria-pressed],[aria-selected]")].filter(vis);
+  const pickThink=()=>{const c=controls().filter(x=>isThink(label(x))&&!isAutoSwitch(label(x)));return c.sort((a,b)=>{const score=s=>{s=s.toLowerCase();return /deep\s*think|thinking|reasoning|think|تفکر|استدلال/.test(s)?100:/extra\s+high|high|بالا/.test(s)?90:/medium|متوسط/.test(s)?80:70};return score(label(b))-score(label(a))})[0]||null};
+  const inMenu=x=>!!x.closest('[role="menu"], [role="listbox"], [data-radix-menu-content]');
+  const pickFast=()=>{const c=controls().filter(x=>isFast(label(x)));return c.sort((a,b)=>Number(inMenu(b))-Number(inMenu(a)))[0]||null};
+  let b=want?pickThink():pickFast();
+  if(!b){
+    const opener=controls().find(x=>/\b(instant|auto|model|medium|high|thinking|reasoning|مدل|فوری)\b/i.test(label(x)));
+    if(opener){opener.click();}
+  }
+  b=want?pickThink():pickFast();
+  if(!b){
+    // Some ChatGPT plans expose "Instant" as the closed picker itself. If that is what is
+    // currently shown, it already represents the requested non-thinking state; do not reopen it.
+    if(!want){const shown=controls().find(x=>/^\s*instant\s*$/i.test(label(x)));if(shown)return true;}
+    return false;
+  }
+  if(state(b))return true;
+  // An unselected "Instant" control outside a menu is the picker opener, not the option itself.
+  if(!want&&/^\s*instant\s*$/i.test(label(b))&&!b.closest('[role="menu"], [role="listbox"], [data-radix-menu-content]'))return true;
+  b.click(); return true;
+}"""
+
+JS_GENERIC_SNAPSHOT = r"""() => {
+  const textOf = (root) => {
+    if (!root) return '';
+    const c = root.cloneNode(true);
+    c.querySelectorAll('button,summary,details,[aria-hidden="true"],[hidden],script,style,[class*="thinking" i],[class*="reasoning" i],[class*="chain-of-thought" i],[data-testid*="thinking" i],[data-testid*="reasoning" i],[aria-label*="thinking" i],[aria-label*="reasoning" i],[data-state*="reasoning" i]').forEach(x=>x.remove());
+    return (c.innerText || c.textContent || '').replace(/\u00a0/g,' ').replace(/\n{3,}/g,'\n\n').trim();
+  };
+  const visible = (el) => { const r=el.getBoundingClientRect(), s=getComputedStyle(el); return r.width>0&&r.height>0&&s.visibility!=='hidden'&&s.display!=='none'; };
+  const roots = [];
+  const sels = [
+    '[data-message-author-role="assistant"]', '[data-role="assistant"]',
+    '[data-testid*="assistant-message" i]', '[data-testid*="assistant" i]',
+    '[class*="assistant-message" i]', '[class*="assistant" i]', '[class*="response" i]'
+  ];
+  for (const sel of sels) {
+    const found = [...document.querySelectorAll(sel)].filter(visible);
+    if (!found.length) continue;
+    for (const el of found) { const tx=textOf(el); if (tx) roots.push(tx); }
+    if (roots.length) break;
+  }
+  const all = [...new Set(roots)];
+  const stop = [...document.querySelectorAll('button,[role="button"]')].some(b => {
+    if (!visible(b)) return false;
+    const s=((b.getAttribute('aria-label')||'')+' '+(b.getAttribute('title')||'')+' '+(b.textContent||'')).trim();
+    return /^(stop|stop generating|cancel generation|توقف|ایست)\b/i.test(s);
+  });
+  const auth = /\b(sign in|log in|login|continue with google|continue with apple|ورود|ثبت نام)\b/i.test((document.body?.innerText||'').slice(0,6000));
+  return {assistant: all, latest: all.length ? all[all.length-1] : '', count: all.length, generating: stop, auth};
+}"""
+
+
 class DeepSeekWeb:
     """Owned and used by ONE thread only (sync Playwright requirement)."""
 
     def __init__(self, profile_dir: Optional[Path] = None, name: str = "", headed: bool = False,
                  on_state: Optional[Callable[[str], None]] = None,
-                 on_exchange: Optional[Callable[[int, int, float], None]] = None) -> None:
+                 on_exchange: Optional[Callable[[int, int, float], None]] = None,
+                 provider: str = "deepseek_web") -> None:
         self.profile_dir = Path(profile_dir) if profile_dir else PROFILE_DIR
         self.name = name
+        self.provider = str(provider or "deepseek_web")
+        self.recipe = WEB_RECIPES.get(self.provider, WEB_RECIPES["deepseek_web"])
+        self._think_pref_initial = bool(THINK_MODE and self.recipe.get("supports_think"))
         self.headed_pref = headed          # keep the window visible (hands-on mode)
         self.on_state = on_state
         self.on_exchange = on_exchange
@@ -2396,6 +2529,10 @@ class DeepSeekWeb:
         self.last_timings: Dict[str, float] = {}
         self._warned_dom = False
 
+    @property
+    def think_pref(self) -> bool:
+        return bool(THINK_MODE and self.recipe.get("supports_think"))
+
     # ---- launch -----------------------------------------------------------
 
     def _launch(self, headless: bool):
@@ -2404,10 +2541,12 @@ class DeepSeekWeb:
             args.append("--no-sandbox")
         if not headless and not sys.platform.startswith("linux") and self._minimize:
             args.append("--start-minimized")     # most Linux window managers mishandle it
-        kwargs = dict(user_data_dir=str(self.profile_dir), headless=headless, args=args,
+
+        profile = self.profile_dir
+        profile.mkdir(parents=True, exist_ok=True)
+        kwargs = dict(user_data_dir=str(profile), headless=headless, args=args,
                       viewport={"width": 1280, "height": 900}, locale="en-US",
                       ignore_default_args=["--enable-automation"])
-        self.profile_dir.mkdir(parents=True, exist_ok=True)
         if BROWSER_CHANNEL:
             try:
                 return self.pw.chromium.launch_persistent_context(channel=BROWSER_CHANNEL, **kwargs)
@@ -2434,19 +2573,25 @@ class DeepSeekWeb:
         self.ctx = None
         self.scratch = None
 
-    @staticmethod
-    def _has_token(page) -> bool:
-        try:
-            tok = page.evaluate("localStorage.getItem('userToken')")
-            if not tok or tok in ("null", "undefined", "{}", ""):
-                return False
+    def _has_token(self, page) -> bool:
+        if self.provider == "deepseek_web":
             try:
-                obj = json.loads(tok)
-                if isinstance(obj, dict):
-                    return bool(obj.get("value") or obj.get("token"))
+                tok = page.evaluate("localStorage.getItem('userToken')")
+                if not tok or tok in ("null", "undefined", "{}", ""):
+                    return False
+                try:
+                    obj = json.loads(tok)
+                    if isinstance(obj, dict):
+                        return bool(obj.get("value") or obj.get("token"))
+                except Exception:
+                    pass
+                return True
             except Exception:
-                pass
-            return True
+                return False
+        try:
+            if not self._find_textarea(page):
+                return False
+            return bool(self._find_textarea(page))
         except Exception:
             return False
 
@@ -2458,6 +2603,14 @@ class DeepSeekWeb:
             except Exception:
                 pass
             self._sel = None
+        if self.provider != "deepseek_web":
+            try:
+                sel = page.evaluate(JS_GENERIC_COMPOSER)
+            except Exception:
+                sel = None
+            if sel:
+                self._sel = sel
+            return sel
         try:
             sel = page.evaluate(JS_FIND_SELECTOR, TEXTAREA_SELECTORS)
         except Exception:
@@ -2476,11 +2629,27 @@ class DeepSeekWeb:
         return None
 
     def _logged_in(self, page) -> bool:
-        return self._has_token(page) and self._find_textarea(page) is not None
+        if self.provider == "deepseek_web":
+            return self._has_token(page) and self._find_textarea(page) is not None
+        try:
+            sel = self._find_textarea(page)
+            if not sel:
+                return False
+            host = (urllib.parse.urlsplit(str(page.url or "")).hostname or "").lower()
+            expected = str(self.recipe.get("url") or "").split("//", 1)[-1].split("/", 1)[0].lower()
+            if expected and host and not (host == expected or host.endswith("." + expected)):
+                return False
+            body = str(page.locator("body").inner_text(timeout=1500) if page.locator("body").count() else "")[:10000]
+            if re.search(r"\b(sign\s*in|log\s*in|create\s+account|ثبت\s*نام|ورود)\b", body, re.I):
+                return False
+            return True
+        except Exception:
+            return False
 
     def _goto_chat(self, page) -> None:
+        url = CHAT_URL if self.provider == "deepseek_web" else str(self.recipe.get("url") or self.recipe.get("login_url"))
         try:
-            page.goto(CHAT_URL, wait_until="domcontentloaded", timeout=30000)
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
         except Exception as exc:
             log(f"[browser] navigation warning: {exc}", C.yellow)
         self._wait_textarea(page, 8)
@@ -2489,16 +2658,30 @@ class DeepSeekWeb:
         try:
             self.ctx = self._launch(headless)
             self.ctx.add_init_script(HOOK_JS)
-            page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+            pages = list(self.ctx.pages)
+            # Never hijack an arbitrary restored Chrome page. Prefer DeepSeek itself,
+            # then a blank/new-tab page, otherwise create a dedicated control page.
+            page = next((p for p in pages if CHAT_URL.rstrip("/") in (p.url or "")), None)
+            if page is None:
+                page = next((p for p in pages if (p.url or "") in ("", "about:blank", "chrome://newtab/", "chrome://new-tab-page/")), None)
+            if page is None:
+                page = self.ctx.new_page()
             self._setup_page(page)
             self._goto_chat(page)
+            if self.provider != "deepseek_web" and not self._logged_in(page):
+                login_url = str(self.recipe.get("login_url") or "")
+                if login_url and login_url != str(self.recipe.get("url") or ""):
+                    try:
+                        page.goto(login_url, wait_until="domcontentloaded", timeout=30000)
+                    except Exception as exc:
+                        log(f"[login:{self.name or self._provider_name()}] navigation warning: {exc}", C.yellow)
             self.scratch = page
             self.headless = headless
             if self._logged_in(page):
                 return True
             if announce:
                 self._state("login")
-                log(f"[login:{self.name or 'account'}] Please log in to DeepSeek in the opened Chrome window "
+                log(f"[login:{self.name or 'account'}] Please log in to {self._provider_name()} in the opened Chrome window "
                     f"(waiting up to {login_wait // 60} minutes)...", C.bold)
             end = time.time() + login_wait
             last_report = 0.0
@@ -2598,21 +2781,30 @@ class DeepSeekWeb:
     def open_chat(self, page) -> None:
         self._goto_chat(page)
         if not self._has_token(page):
-            raise BridgeError("DeepSeek login expired. Click Login for this account on the dashboard (or restart the bridge).", "login")
+            pnm = self.recipe.get("name", self.provider)
+            raise BridgeError(f"{pnm} login is not active. Click Login for this account on the dashboard.", "login")
         if not self._find_textarea(page):
-            raise BridgeError("chat input box not found (site layout changed or blocked)", "upstream")
+            raise BridgeError("chat input box not found (provider layout changed or blocked)", "upstream")
+        if self.recipe.get("supports_think"):
+            found = self._set_native_think(page, self.think_pref)
+            if self.think_pref and not found:
+                log(f"[think:{self.name or self._provider_name()}] native thinking control not found; keeping provider default", C.yellow)
 
     def open_session(self, page, sid: Optional[str]) -> bool:
-        """Open an existing DeepSeek chat (by session id) in `page`."""
         if not sid:
             return False
-        url = CHAT_URL.rstrip("/") + "/a/chat/s/" + sid
+        if self.provider == "deepseek_web":
+            url = CHAT_URL.rstrip("/") + "/a/chat/s/" + sid
+        else:
+            url = sid if re.match(r"^https?://", sid) else str(self.recipe.get("url"))
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
         except Exception as exc:
             log(f"[browser] navigation warning: {exc}", C.yellow)
         if not self._wait_textarea(page, 12) or not self._has_token(page):
             return False
+        if self.provider != "deepseek_web":
+            return True
         end = time.time() + 6
         while time.time() < end:
             if self.session_of(page) == sid:
@@ -2631,11 +2823,16 @@ class DeepSeekWeb:
     def session_of(page) -> Optional[str]:
         try:
             m = re.search(r"/s/([0-9a-fA-F-]{32,40})", page.url)
-            return m.group(1) if m else None
+            if m:
+                return m.group(1)
+            u = str(page.url or "")
+            return u if re.match(r"^https?://", u) else None
         except Exception:
             return None
 
     def delete_chat(self, sid: str) -> bool:
+        if self.provider != "deepseek_web":
+            return False
         try:
             page = self.scratch
             if page is None or page.is_closed():
@@ -2648,6 +2845,19 @@ class DeepSeekWeb:
             return page.evaluate(JS_DELETE_CHAT, sid) in (200, 204)
         except Exception:
             return False
+
+    # ---- provider-neutral web controls ----------------------------------
+
+    def _set_native_think(self, page, enabled: bool) -> bool:
+        if not self.recipe.get("supports_think"):
+            return False
+        try:
+            return bool(page.evaluate(JS_SET_NATIVE_THINK, {"enabled": bool(enabled), "provider": self.provider}))
+        except Exception:
+            return False
+
+    def _provider_name(self) -> str:
+        return str(self.recipe.get("name") or self.provider)
 
     # ---- exchange ---------------------------------------------------------
 
@@ -2711,6 +2921,127 @@ class DeepSeekWeb:
                 log(f"[files] uploaded in {time.time() - t0:.1f}s", C.dim)
                 return
             time.sleep(0.25)
+
+    def _inject_generic(self, page, sel: str, prompt: str) -> int:
+        """Insert web prompts without a clipboard/paste event.
+
+        ChatGPT currently turns pastes above 10k characters into attachments. The bridge must
+        therefore use a DOM/input path that produces an ordinary text-input event instead of
+        a ClipboardEvent. Playwright ``fill()`` is the safe fallback for both textarea and
+        contenteditable composers and never uses the clipboard.
+        """
+        text = prompt.replace("\r\n", "\n").replace("\r", "\n")
+        try:
+            r = page.evaluate(JS_SET_GENERIC_TEXT, {"selector": sel, "text": text}) or {}
+            if r.get("ok") and int(r.get("len") or 0) == len(text):
+                return len(text)
+        except Exception as exc:
+            log(f"[send:{self.name or self._provider_name()}] direct input setter failed: {exc}", C.dim)
+        try:
+            loc = page.locator(sel).first
+            loc.fill(text, timeout=60000)
+            return len(text)
+        except Exception as exc:
+            raise BridgeError(f"could not put the prompt into {self._provider_name()} without paste/upload conversion: {exc}", "upstream")
+
+    def _attach_generic(self, page, files: List[str]) -> None:
+        try:
+            loc = page.locator("input[type=file]")
+            if loc.count() == 0:
+                for p in (page.locator("button"), page.locator('[role="button"]')):
+                    try:
+                        n = p.count()
+                    except Exception:
+                        n = 0
+                    for i in range(min(n, 80)):
+                        try:
+                            b = p.nth(i); txt = (b.inner_text() or "") + " " + (b.get_attribute("aria-label") or "")
+                            if re.search(r"attach|upload|file|ضمیمه|آپلود", txt, re.I):
+                                b.click(timeout=1500); break
+                        except Exception:
+                            continue
+                page.wait_for_selector("input[type=file]", state="attached", timeout=5000)
+                loc = page.locator("input[type=file]")
+            loc.first.set_input_files(files, timeout=60000)
+        except Exception as exc:
+            raise BridgeError(f"could not attach file(s) to {self._provider_name()}: {str(exc)[:160]}", "upstream")
+
+    def _generic_submit(self, page, sel: str, cancel, timeout: float, before_count: int) -> None:
+        page.keyboard.press("Enter")
+        start=time.time(); clicked=False
+        while time.time()-start < timeout:
+            if cancel is not None and cancel.is_set():
+                raise BridgeCancelled()
+            try:
+                st=page.evaluate(JS_GENERIC_SNAPSHOT) or {}
+                if st.get("generating") or st.get("count",0)>before_count:
+                    return
+            except Exception:
+                pass
+            if time.time()-start > 2 and not clicked:
+                clicked=True
+                try:
+                    page.evaluate(JS_GENERIC_SEND, sel)
+                except Exception:
+                    pass
+            time.sleep(0.2)
+        raise BridgeError(f"{self._provider_name()} did not accept the message", "upstream")
+
+    def _collect_generic(self, page, cancel, on_partial, before_count: int) -> str:
+        end=time.time()+MAX_REPLY_SECONDS; started=False; last=""; stable=0; seen_count=before_count
+        while time.time() < end:
+            if cancel is not None and cancel.is_set():
+                raise BridgeCancelled()
+            if self.abort:
+                raise BridgeCancelled()
+            try:
+                st=page.evaluate(JS_GENERIC_SNAPSHOT) or {}
+            except Exception as exc:
+                raise BridgeError(f"browser snapshot failed: {exc}", "upstream")
+            cur=str(st.get("latest") or "").strip(); cnt=int(st.get("count") or 0); generating=bool(st.get("generating"))
+            if cnt>seen_count:
+                seen_count=cnt; started=True
+            if cur and cur!=last:
+                last,stable=cur,0; started=True
+                if on_partial:
+                    try:on_partial(cur)
+                    except Exception:pass
+            elif cur:
+                stable += 1
+            if started and not generating and last and stable >= 8:
+                return last
+            time.sleep(POLL_SECONDS if not last else min(0.35,max(POLL_SECONDS,0.15)))
+        raise BridgeError(f"timeout waiting for the {self._provider_name()} reply", "timeout")
+
+    def _exchange_generic(self, page, prompt: str, cancel=None, on_partial=None, files: Optional[List[str]]=None) -> Exchange:
+        if not self._has_token(page):
+            raise BridgeError(f"{self._provider_name()} login is not active", "login")
+        if self.recipe.get("supports_think"):
+            found=self._set_native_think(page, self.think_pref)
+            if self.think_pref and not found:
+                log(f"[think:{self.name or self._provider_name()}] native thinking control not found; keeping provider default", C.yellow)
+        sel=self._wait_textarea(page, 10)
+        if not sel:
+            raise BridgeError(f"{self._provider_name()} chat input box not found", "upstream")
+        if files:
+            self._attach_generic(page, files)
+        t0=time.perf_counter()
+        before_count=0
+        try: before_count=int((page.evaluate(JS_GENERIC_SNAPSHOT) or {}).get("count") or 0)
+        except Exception: before_count=0
+        self._inject_generic(page, sel, prompt)
+        self._generic_submit(page, sel, cancel, SUBMIT_TIMEOUT + (UPLOAD_TIMEOUT if files else 0), before_count)
+        reply=self._collect_generic(page, cancel, on_partial, before_count)
+        sid=self.session_of(page)
+        total=time.perf_counter()-t0
+        if not reply.strip(): raise BridgeError(f"{self._provider_name()} returned an empty reply", "empty")
+        notice = site_notice_kind(reply)
+        if notice:
+            raise BridgeError(f"{self._provider_name()} notice: {reply.strip()[:160]}", notice)
+        if self.on_exchange:
+            try:self.on_exchange(len(prompt),len(reply),total)
+            except Exception:pass
+        return Exchange(text=reply, session_id=sid, seconds=total)
 
     def _submit(self, page, sel: str, seq0: int, cancel, timeout: Optional[float] = None) -> None:
         timeout = timeout or SUBMIT_TIMEOUT
@@ -2829,6 +3160,8 @@ class DeepSeekWeb:
         if len(prompt) > MAX_PROMPT_CHARS + 20_000:
             raise BridgeError(f"prompt too large ({len(prompt):,} chars)", "bad_request")
         self.ensure_alive()
+        if self.provider != "deepseek_web":
+            return self._exchange_generic(page, prompt, cancel, on_partial, files)
         if page.is_closed():
             raise BridgeError("the browser tab was closed", "upstream")
         if not self._has_token(page):
@@ -2840,6 +3173,10 @@ class DeepSeekWeb:
         sel = self._wait_textarea(page, 8)
         if not sel:
             raise BridgeError("chat input box not found", "upstream")
+        if self.recipe.get("supports_think"):
+            _found_think = self._set_native_think(page, self.think_pref)
+            if self.think_pref and not _found_think:
+                log(f"[think:{self.name or 'DeepSeek'}] native thinking control not found; using provider default", C.yellow)
         dump_debug("prompt", prompt)
         if files:
             self._attach(page, files, cancel)
@@ -3030,6 +3367,16 @@ class Engine:
         self.epoch = ds.epoch
         self.created_sessions: set = set()
         self.pending_delete: List[str] = []
+        # Generic web providers (ChatGPT/Grok/etc.) deliberately keep one sticky
+        # conversation per Engine/account. The website itself owns the conversation
+        # history; the bridge sends only the delta after the first turn.
+        self.sticky_conv: Optional[Conversation] = None
+        # Generic web providers (ChatGPT/Grok) keep one browser conversation per logical lane
+        # instead of one chat per request. Main Claude Code traffic uses the project lane; Swarm
+        # agents use their stable tag lane. DeepSeek keeps its existing signature-based matcher.
+        self.generic_lanes: Dict[str, Conversation] = {}
+        self.generic_side_page = None
+        self.generic_side_ready = False
         self.term_page = None
         self.term_ready = False
 
@@ -3038,10 +3385,15 @@ class Engine:
     def _sync_epoch(self) -> None:
         if self.ds.epoch != self.epoch:
             self.convs.clear()
+            self.sticky_conv = None
+            self.generic_lanes.clear()
+            self.generic_side_page, self.generic_side_ready = None, False
             self.term_page, self.term_ready = None, False
             self.epoch = self.ds.epoch
 
     def _schedule_delete(self, sid: Optional[str], force: bool = False) -> None:
+        if getattr(self.ds, "provider", "deepseek_web") != "deepseek_web":
+            return
         if sid and (DELETE_OLD_CHATS or force) and sid in self.created_sessions:
             self.pending_delete.append(sid)
 
@@ -3056,8 +3408,21 @@ class Engine:
             return
         if conv in self.convs:
             self.convs.remove(conv)
+        if conv is self.sticky_conv:
+            self.sticky_conv = None
+        for key, mapped in list(self.generic_lanes.items()):
+            if mapped is conv:
+                self.generic_lanes.pop(key, None)
         sid = conv.session_id or (self.ds.session_of(conv.page) if conv.page is not None else None)
         if conv.page is not None:
+            # Keep the single generic-provider tab alive; a normal request failure
+            # must not cause the next request to spawn another browser tab.
+            if getattr(self.ds, "provider", "deepseek_web") != "deepseek_web":
+                try:
+                    if self.ds.scratch is conv.page:
+                        return
+                except Exception:
+                    pass
             self.ds.close_page(conv.page)
         self._schedule_delete(sid)
 
@@ -3102,7 +3467,54 @@ class Engine:
                 self.ds.close_page(page)
             return False
 
-    def _new_conv(self) -> Conversation:
+    def _generic_lane_key(self, req: Optional[NormReq]) -> str:
+        """Stable conversation lane for ChatGPT/Grok without relying on Claude metadata ids."""
+        if req is not None:
+            tag = str(getattr(req, "tag", None) or "").strip()
+            # Only stable, explicitly agent-like tags form separate lanes. Request/session
+            # identifiers can change on every turn and must never create a fresh chat.
+            if tag and re.match(r"^(?:(?:sw|swarm)\d*[._:-]|(?:agent|team)[._:-])[A-Za-z0-9._:-]{1,120}$", tag, re.I):
+                return "tag:" + tag[:160]
+            cwd = claude_cwd(req)
+            if cwd:
+                try:
+                    return "project:" + str(Path(cwd).resolve()).casefold()
+                except Exception:
+                    return "project:" + str(cwd).casefold()
+        return "main"
+
+    def _new_conv(self, req: Optional[NormReq] = None) -> Conversation:
+        # ChatGPT/Grok and other generic web providers: one persistent chat per logical lane.
+        # A normal request never opens a new tab. Only a genuinely different project/agent lane
+        # gets another tab, and the normal account's main lane reuses the bootstrapped scratch tab.
+        if getattr(self.ds, "provider", "deepseek_web") != "deepseek_web":
+            key = self._generic_lane_key(req)
+            existing = self.generic_lanes.get(key)
+            if existing is not None:
+                if existing.page is None:
+                    if self._wake(existing):
+                        return existing
+                    self._drop(existing)
+                elif not existing.page.is_closed():
+                    return existing
+            self._make_room()
+            page = None
+            if key == "main" and self.sticky_conv is None:
+                self.ds.ensure_alive()
+                page = self.ds.scratch
+            if page is None or page.is_closed():
+                page = self.ds.new_page()
+                try:
+                    self.ds.open_chat(page)
+                except Exception:
+                    self.ds.close_page(page)
+                    raise
+            conv = Conversation(cid=uuid.uuid4().hex[:6], page=page, epoch=self.epoch)
+            self.convs.append(conv)
+            self.generic_lanes[key] = conv
+            if key == "main":
+                self.sticky_conv = conv
+            return conv
         self._make_room()
         page = self.ds.new_page()
         try:
@@ -3115,6 +3527,20 @@ class Engine:
         return conv
 
     def _find_conv(self, req: NormReq) -> Optional[Conversation]:
+        if getattr(self.ds, "provider", "deepseek_web") != "deepseek_web":
+            key = self._generic_lane_key(req)
+            c = self.generic_lanes.get(key)
+            if c is not None:
+                try:
+                    if c.epoch == self.epoch and not c.poisoned:
+                        self.sticky_conv = c if key == "main" else self.sticky_conv
+                        if c.page is None or not c.page.is_closed():
+                            return c
+                        if c.session_id:
+                            return c
+                except Exception:
+                    pass
+            return None
         best: Optional[Conversation] = None
         for c in self.convs:
             try:
@@ -3137,8 +3563,54 @@ class Engine:
                        f"{'  [hibernated]' if c.page is None else ''}")
         return out
 
+    def _fresh_generic_chat(self, conv: Optional[Conversation] = None, reason: str = "") -> bool:
+        """Start a fresh ChatGPT/Grok chat in the SAME browser tab."""
+        if getattr(self.ds, "provider", "deepseek_web") == "deepseek_web":
+            return False
+        c = conv or self.sticky_conv
+        page = c.page if c is not None else self.ds.scratch
+        if page is None or page.is_closed():
+            self.ds.ensure_alive()
+            page = self.ds.scratch
+        if page is None:
+            return False
+        clicked = False
+        try:
+            clicked = bool(page.evaluate(JS_GENERIC_NEW_CHAT))
+        except Exception as exc:
+            log(f"[chat:{self.ds._provider_name()}] new-chat control probe failed: {exc}", C.dim)
+        if not clicked:
+            try:
+                page.goto(str(self.ds.recipe.get("url") or "about:blank"), wait_until="domcontentloaded", timeout=30000)
+                clicked = True
+            except Exception as exc:
+                log(f"[chat:{self.ds._provider_name()}] could not reset the current tab: {exc}", C.yellow)
+        try:
+            self.ds._wait_textarea(page, 10)
+        except Exception:
+            pass
+        if c is None:
+            return clicked
+        c.page = page
+        c.sigs, c.n, c.reply_ids, c.tools_sig = [], 0, [], ""
+        c.chars_sent, c.session_id, c.turns, c.poisoned = 0, None, 0, False
+        c.last_used = time.time()
+        if c not in self.convs:
+            self.convs.append(c)
+        self.sticky_conv = c
+        if reason:
+            log(f"[chat:{self.ds._provider_name()}] fresh conversation in same tab ({reason})", C.yellow)
+        return clicked
+
     def reset_all(self) -> int:
         n = len(self.convs)
+        if getattr(self.ds, "provider", "deepseek_web") != "deepseek_web":
+            # Reset every generic lane in place. No browser tab is created merely by resetting.
+            ok = 0
+            for c in list(self.convs):
+                if self._fresh_generic_chat(c, reason="explicit reset"):
+                    ok += 1
+            return n if ok == len(self.convs) else ok
         for c in list(self.convs):
             self._drop(c)
         return n
@@ -3210,6 +3682,18 @@ class Engine:
         best = -1
         if self.ds.epoch != self.epoch:
             return best
+        if getattr(self.ds, "provider", "deepseek_web") != "deepseek_web":
+            key = self._generic_lane_key(req)
+            c = self.generic_lanes.get(key)
+            if c is not None:
+                try:
+                    if c.epoch == self.epoch and not c.poisoned:
+                        # The web page owns the authoritative conversation history.
+                        # Claude Code metadata may change between requests, so do not require
+                        # strict message/tool-id matching for ChatGPT/Grok routing.
+                        return max(0, c.n)
+                except Exception:
+                    pass
         for c in list(self.convs):
             try:
                 if c.epoch == self.epoch and match_continuation(c.sigs, c.n, c.reply_ids, req.messages, req.sigs):
@@ -3233,9 +3717,14 @@ class Engine:
             return False
 
     def ping(self) -> Dict[str, Any]:
-        """Account health test: one tiny message in a throw-away chat."""
+        """Health test without polluting a ChatGPT/Grok conversation with a synthetic message."""
         self._sync_epoch()
         self.ds.ensure_alive()
+        if getattr(self.ds, "provider", "deepseek_web") != "deepseek_web":
+            page = self.ds.scratch
+            if page is None or page.is_closed() or not self.ds._logged_in(page):
+                raise BridgeError(f"{self.ds._provider_name()} login is not active", "login")
+            return {"seconds": 0.0, "reply": "READY"}
         page = self.ds.scratch
         self.ds.open_chat(page)
         t0 = time.time()
@@ -3264,10 +3753,15 @@ class Engine:
                 prompt = build_delta_prompt(req, delta, tools_changed=(req.tools_sig != conv.tools_sig))
                 if conv.chars_sent + len(prompt) > ROTATE_CHARS:
                     log(f"[conv {conv.cid}] chat is getting long; rotating to a fresh chat", C.yellow)
-                    self._drop(conv)
-                    conv, cont = None, False
+                    if getattr(self.ds, "provider", "deepseek_web") != "deepseek_web":
+                        if not self._fresh_generic_chat(conv, reason="size cap"):
+                            raise BridgeError(f"{self.ds._provider_name()} could not start a fresh chat in the existing tab", "upstream")
+                        cont = False
+                    else:
+                        self._drop(conv)
+                        conv, cont = None, False
             if not cont:
-                conv = self._new_conv()
+                conv = self._new_conv(req)
                 prompt = build_full_prompt(req, budget)
             log(f"[conv {conv.cid}] {'CONTINUE +' + str(len(req.messages) - conv.n - 1) + ' msg' if cont else 'NEW chat, ' + str(len(req.messages)) + ' msg'}"
                 f" -> prompt {len(prompt):,} chars", C.cyan)
@@ -3281,11 +3775,18 @@ class Engine:
                     raise BridgeError("DeepSeek returned an empty reply", "empty")
                 break
             except BridgeCancelled:
-                self._drop(conv)
+                if getattr(self.ds, "provider", "deepseek_web") != "deepseek_web":
+                    self._fresh_generic_chat(conv, reason="cancelled request")
+                else:
+                    self._drop(conv)
                 raise
             except BridgeError as exc:
                 log(f"[conv {conv.cid}] {exc.kind}: {exc}", C.red)
-                self._drop(conv)
+                if getattr(self.ds, "provider", "deepseek_web") != "deepseek_web":
+                    if not self._fresh_generic_chat(conv, reason=exc.kind):
+                        raise
+                else:
+                    self._drop(conv)
                 conv = None
                 attempt += 1
                 self._note_err(exc.kind, str(exc))
@@ -3307,7 +3808,8 @@ class Engine:
                 cleanup_dir(fdir)
         if ex.session_id:
             conv.session_id = ex.session_id
-            self.created_sessions.add(ex.session_id)
+            if getattr(self.ds, "provider", "deepseek_web") == "deepseek_web":
+                self.created_sessions.add(ex.session_id)
         try:
             clean, calls, extra = self._finalize(req, conv.page, ex.text, cancel, conv)
         except Exception:                        # incl. BridgeCancelled: the tab is in an unknown state
@@ -3333,14 +3835,28 @@ class Engine:
 
     def _process_side(self, req: NormReq, cancel, on_partial) -> Outcome:
         self.ds.ensure_alive()
-        page = self.ds.scratch
-        self.ds.open_chat(page)
+        if getattr(self.ds, "provider", "deepseek_web") != "deepseek_web":
+            # ChatGPT/Grok side work (titles, lightweight summaries) must never navigate the
+            # account's main sticky chat back to the home URL. Reuse one dedicated side tab instead.
+            if self.generic_side_page is None or self.generic_side_page.is_closed():
+                self.generic_side_page = self.ds.new_page()
+                self.generic_side_ready = False
+            page = self.generic_side_page
+            if not self.generic_side_ready:
+                self.ds.open_chat(page)
+                self.generic_side_ready = True
+            lane_note = "dedicated side chat"
+        else:
+            page = self.ds.scratch
+            self.ds.open_chat(page)
+            lane_note = "scratch chat"
         prompt = build_full_prompt(req, HISTORY_BUDGET_CHARS)
-        log(f"[side] scratch chat, prompt {len(prompt):,} chars", C.cyan)
+        log(f"[side] {lane_note}, prompt {len(prompt):,} chars", C.cyan)
         ex = self.ds.exchange(page, prompt, cancel, on_partial)
         if ex.session_id:
-            self.created_sessions.add(ex.session_id)
-            self._schedule_delete(ex.session_id, force=True)   # title-generation etc.: throwaway
+            if getattr(self.ds, "provider", "deepseek_web") == "deepseek_web":
+                self.created_sessions.add(ex.session_id)
+                self._schedule_delete(ex.session_id, force=True)   # title-generation etc.: throwaway
         clean, calls, _ = self._finalize(req, page, ex.text, cancel)
         for c in calls:
             c["id"] = make_id(req.id_prefix)
@@ -3359,7 +3875,7 @@ class Engine:
             self.ds.open_chat(self.term_page)
             self.term_ready = True
         ex = self.ds.exchange(self.term_page, text)
-        if ex.session_id:
+        if ex.session_id and getattr(self.ds, "provider", "deepseek_web") == "deepseek_web":
             self.created_sessions.add(ex.session_id)
         return sanitize_reply(ex.text)
 
@@ -3413,7 +3929,7 @@ class Bridge:
         try:
             if a is not None:
                 self.ds = DeepSeekWeb(a.profile, a.name, a.headed, on_state=self._status,
-                                      on_exchange=a.stats.record_exchange)
+                                      on_exchange=a.stats.record_exchange, provider=a.provider)
                 known = a.logged_in and not self.force_login
             else:
                 self.ds, known = DeepSeekWeb(), True
@@ -3513,19 +4029,33 @@ TIER_NAMES = {1: "Basic", 2: "Fast", 3: "Standard", 4: "Strong", 5: "Top"}
 API_TIMEOUT = _env_int("DS_BRIDGE_API_TIMEOUT", 900)
 
 # Suggested models only: "Fetch models" in the panel asks the provider for the real, current list.
+WEB_RECIPES: Dict[str, Dict[str, Any]] = {
+    # Selectors are intentionally semantic/learnable rather than brittle site-specific CSS.
+    "deepseek_web": {"id": "deepseek_web", "name": "DeepSeek", "url": "https://chat.deepseek.com/",
+                     "login_url": "https://chat.deepseek.com/", "icon": "DS", "tier": 3, "supports_think": True},
+    "chatgpt_web": {"id": "chatgpt_web", "name": "ChatGPT", "url": "https://chatgpt.com/",
+                    "login_url": "https://chatgpt.com/auth/login", "icon": "G", "tier": 4, "supports_think": True},
+    "grok_web": {"id": "grok_web", "name": "Grok", "url": "https://grok.com/",
+                 "login_url": "https://accounts.x.ai/sign-in?redirect=grok-com", "icon": "X", "tier": 4, "supports_think": False},
+}
+
 PROVIDERS: List[Dict[str, Any]] = [
-    {"id": "deepseek_web", "kind": "web", "name": "DeepSeek", "sub": "website login (free)", "icon": "🐋", "tier": 3,
+    {"id": "deepseek_web", "kind": "web", "name": "DeepSeek", "sub": "website login (free)", "icon": "DS", "tier": 3,
      "base": "", "models": [], "link": "https://chat.deepseek.com"},
-    {"id": "grok", "kind": "openai", "name": "Grok", "sub": "xAI API key", "icon": "⚡", "tier": 4,
+    {"id": "chatgpt_web", "kind": "web", "name": "ChatGPT", "sub": "website login (your account)", "icon": "G", "tier": 4,
+     "base": "", "models": [], "link": "https://chatgpt.com/auth/login", "experimental": True},
+    {"id": "grok_web", "kind": "web", "name": "Grok", "sub": "website login (your account)", "icon": "X", "tier": 4,
+     "base": "", "models": [], "link": "https://accounts.x.ai/sign-in?redirect=grok-com", "experimental": True},
+    {"id": "grok", "kind": "openai", "name": "Grok", "sub": "xAI API key", "icon": "X", "tier": 4,
      "base": "https://api.x.ai/v1", "models": ["grok-4", "grok-3", "grok-3-mini"], "link": "https://console.x.ai"},
-    {"id": "claude", "kind": "anthropic", "name": "Claude", "sub": "Anthropic API key", "icon": "🅰️", "tier": 5,
+    {"id": "claude", "kind": "anthropic", "name": "Claude", "sub": "Anthropic API key", "icon": "A", "tier": 5,
      "base": "https://api.anthropic.com", "models": ["claude-opus-4-20250514", "claude-sonnet-4-20250514", "claude-3-5-haiku-latest"],
      "link": "https://console.anthropic.com"},
-    {"id": "openai", "kind": "openai", "name": "OpenAI", "sub": "API key", "icon": "🟢", "tier": 4,
+    {"id": "openai", "kind": "openai", "name": "OpenAI", "sub": "API key", "icon": "G", "tier": 4,
      "base": "https://api.openai.com/v1", "models": ["gpt-4.1", "gpt-4o", "gpt-4o-mini"], "link": "https://platform.openai.com"},
-    {"id": "openrouter", "kind": "openai", "name": "OpenRouter", "sub": "one key, hundreds of models", "icon": "🔀", "tier": 4,
+    {"id": "openrouter", "kind": "openai", "name": "OpenRouter", "sub": "one key, hundreds of models", "icon": "↗", "tier": 4,
      "base": "https://openrouter.ai/api/v1", "models": [], "link": "https://openrouter.ai/keys"},
-    {"id": "deepseek_api", "kind": "openai", "name": "DeepSeek API", "sub": "paid API key", "icon": "🐳", "tier": 3,
+    {"id": "deepseek_api", "kind": "openai", "name": "DeepSeek API", "sub": "paid API key", "icon": "DS", "tier": 3,
      "base": "https://api.deepseek.com/v1", "models": ["deepseek-chat", "deepseek-reasoner"], "link": "https://platform.deepseek.com"},
     {"id": "custom_openai", "kind": "openai", "name": "Custom", "sub": "any OpenAI-compatible endpoint", "icon": "⚙️", "tier": 3,
      "base": "", "models": [], "link": ""},
@@ -3670,6 +4200,22 @@ _ANTHROPIC_KEYS = ("model", "max_tokens", "messages", "system", "tools", "tool_c
                    "top_k", "stop_sequences")
 
 
+def apply_think_mode(body: Dict[str, Any], account: Any) -> Dict[str, Any]:
+    """Apply provider-native reasoning explicitly so the app-level toggle is deterministic."""
+    provider=str(getattr(account,"provider","") or "")
+    model=str(getattr(account,"model","") or "").strip()
+    if provider == "deepseek_api":
+        enabled = bool(THINK_MODE)
+        body["thinking"]={"type":"enabled" if enabled else "disabled"}
+        # DeepSeek currently rejects `required` / named tool choices while thinking is enabled.
+        # Preserve tool calling by relaxing only that incompatible selection to the provider-safe `auto`.
+        if enabled and body.get("tools") and body.get("tool_choice") not in (None, "auto", "none"):
+            body["tool_choice"]="auto"
+    elif provider == "openai" and re.match(r"^(gpt-5(?:[.-].*)?|o[1-4](?:[.-].*)?)$", model, re.I):
+        body["reasoning_effort"]="high" if THINK_MODE else "low"
+    return body
+
+
 class ApiEngine:
     """Talks to a provider's HTTP API. Same interface the pool expects from the browser Engine."""
 
@@ -3711,6 +4257,7 @@ class ApiEngine:
             else:
                 field = "max_completion_tokens" if a.provider == "openai" else "max_tokens"
                 body = anthropic_to_openai(req.raw, a.model, mt, field)
+                body = apply_think_mode(body, a)
                 url = base + "/chat/completions"
                 headers = {"content-type": "application/json", "authorization": "Bearer " + a.api_key}
             t0 = time.time()
@@ -3850,6 +4397,43 @@ class ApiWorker:
 
 ACTIVITY: "deque" = deque(maxlen=500)
 _ACT_SEQ = itertools.count(1)
+DASH_EVENT_SEQ = itertools.count(1)
+DASH_EVENT_LOCK = threading.Lock()
+DASH_EVENT_SUBS: List["queue.Queue[Dict[str, Any]]"] = []
+CLAUDE_MIRROR: "deque" = deque(maxlen=1200)
+
+
+def emit_dash_event(kind: str, payload: Dict[str, Any]) -> None:
+    """Broadcast a bounded real-time dashboard event without adding polling load."""
+    event = {"id": next(DASH_EVENT_SEQ), "t": time.time(), "kind": str(kind), "data": payload}
+    CLAUDE_MIRROR.append(event)
+    with DASH_EVENT_LOCK:
+        dead: List["queue.Queue[Dict[str, Any]]"] = []
+        for q in list(DASH_EVENT_SUBS):
+            try:
+                q.put_nowait(event)
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(event)
+                except Exception:
+                    dead.append(q)
+        for q in dead:
+            if q in DASH_EVENT_SUBS:
+                DASH_EVENT_SUBS.remove(q)
+
+
+def add_dash_subscription(q: "queue.Queue[Dict[str, Any]]") -> None:
+    with DASH_EVENT_LOCK:
+        DASH_EVENT_SUBS.append(q)
+
+
+def remove_dash_subscription(q: "queue.Queue[Dict[str, Any]]") -> None:
+    with DASH_EVENT_LOCK:
+        if q in DASH_EVENT_SUBS:
+            DASH_EVENT_SUBS.remove(q)
+
+
 _PRIMARY_ARG = ("command", "file_path", "path", "pattern", "url", "query", "description", "prompt", "text")
 
 
@@ -3896,21 +4480,23 @@ def record_activity(req: Any, outcome: Optional[Outcome], secs: float, in_tokens
     try:
         tin, tout = (outcome.usage if outcome is not None and outcome.usage else
                      (in_tokens, estimate_tokens([outcome.text, outcome.calls]) if outcome is not None else 0))
-        ACTIVITY.append({
+        item = {
             "n": next(_ACT_SEQ), "t": time.time(), "tag": req.tag or "", "role": req.role or "",
             "kind": "agent" if req.tag else ("side" if req.side else "main"), "model": req.model,
             "account": getattr(outcome, "account", "") if outcome is not None else "",
             "tier": getattr(outcome, "tier", 0) if outcome is not None else 0, "secs": round(secs, 1),
             "tin": int(tin), "tout": int(tout), "msgs": len(req.messages), "stream": req.stream,
             "user": summarize_last(req), "reply": (outcome.text[:1500] if outcome is not None else ""),
-            "calls": [_brief_call(c) for c in (outcome.calls if outcome is not None else [])][:8], "err": err[:300]})
+            "calls": [_brief_call(c) for c in (outcome.calls if outcome is not None else [])][:8], "err": err[:300]}
+        ACTIVITY.append(item)
+        emit_dash_event("activity", item)
     except Exception:
         pass
 
 
 def claude_cwd(req: Any) -> str:
     """The working directory Claude Code reports in its system prompt (used by /swarm)."""
-    m = re.search(r"(?:Primary working directory|Working directory)\s*:\s*([^\r\n]+)", req.system_text or "")
+    m = re.search(r"(?:Primary working directory|Working directory)\s*:\s*([^\r\n]+)", getattr(req, "system_text", "") or "")
     if m:
         p = m.group(1).strip().strip("`'\"")
         try:
@@ -4030,8 +4616,9 @@ def parse_plan(text: str, max_tasks: int = 12) -> Dict[str, Any]:
 
 
 class SwarmAgent:
-    def __init__(self, aid: str, title: str, prompt: str, files: List[str], deps: List[str]) -> None:
+    def __init__(self, aid: str, title: str, prompt: str, files: List[str], deps: List[str], account_id: str = "") -> None:
         self.id, self.title, self.prompt, self.files, self.deps = aid, title, prompt, files, deps
+        self.account_id = str(account_id or "")
         self.status = "queued"           # queued starting running verifying reviewing merging merged done failed conflict skipped stopped
         self.activity, self.note = "", ""
         self.log: "deque" = deque(maxlen=400)
@@ -4073,7 +4660,10 @@ class SwarmRun:
         self.verify = str(opts.get("verify") or "auto")
 
     def ev(self, msg: str) -> None:
-        self.events.append({"t": time.time(), "msg": msg})
+        item = {"t": time.time(), "msg": msg}
+        self.events.append(item)
+        emit_dash_event("swarm", {"run": self.id, "status": self.status, "project": str(self.project),
+                                    "message": str(msg)[:500]})
 
     def get(self, aid: str) -> Optional[SwarmAgent]:
         return next((a for a in self.agents if a.id == aid), None)
@@ -4081,6 +4671,8 @@ class SwarmRun:
     def view(self, full: bool = True) -> Dict[str, Any]:
         d = {"id": self.id, "goal": self.goal, "project": str(self.project), "status": self.status,
              "created": self.created, "finished": self.finished, "max_agents": self.max_agents,
+             "attachments": list(self.opts.get("attachments") or []),
+             "account_ids": list(self.opts.get("account_ids") or []),
              "verify": self.verify, "review": self.review_on, "mode": self.opts.get("mode"), "applied": self.applied,
              "cleaned": self.cleaned, "base_branch": self.base_branch, "merged_branch": self.merged_branch,
              "plan": self.summary_plan, "summary": self.summary, "final_verify": self.final_verify,
@@ -4099,6 +4691,10 @@ class SwarmRun:
 class Swarm:
     def __init__(self, pool: Any) -> None:
         self.pool = pool
+        try:
+            cleanup_swarm_attachments(7)
+        except Exception as exc:
+            _warn_once("swarm_attachment_cleanup", f"could not prune old swarm attachments: {exc}")
         self.runs: Dict[str, SwarmRun] = {}
         self.roles: Dict[str, str] = {}
         self.lock = threading.RLock()
@@ -4113,7 +4709,8 @@ class Swarm:
     # ---- start -------------------------------------------------------------------
 
     def start(self, goal: str, project: str, agents: Any = "auto", verify: str = "auto", review: str = "",
-              mode: str = "", tasks_text: str = "", strict: bool = False, init_git: bool = True) -> SwarmRun:
+              mode: str = "", tasks_text: str = "", strict: bool = False, init_git: bool = True,
+              attachments: Optional[List[str]] = None, account_ids: Optional[List[str]] = None) -> SwarmRun:
         goal = (goal or "").strip()
         if not goal and not tasks_text.strip():
             raise ValueError("describe what the team should build")
@@ -4134,6 +4731,13 @@ class Swarm:
             git(["add", "-A"], proj, check=False)
             git(["commit", "-q", "--allow-empty", "-m", "Initial snapshot (DeepSeek Bridge swarm)"], proj)
         top = Path(git(["rev-parse", "--show-toplevel"], proj).stdout.strip())
+        selected_accounts=[x for x in (account_ids or []) if self.pool.get(x) is not None and self.pool.get(x).enabled]
+        if not selected_accounts:
+            selected_accounts=self.pool.project_accounts_for(str(top))
+        if not selected_accounts:
+            selected_accounts=[a.id for a in self.pool.accounts if a.enabled]
+        if not selected_accounts:
+            raise ValueError("no enabled AI account is available for this swarm")
         base = git(["rev-parse", "HEAD"], proj).stdout.strip()
         branch = git(["rev-parse", "--abbrev-ref", "HEAD"], proj).stdout.strip()
         try:
@@ -4151,8 +4755,11 @@ class Swarm:
             (self.pool.capacity() if str(agents) in ("auto", "", "0") else int(agents))
         n = max(1, min(SWARM_MAX_AGENTS, n or 1))
         run = SwarmRun(rid, goal, top, base, branch, {"agents": n, "mode": mode or _norm_mode(self.pool.cfg.get("permission_mode")) or DEFAULT_MODE,
-                                                       "strict": bool(strict), "tasks_text": tasks_text})
+                                                       "strict": bool(strict), "tasks_text": tasks_text,
+                                                       "attachments": list(attachments or [])[:ATTACH_MAX_FILES],
+                                                       "account_ids": list(dict.fromkeys(selected_accounts))})
         run.verify = verify or "auto"
+        self.pool.set_project_accounts(str(top), list(dict.fromkeys(selected_accounts)))
         rv = (review or SWARM_REVIEW).lower()
         run.review_on = rv == "on" or (rv == "auto" and len({a.tier for a in self.pool.accounts if a.usable()}) > 1)
         with self.lock:
@@ -4213,7 +4820,9 @@ class Swarm:
                 plan = {"summary": "single agent (the planner did not produce a usable plan)", "contracts": "",
                         "tasks": [{"id": "a1", "title": run.goal[:60], "prompt": run.goal, "files": [], "deps": []}]}
         run.summary_plan, run.contracts = plan["summary"], plan["contracts"]
-        run.agents = [SwarmAgent(t["id"], t["title"], t["prompt"], t["files"], t["deps"]) for t in plan["tasks"]]
+        aids=list(run.opts.get("account_ids") or [])
+        run.agents = [SwarmAgent(t["id"], t["title"], t["prompt"], t["files"], t["deps"], aids[i % len(aids)])
+                      for i,t in enumerate(plan["tasks"])]
         run.ev(f"plan: {len(run.agents)} task(s) - " + "; ".join(f"{a.id} {a.title}" for a in run.agents))
 
     def _schedule(self, run: SwarmRun) -> None:
@@ -4234,24 +4843,36 @@ class Swarm:
 
     # ---- one agent ---------------------------------------------------------------
 
-    def _agent_prompt(self, run: SwarmRun, ag: SwarmAgent) -> str:
+    def _agent_prompt(self, run: SwarmRun, ag: SwarmAgent, attachment_paths: Optional[List[str]] = None) -> str:
         others = "\n".join(f"- {o.id} {o.title}: {', '.join(o.files) or '(unspecified)'}" for o in run.agents if o is not ag) or "(none)"
+        attachments = ("\nATTACHMENTS AVAILABLE TO YOU (read-only inputs unless your task explicitly requires extracting/processing them):\n"
+                       + "\n".join(f"- {p}" for p in (attachment_paths or []))
+                       if attachment_paths else "")
         return (f"You are developer {ag.id} (\"{ag.title}\") in a team of {len(run.agents)} developers building one project IN PARALLEL. "
                 f"You work alone in your own git worktree/branch; the others work at the same time in theirs.\n\n"
                 f"OVERALL GOAL: {run.goal}\n\nYOUR TASK:\n{ag.prompt}\n\n"
+                f"ASSIGNED BRIDGE ACCOUNT: {self.pool.get(ag.account_id).name if self.pool.get(ag.account_id) else ag.account_id or '(auto)'}\n"
                 f"YOU OWN THESE PATHS (create / modify only these): {', '.join(ag.files) or 'whatever your task needs'}\n"
                 f"OTHER DEVELOPERS AND THEIR PATHS (do NOT touch them; assume their code exists as described in the contracts):\n{others}\n\n"
-                f"SHARED CONTRACTS (interfaces everybody follows):\n{run.contracts or '(none)'}\n\n"
+                f"SHARED CONTRACTS (interfaces everybody follows):\n{run.contracts or '(none)'}\n" + attachments + "\n\n"
                 "RULES: stay inside your paths; do not commit (the orchestrator does it); run the tests/build for YOUR part when they exist; "
-                "finish with a short summary of what you changed.")
+                "do not add the supplied attachments to git; finish with a short summary of what you changed.")
 
-    def _claude(self, run: SwarmRun, ag: SwarmAgent, prompt: str, role: str, cwd: Any, tag: str) -> int:
+    def _claude(self, run: SwarmRun, ag: SwarmAgent, prompt: str, role: str, cwd: Any, tag: str, account_id: str = "") -> int:
         exe = shutil.which("claude")
         if not exe:
             raise ValueError("Claude Code is not installed")
         self.roles[tag] = role
         cfg = self.pool.cfg
-        env = claude_env(cfg, f"http://127.0.0.1:{cfg['port']}/s/{tag}")
+        endpoint_account = account_id or ag.account_id
+        if endpoint_account:
+            # Carry both the hard account pin and the agent tag so parallel swarm activity
+            # stays attributable to the correct agent in the live panel.
+            endpoint = (f"http://127.0.0.1:{cfg['port']}/a/{urllib.parse.quote(endpoint_account, safe='')}"
+                        f"/s/{urllib.parse.quote(tag, safe='')}")
+        else:
+            endpoint = f"http://127.0.0.1:{cfg['port']}/s/{urllib.parse.quote(tag, safe='')}"
+        env = claude_env(cfg, endpoint)
         cmd = [exe, *permission_args(run.opts.get("mode") or DEFAULT_MODE, []), "-p", "--output-format", "stream-json", "--verbose"]
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         p = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -4267,7 +4888,7 @@ class Swarm:
             except Exception:
                 pass
             for line in p.stdout:                                # type: ignore[union-attr]
-                self._line(ag, line)
+                self._line(ag, line, tag)
                 if run.stop.is_set():
                     p.kill()
             return p.wait()
@@ -4276,7 +4897,7 @@ class Swarm:
             ag.proc = None
 
     @staticmethod
-    def _line(ag: SwarmAgent, line: str) -> None:
+    def _line(ag: SwarmAgent, line: str, tag: str = "") -> None:
         line = line.strip()
         if not line:
             return
@@ -4285,20 +4906,25 @@ class Swarm:
         except Exception:
             ag.add_log(line)
             ag.activity = line[:120]
+            emit_dash_event("agent", {"tag": tag, "agent": ag.id, "status": ag.status, "activity": ag.activity[:180]})
             return
         if not isinstance(o, dict):
             return
         if o.get("type") == "assistant":
             for b in (o.get("message") or {}).get("content") or []:
                 if b.get("type") == "tool_use":
-                    ag.activity = "🔧 " + _brief_call({"name": b.get("name"), "arguments": b.get("input")})
+                    ag.activity = "⌁ " + _brief_call({"name": b.get("name"), "arguments": b.get("input")})
                     ag.add_log(ag.activity)
+                    emit_dash_event("agent", {"tag": tag, "agent": ag.id, "status": ag.status, "activity": ag.activity[:180],
+                                                "tool": b.get("name")})
                 elif b.get("type") == "text" and str(b.get("text", "")).strip():
-                    ag.activity = "💬 " + str(b["text"]).strip().splitlines()[0][:120]
+                    ag.activity = "» " + str(b["text"]).strip().splitlines()[0][:120]
                     ag.add_log(ag.activity)
+                    emit_dash_event("agent", {"tag": tag, "agent": ag.id, "status": ag.status, "activity": ag.activity[:180]})
         elif o.get("type") == "result":
             ag.result = str(o.get("result") or "")
-            ag.add_log("✔ " + ag.result.strip().splitlines()[0][:160] if ag.result.strip() else "✔ finished")
+            ag.add_log("✓ " + ag.result.strip().splitlines()[0][:160] if ag.result.strip() else "✓ finished")
+            emit_dash_event("agent", {"tag": tag, "agent": ag.id, "status": ag.status, "activity": "✓ finished"})
 
     def _commit(self, ag: SwarmAgent, wt: Any, msg: str) -> bool:
         git(["add", "-A"], wt, check=False)
@@ -4335,9 +4961,49 @@ class Swarm:
         except Exception as exc:
             return False, cmd, f"could not run the check: {exc}"
 
+    def _materialize_attachments(self, run: SwarmRun, ag: SwarmAgent, wt: Path) -> List[str]:
+        ids = [str(x) for x in (run.opts.get("attachments") or [])]
+        if not ids:
+            return []
+        dest = wt / ".dsb-agent-input"
+        dest.mkdir(parents=True, exist_ok=True)
+        paths: List[str] = []
+        excludes = None
+        try:
+            gp = git(["rev-parse", "--git-path", "info/exclude"], wt, check=False).stdout.strip()
+            if gp:
+                excludes = Path(gp)
+                if not excludes.is_absolute():
+                    excludes = (wt / excludes).resolve()
+            else:
+                excludes = None
+            if excludes is not None:
+                excludes.parent.mkdir(parents=True, exist_ok=True)
+                text = excludes.read_text(encoding="utf-8") if excludes.exists() else ""
+                if "/.dsb-agent-input/" not in text:
+                    with excludes.open("a", encoding="utf-8") as f:
+                        f.write("\n/.dsb-agent-input/\n")
+        except Exception as exc:
+            _warn_once("agent_input_exclude", f"could not exclude agent attachments from git: {exc}")
+        for index, aid in enumerate(ids, 1):
+            meta = get_swarm_attachment(aid)
+            src = Path(meta["path"])
+            dst = dest / f"{index:02d}-{_safe_upload_name(meta['name'])}"
+            if dst.exists():
+                dst.unlink()
+            try:
+                os.link(src, dst)
+            except Exception:
+                shutil.copy2(src, dst)
+            paths.append(str(dst))
+        ag.add_log(f"＋ {len(paths)} attachment(s) available in .dsb-agent-input")
+        return paths
+
     def _agent_main(self, run: SwarmRun, ag: SwarmAgent) -> None:
         try:
             ag.started = time.time()
+            emit_dash_event("agent", {"tag": f"{run.id}.{ag.id}", "agent": ag.id, "status": "starting",
+                                       "activity": "starting"})
             ag.branch = f"swarm/{run.id}/{ag.id}"
             with run.merge_lock:
                 ag.base = git(["rev-parse", run.merged_branch], run.project).stdout.strip() if ag.deps else run.base
@@ -4345,7 +5011,8 @@ class Swarm:
                 git(["worktree", "add", "-b", ag.branch, str(wt), ag.base], run.project)
             ag.worktree = str(wt)
             self._link_deps(run, wt)
-            prompt, rounds = self._agent_prompt(run, ag), 0
+            attachment_paths = self._materialize_attachments(run, ag, wt)
+            prompt, rounds = self._agent_prompt(run, ag, attachment_paths), 0
             while True:
                 ag.status = "running"
                 rc = self._claude(run, ag, prompt, "coder", wt, f"{run.id}.{ag.id}")
@@ -4394,6 +5061,8 @@ class Swarm:
             run.ev(f"{ag.id} failed: {exc}")
         finally:
             ag.finished = time.time()
+            emit_dash_event("agent", {"tag": f"{run.id}.{ag.id}", "agent": ag.id,
+                                       "status": ag.status, "activity": ag.activity[:180]})
 
     def _merge(self, run: SwarmRun, ag: SwarmAgent) -> None:
         with run.merge_lock:
@@ -4561,6 +5230,9 @@ COOLDOWN_MAX = _env_int("DS_BRIDGE_COOLDOWN_MAX", 1800)
 ACCOUNT_WAIT_SECONDS = _env_int("DS_BRIDGE_ACCOUNT_WAIT", 120)  # how long a request waits for ANY account
 STREAK_GAP = 300                                                # idle gap (s) that ends a "continuous use" streak
 DASH_AUTOOPEN = _env_bool("DS_BRIDGE_OPEN_DASH", True)
+UI_PERFORMANCE_MODE = os.getenv("DS_BRIDGE_UI_PERFORMANCE", "auto").strip().lower()
+if UI_PERFORMANCE_MODE not in {"auto", "balanced", "light", "max"}:
+    UI_PERFORMANCE_MODE = "auto"
 STRATEGIES = ("balanced", "round_robin", "failover", "pinned")
 ROUTING_DEFAULTS: Dict[str, Any] = {"strategy": "balanced", "pinned": "", "auto_failover": True,
                                     "rotate_requests": 30, "rotate_minutes": 30,
@@ -4776,6 +5448,9 @@ class Pool:
         self._last_route: Optional[str] = None
         self._stop = threading.Event()
         self._usage_saved = 0.0
+        raw_pa = cfg.get("project_accounts")
+        self.project_accounts: Dict[str, List[str]] = {str(k): [str(x) for x in v if str(x)]
+                                                         for k, v in raw_pa.items() if isinstance(v, list)} if isinstance(raw_pa, dict) else {}
         self.swarm = Swarm(self)
         routing = cfg.get("routing")
         if not isinstance(routing, dict):
@@ -4814,6 +5489,7 @@ class Pool:
         with self.lock:
             self.cfg["accounts"] = [a.to_cfg() for a in self.accounts]
             self.cfg["routing"] = self.routing
+            self.cfg["project_accounts"] = self.project_accounts
             save_config(self.cfg)
 
     def _usage_path(self) -> Path:
@@ -4844,7 +5520,9 @@ class Pool:
     # ---- small helpers ----------------------------------------------------------
 
     def event(self, level: str, msg: str) -> None:
-        self.events.append({"t": time.time(), "level": level, "msg": msg})
+        item = {"t": time.time(), "level": level, "msg": msg}
+        self.events.append(item)
+        emit_dash_event("pool", item)
         log(f"[pool] {msg}", {"warn": C.yellow, "error": C.red, "ok": C.green}.get(level, C.dim))
 
     def get_by_id(self, aid: Any) -> Optional[Account]:
@@ -4886,6 +5564,29 @@ class Pool:
         for a in self.accounts:
             self.start_account(a)
 
+    def start_selected(self, account_ids: List[str]) -> List[str]:
+        wanted = {str(x) for x in account_ids if str(x)}
+        started: List[str] = []
+        for a in self.accounts:
+            if a.enabled and a.id in wanted:
+                self.start_account(a)
+                started.append(a.id)
+        return started
+
+    def wait_selected_ready(self, account_ids: List[str], timeout: float) -> bool:
+        wanted = {str(x) for x in account_ids if str(x)}
+        if not wanted:
+            return False
+        end = time.time() + timeout
+        while time.time() < end:
+            if any(a.status == "ready" for a in self.accounts if a.id in wanted):
+                return True
+            live = [a for a in self.accounts if a.id in wanted and a.enabled and a.status in ("starting", "login")]
+            if not live:
+                return False
+            time.sleep(0.3)
+        return False
+
     def restart_account(self, a: Account, force_login: bool = False) -> None:
         def run() -> None:
             with a.op_lock:
@@ -4924,6 +5625,53 @@ class Pool:
         self.save_usage()
 
     # ---- account management ------------------------------------------------------
+
+    @staticmethod
+    def _project_key(project: str) -> str:
+        try:
+            return str(Path(project).expanduser().resolve()) if project else ""
+        except Exception:
+            return str(project or "").strip()
+
+    def project_accounts_for(self, project: str) -> List[str]:
+        key=self._project_key(project)
+        raw=self.project_accounts.get(key, [])
+        ids={a.id for a in self.accounts}
+        return [x for x in raw if x in ids]
+
+    def set_project_accounts(self, project: str, account_ids: List[str]) -> List[str]:
+        key=self._project_key(project)
+        if not key:
+            raise ValueError("project path is required")
+        clean=[]; seen=set()
+        for x in account_ids or []:
+            a=self.get(str(x))
+            if a and a.id not in seen:
+                clean.append(a.id); seen.add(a.id)
+        if not clean:
+            self.project_accounts.pop(key, None)
+        else:
+            self.project_accounts[key]=clean
+        self._save()
+        self.event("info", f"project account routing updated for {key}: {len(clean)} account(s)")
+        return clean
+
+    def add_web_account(self, provider: str, name: str = "", tier: int = 0, headed: bool = True, start: bool = True) -> Account:
+        pv=_PROVIDER.get(provider)
+        if not pv or pv.get("kind") != "web":
+            raise ValueError("unknown web-login provider")
+        with self.lock:
+            n=len(self.accounts)+1
+            name=(name or "").strip()[:40] or f"{pv['name']} {n}"
+            if any(x.name.lower()==name.lower() for x in self.accounts): name=f"{name} {n}"
+            aid=f"{re.sub(r'[^a-z0-9]+','-',provider.lower())[:12] or 'web'}-{secrets.token_hex(2)}"
+            a=Account({"id":aid,"name":name,"profile":str(ACCOUNTS_DIR/aid),"enabled":True,"headed":bool(headed),
+                       "logged_in":False,"created":time.time(),"kind":"web","provider":provider,
+                       "tier":tier or int(pv.get("tier") or 3),"max_parallel":1})
+            a.on_change=self._save; self.accounts.append(a); self._save()
+        self.event("info", f"{pv['name']} web account '{name}' added - login in its dedicated browser profile")
+        if start: self.start_account(a, force_login=True)
+        return a
 
     def add_account(self, name: str = "", start: bool = True) -> Account:
         with self.lock:
@@ -5058,7 +5806,8 @@ class Pool:
         self.restart_account(a)
 
     def login(self, a: Account) -> None:
-        self.event("info", f"account '{a.name}': log in to DeepSeek in the window that opens")
+        pname=(_PROVIDER.get(a.provider) or {}).get("name", "DeepSeek")
+        self.event("info", f"account '{a.name}': log in to {pname} in the window that opens")
         a.enabled = True
         self._save()
         self.restart_account(a, force_login=True)
@@ -5152,6 +5901,12 @@ class Pool:
                 return pa, "account endpoint"
             return None, f"account '{pa.name}' is not ready"
         elig = [a for a in accts if a.usable(now) and a.id not in exclude]
+        project = claude_cwd(req) if req is not None and not getattr(req, "side", False) else ""
+        assigned = self.project_accounts_for(project) if project else []
+        if assigned:
+            elig = [a for a in elig if a.id in assigned]
+            if not elig:
+                return None, f"assigned project account(s) not ready: {', '.join(assigned)}"
         if not elig:
             enabled = [a for a in accts if a.enabled]
             if (len(enabled) == 1 and enabled[0].status == "ready" and enabled[0].worker is not None
@@ -5260,7 +6015,7 @@ class Pool:
                             tried.clear()
                             time.sleep(1.0)
                             continue
-                        raise last or BridgeError(f"no DeepSeek account is available ({why})", "upstream")
+                        raise last or BridgeError(f"no AI account is available ({why})", "upstream")
                     attempts += 1
                     self._route_note(a, why, req)
                     with self.lock:
@@ -5311,7 +6066,7 @@ class Pool:
         a, why = self.pick(None, ())
         if a is None:
             fut: concurrent.futures.Future = concurrent.futures.Future()
-            fut.set_exception(BridgeError(f"no DeepSeek account is available ({why})", "upstream"))
+            fut.set_exception(BridgeError(f"no AI account is available ({why})", "upstream"))
             return fut
         return a.worker.submit(fn, priority, cancel)
 
@@ -5569,7 +6324,72 @@ def set_project_context(pool: Any, project: Any) -> Dict[str, Any]:
         pool.event("info", f"active project changed to {path}")
     except Exception:
         pass
+    emit_dash_event("project", {"project": str(path)})
     return {"ok": True, "project": str(path)}
+
+
+SWARM_ATTACH_DIR = Path(os.getenv("DS_BRIDGE_SWARM_ATTACH_DIR",
+                                  str(Path.home() / ".deepseek_bridge" / "swarm_attachments"))).expanduser().resolve()
+
+
+def _safe_upload_name(name: str) -> str:
+    name = Path(str(name or "attachment")).name
+    name = re.sub(r"[^A-Za-z0-9._()\- ]+", "_", name).strip(" .")
+    return name[:180] or "attachment"
+
+
+def store_swarm_attachment(name: str, mime: str, data: bytes) -> Dict[str, Any]:
+    if len(data) > ATTACH_MAX_BYTES:
+        raise ValueError(f"attachment exceeds {ATTACH_MAX_BYTES:,} bytes")
+    SWARM_ATTACH_DIR.mkdir(parents=True, exist_ok=True)
+    aid = uuid.uuid4().hex[:16]
+    safe = _safe_upload_name(name)
+    path = SWARM_ATTACH_DIR / f"{aid}-{safe}"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+    meta = {"id": aid, "name": safe, "mime": (mime or "application/octet-stream")[:120],
+            "size": len(data), "path": str(path), "created": time.time()}
+    (SWARM_ATTACH_DIR / f"{aid}.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    emit_dash_event("attachment", {k: meta[k] for k in ("id", "name", "mime", "size")})
+    return meta
+
+
+def get_swarm_attachment(aid: str) -> Dict[str, Any]:
+    safe = re.sub(r"[^0-9a-f]", "", str(aid).lower())[:32]
+    if not safe:
+        raise ValueError("invalid attachment id")
+    meta_path = SWARM_ATTACH_DIR / f"{safe}.json"
+    if not meta_path.is_file():
+        raise ValueError("attachment not found or expired")
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    if not isinstance(meta, dict) or meta.get("id") != safe:
+        raise ValueError("invalid attachment metadata")
+    path = Path(str(meta.get("path") or ""))
+    if not path.is_file() or path.parent.resolve() != SWARM_ATTACH_DIR.resolve():
+        raise ValueError("attachment storage is invalid")
+    return meta
+
+
+def cleanup_swarm_attachments(max_age_days: int = 7) -> int:
+    cutoff = time.time() - max_age_days * 86400
+    removed = 0
+    try:
+        for meta_path in SWARM_ATTACH_DIR.glob("*.json"):
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if float(meta.get("created", 0)) >= cutoff:
+                    continue
+                data_path = Path(str(meta.get("path") or ""))
+                if data_path.is_file() and data_path.parent.resolve() == SWARM_ATTACH_DIR.resolve():
+                    data_path.unlink(missing_ok=True)
+                meta_path.unlink(missing_ok=True)
+                removed += 1
+            except Exception as exc:
+                _warn_once("attach_cleanup:" + meta_path.name, f"attachment cleanup failed for {meta_path.name}: {exc}")
+    except Exception as exc:
+        _warn_once("attach_cleanup_root", f"attachment cleanup failed: {exc}")
+    return removed
 
 
 def dash_action(pool: Any, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -5596,6 +6416,10 @@ def dash_action(pool: Any, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
 
     if action == "add":
         return {"ok": True, "id": pool.add_account(str(data.get("name", ""))).id}
+    if action == "add_web":
+        a=pool.add_web_account(str(data.get("provider", "")), str(data.get("name", "")),
+                               int(data.get("tier") or 0), bool(data.get("headed", True)), True)
+        return {"ok": True, "id": a.id}
     if action == "remove":
         pool.remove_account(acct(), bool(data.get("purge", True)))
     elif action == "rename":
@@ -5637,15 +6461,48 @@ def dash_action(pool: Any, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
                          tier_balanced=data.get("tier_balanced"))
     elif action == "command":
         return {"ok": True, "text": pool.run_command(str(data.get("text", "")), secret=True)}
+    elif action == "project_accounts":
+        project=str(data.get("project", "")).strip()
+        ids=[str(x) for x in (data.get("account_ids") or [])][:32]
+        chosen=pool.set_project_accounts(project, ids)
+        return {"ok": True, "project": str(Path(project).expanduser().resolve()), "account_ids": chosen}
     elif action == "settings_set":
         vals = data.get("values") if isinstance(data.get("values"), dict) else {}
-        restart = settings_set(pool.cfg, vals, [str(x) for x in (data.get("reset") or [])])
-        pool.event("info", f"settings saved ({', '.join(list(vals) + list(data.get('reset') or [])) or 'no change'})")
+        resets = [str(x) for x in (data.get("reset") or [])]
+        restart = settings_set(pool.cfg, vals, resets)
+        changed = list(vals) + resets
+        pool.event("info", f"settings saved ({', '.join(changed) or 'no change'})")
+        emit_dash_event("settings", {"changed": changed, "restart": restart,
+                                       "settings": settings_view(pool.cfg),
+                                       "project": pool.cfg.get("project_dir") or str(SCRIPT_DIR)})
         return {"ok": True, "restart": restart, "settings": settings_view(pool.cfg)}
     elif action == "launch":
         return launch_claude_from_panel(pool, data)
     elif action == "project_context":
         return set_project_context(pool, data.get("project", ""))
+    elif action == "swarm_prompt_improve":
+        original = str(data.get("prompt", "")).strip()
+        current = str(data.get("current", "")).strip()
+        custom = str(data.get("custom", "")).strip()
+        if not original:
+            raise ValueError("enter a prompt to improve")
+        instruction = (
+            "Improve the following software-engineering agent task prompt. Preserve the user's original intent, "
+            "requested outcome, scope, technologies, constraints and desired behavior. Make it clearer, more "
+            "actionable and more complete. Add useful acceptance criteria, verification steps, edge cases and "
+            "implementation clarity only when they naturally follow from the intent. NEVER invent a different goal, "
+            "remove a requested capability, or silently broaden the scope. Return ONLY the improved prompt, no preamble.\n\n"
+            f"ORIGINAL USER PROMPT:\n{original}\n"
+        )
+        if current:
+            instruction += f"\nCURRENT AI-IMPROVED VERSION (preserve it unless the custom notes require a change):\n{current}\n"
+        if custom:
+            instruction += f"\nADDITIONAL CUSTOMIZATION / NOTES FROM USER:\n{custom}\n"
+        improved = pool.ask(instruction, role="planner", max_tokens=6000, tag="panel.prompt-improve", timeout=900).strip()
+        if not improved:
+            raise ValueError("the AI did not return an improved prompt")
+        emit_dash_event("prompt_improved", {"original": original[:400], "chars": len(improved)})
+        return {"ok": True, "original": original, "current": current, "improved": improved, "custom": custom}
     elif action == "fs":
         return {"ok": True, **fs_list(str(data.get("path", "")))}
     elif action == "mkdir":
@@ -5659,12 +6516,20 @@ def dash_action(pool: Any, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
         return run_task(pool, str(data.get("name", "")))
     elif action == "swarm_start":
         swarm_project = str(data.get("project", ""))
+        attachment_ids = [str(x) for x in (data.get("attachments") or [])][:ATTACH_MAX_FILES]
+        for aid in attachment_ids:
+            get_swarm_attachment(aid)
+        account_ids=[str(x) for x in (data.get("account_ids") or [])][:32]
         run = pool.swarm.start(str(data.get("goal", "")), swarm_project, data.get("agents", "auto"),
                                str(data.get("verify", "auto")), str(data.get("review", "")), str(data.get("mode", "")),
-                               str(data.get("tasks", "")), bool(data.get("strict")), bool(data.get("init_git", True)))
+                               str(data.get("tasks", "")), bool(data.get("strict")), bool(data.get("init_git", True)),
+                               attachments=attachment_ids, account_ids=account_ids)
         remember_project(pool.cfg, swarm_project, persist=True)
         pool.event("info", f"swarm project selected: {run.project}")
-        return {"ok": True, "id": run.id, "project": run.project}
+        emit_dash_event("swarm_started", {"id": run.id, "project": str(run.project), "attachments": attachment_ids,
+                                             "account_ids": list(run.opts.get("account_ids") or [])})
+        return {"ok": True, "id": run.id, "project": run.project, "attachments": attachment_ids,
+                "account_ids": list(run.opts.get("account_ids") or [])}
     elif action in ("swarm_stop", "swarm_agents", "swarm_apply", "swarm_cleanup"):
         run = pool.swarm.runs.get(str(data.get("run", "")))
         if run is None:
@@ -5727,6 +6592,8 @@ SETTINGS_SCHEMA: Tuple[Tuple[Any, ...], ...] = (
     ("MAX_KEPT_CONVS", "int", "browser", "Sleeping conversations kept per account", "گفتگوهای خوابیده نگه‌داشته‌شده", 1, 500, "live"),
     ("DELETE_OLD_CHATS", "bool", "browser", "Delete old chats on chat.deepseek.com", "حذف چت‌های قدیمی در سایت دیپ‌سیک", 0, 0, "live"),
     ("HEADLESS_MODE", "choice", "browser", "Browser windows: auto / always hidden / always visible", "پنجره مرورگر: خودکار / همیشه مخفی / همیشه نمایان", ["auto", "1", "0"], 0, "browser"),
+    ("THINK_MODE", "bool", "browser", "Native thinking for DeepSeek and ChatGPT (default off)", "تفکر بومی برای DeepSeek و ChatGPT (پیش‌فرض خاموش)", 0, 0, "live"),
+    ("UI_PERFORMANCE_MODE", "choice", "panel", "Panel performance: automatic / balanced / lightweight / maximum", "کارایی پنل: خودکار / متعادل / سبک / حداکثر", ["auto", "balanced", "light", "max"], 0, "live"),
     ("UPLOAD_TIMEOUT", "int", "browser", "Wait for file uploads up to (s)", "انتظار برای آپلود فایل (ثانیه)", 10, 1800, "live"),
     ("CHARS_PER_TOKEN", "float", "panel", "Characters per token (for the estimates)", "کاراکتر در هر توکن (برای تخمین)", 1.0, 10.0, "live"),
     ("DASH_AUTOOPEN", "bool", "panel", "Open this panel automatically on start", "باز شدن خودکار پنل هنگام اجرا", 0, 0, "launch"),
@@ -5994,11 +6861,15 @@ def panel_info(pool: Any) -> Dict[str, Any]:
             "deepseek_model": "deepseek-v4-pro", "port": port, "platform": sys.platform,
             "claude": shutil.which("claude") or "", "project": cfg.get("project_dir") or str(SCRIPT_DIR),
             "recent": cfg.get("recent_projects") or [], "mode": mode, "mode_src": src, "run_mode": RUN_MODE,
+            "ui_performance_mode": UI_PERFORMANCE_MODE,
             "script": str(Path(__file__).resolve()), "log": str(SCRIPT_DIR / "bridge.log"), "config": str(CONFIG_PATH),
             "profiles": str(ACCOUNTS_DIR), "home": str(Path.home()), "settings": settings_view(cfg),
             "providers": PROVIDERS, "tiers": TIER_NAMES, "routing": dict(pool.routing),
+            "project_accounts": dict(pool.project_accounts),
             "accounts": [{"id": a.id, "name": a.name, "url": f"{base}/a/{a.id}", "profile": str(a.profile),
-                          "created": a.created, "logged_in": a.logged_in} for a in pool.accounts],
+                          "created": a.created, "logged_in": a.logged_in, "kind": a.kind, "provider": a.provider,
+                          "status": a.state(time.time()), "enabled": a.enabled, "tier": a.tier,
+                          "max_parallel": a.max_parallel, "key_hint": ((a.api_key[:3]+"…"+a.api_key[-3:]) if a.api_key else "")} for a in pool.accounts],
             "limits": {"files": ATTACH_MAX_FILES, "file_bytes": ATTACH_MAX_BYTES, "body_bytes": MAX_HTTP_BODY_BYTES}}
 
 
@@ -6109,7 +6980,7 @@ def open_dashboard(url: str, key: str, page: str = "") -> None:
 
 DASH_HTML = r"""<!doctype html>
 <html lang="fa" dir="rtl" data-theme="dark" data-acc="violet"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>DeepSeek Bridge</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0d1117"><link rel="icon" href="data:,"><title>DeepSeek Bridge</title>
 <style>
 :root{--ac:#7c8cff;--ac2:#b37cff;--ok:#34d399;--warn:#fbbf24;--bad:#fb7185;--info:#60c8ff;--r:14px}
 [data-acc=emerald]{--ac:#34d399;--ac2:#22d3ee}[data-acc=amber]{--ac:#fbbf24;--ac2:#fb7185}[data-acc=sky]{--ac:#38bdf8;--ac2:#818cf8}
@@ -6186,7 +7057,7 @@ svg.sp{width:100%;height:38px;display:block}.err{color:var(--bad);font-size:12px
 #cbox .pr{color:var(--ac);font-weight:700;padding-bottom:6px}#cin{flex:1;background:none;border:0;outline:0;resize:none;max-height:200px;padding:5px 0;direction:auto}.snd{background:linear-gradient(135deg,var(--ac),var(--ac2));color:#fff!important;border-radius:11px}
 #chips2{max-width:900px;margin:0 auto 6px;display:flex;gap:6px;flex-wrap:wrap}.ach{display:flex;gap:6px;align-items:center;background:var(--p2);border:1px solid var(--ln);border-radius:10px;padding:3px 8px;font-size:12px}.ach img{height:30px;border-radius:5px}.ach button{background:none;border:0;cursor:pointer;color:var(--mut)}
 #pal{position:absolute;bottom:100%;inset-inline:16px;max-width:900px;margin:0 auto;background:var(--p);border:1px solid var(--ln);border-radius:12px;padding:5px;box-shadow:0 20px 50px -20px #000;z-index:5}.pi{padding:6px 10px;border-radius:8px;cursor:pointer;display:flex;gap:12px}.pi:hover,.pi.on{background:var(--p2)}.pi b{color:var(--ac)}.pi span{color:var(--mut)}
-#p-chat.drag:after{content:"📎";position:absolute;inset:0;display:grid;place-items:center;font-size:80px;background:color-mix(in srgb,var(--ac) 18%,transparent);border:3px dashed var(--ac);z-index:9}
+#p-chat.drag:after{content:"＋";position:absolute;inset:0;display:grid;place-items:center;font-size:80px;background:color-mix(in srgb,var(--ac) 18%,transparent);border:3px dashed var(--ac);z-index:9}
 /* console / connect / settings / launch */
 #cw{display:flex;flex-direction:column;height:calc(100vh - 150px);min-height:380px}#clog{flex:1;overflow:auto;background:#05070e;border:1px solid var(--ln);border-radius:14px 14px 0 0;padding:10px 14px;font-size:12.5px;color:#cfd6f3}[data-theme=light] #clog{background:#10162b}
 .ll{white-space:pre-wrap;word-break:break-word}.ll time{color:#6b7599;margin-inline-end:10px}.ll.warn{color:#fbbf24}.ll.error{color:#fb7185}.ll.ok{color:#34d399}.ll.cmd{color:#7c8cff}
@@ -6213,26 +7084,82 @@ svg.sp{width:100%;height:38px;display:block}.err{color:var(--bad);font-size:12px
 .stepper{display:inline-flex;align-items:center;gap:6px}.stepper button{width:28px;height:28px;border-radius:8px;border:1px solid var(--ln);background:var(--p2);cursor:pointer;color:var(--tx)}
 @media(max-width:1100px){#app.dock #dockp{display:none}}
 @media(max-width:760px){#app{flex-direction:column-reverse}#rail{width:100%;height:auto;position:fixed;bottom:0;flex-direction:row;padding:6px;overflow-x:auto;justify-content:space-around}.logo{display:none}.nb{width:auto;padding:5px 8px}#main{padding-bottom:70px}#p-chat.on{grid-template-columns:1fr}#cl{display:none}.srow{grid-template-columns:1fr}.kvl{grid-template-columns:1fr}#toast{inset-inline-start:10px;bottom:80px}}
+
+/* adaptive performance / compact UX */
+:root{--perf-shadow:0 14px 40px -26px #000}
+html[data-perf="light"] body{background-attachment:scroll}
+html[data-perf="light"] #rail,html[data-perf="light"] #top,html[data-perf="light"] #dockp,html[data-perf="light"] #cl{backdrop-filter:none!important;box-shadow:none!important;background:var(--p)!important}
+html[data-perf="light"] .box,html[data-perf="light"] .card,html[data-perf="light"] #toast div{box-shadow:none!important}
+html[data-perf="light"] .btn,html[data-perf="light"] .card,html[data-perf="light"] .nb,html[data-perf="light"] .pv,html[data-perf="light"] .ag{transition:none!important}
+html[data-perf="light"] .btn:hover,html[data-perf="light"] .card:hover,html[data-perf="light"] .pv:hover,html[data-perf="light"] .nb:hover i{transform:none!important}
+html[data-perf="light"] .page,html[data-perf="light"] .fcard{animation:none!important}
+html[data-perf="light"] .ov{backdrop-filter:none!important}
+#ccmirror{margin-bottom:12px}.ccm{background:var(--p);border:1px solid var(--ln);border-radius:14px;padding:11px 13px}.ccmhead{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.ccmstate{margin-inline-start:auto;color:var(--ok);font-size:11px}.ccmrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px;color:var(--mut);font-size:12px}.ccmrow .pth{color:var(--tx);overflow-wrap:anywhere}.ccmagents{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.ccma{padding:4px 8px;border-radius:9px;background:var(--p2);font-size:11px}.ccma span{color:var(--mut)}.swpreview{display:grid;gap:8px;margin-top:8px}.swpreview textarea{resize:vertical;min-height:120px}.swu{border:1px dashed var(--ln);border-radius:11px;padding:10px}.swu .lbl{display:flex;justify-content:space-between;gap:8px;align-items:center;color:var(--mut);font-size:11px}.sactions{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}.swattach{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:9px}.achip{display:inline-flex;align-items:center;gap:5px;max-width:100%;background:var(--p2);border:1px solid var(--ln);border-radius:9px;padding:4px 8px;font-size:11px}.achip span{max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.achip button{border:0;background:none;color:var(--mut);cursor:pointer;padding:0 2px}
+@media(max-width:980px){.grid{grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}.fg2{grid-template-columns:1fr}.ags{grid-template-columns:1fr}#top{padding:10px 14px}.page{padding:14px}}
+@media(max-width:600px){.tiles{grid-template-columns:1fr 1fr}.tile b{font-size:21px}.kv{grid-template-columns:1fr 1fr}.grid{grid-template-columns:1fr}.btn{min-height:38px}.inp{min-height:40px}.ccma{max-width:100%}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation:none!important;transition:none!important}}
+/* GitHub-like, low-RAM skin + mobile drawer. No external fonts, icons or effects. */
+:root{--r:8px;--ok:#3fb950;--bad:#f85149;--warn:#d29922;--info:#58a6ff}
+[data-acc=sky]{--ac:#58a6ff;--ac2:#79c0ff}
+[data-theme=dark]{--bg:#0d1117;--p:#161b22;--p2:#21262d;--ln:#30363d;--tx:#f0f6fc;--mut:#8b949e;--glass:#161b22}
+[data-theme=light]{--bg:#ffffff;--p:#ffffff;--p2:#f6f8fa;--ln:#d0d7de;--tx:#1f2328;--mut:#656d76;--glass:#ffffff}
+body{background:var(--bg);background-attachment:scroll}
+#rail{width:72px;background:var(--p);backdrop-filter:none;border-inline-end:1px solid var(--ln);padding:10px 7px;gap:4px}
+.logo{width:40px;height:40px;border-radius:8px;background:var(--p2);color:var(--tx);font-size:13px;font-weight:700;box-shadow:none;margin-bottom:8px}
+.nb{width:58px;border-radius:8px;padding:7px 3px;transition:none;font-size:10px}.nb i{font-size:16px;line-height:1.1;transition:none}.nb.on{background:var(--p2);color:var(--tx);box-shadow:inset 2px 0 var(--ac)}.nb:hover i{transform:none}
+#top{background:var(--p);backdrop-filter:none;padding:9px 16px;gap:8px;min-height:52px}.btn{border-radius:7px;padding:6px 11px;transition:none}.btn:hover{transform:none}.btn.pri{background:var(--ac);box-shadow:none}.box,.card{border-radius:var(--r);box-shadow:none}.card:hover,.pv:hover,.ag:hover{transform:none}.inp{border-radius:7px;box-shadow:none}.seg label,.menu,.fcard,.pv,.ag,.rn,.ccm,.swu{border-radius:8px;box-shadow:none}.tag.live,.tb2{background:var(--ac)}
+#dockp{background:var(--p);backdrop-filter:none;box-shadow:none}.ov{backdrop-filter:none;background:rgba(1,4,9,.58)}
+#mobileNav{display:none}#navshade{display:none}
+@media(max-width:760px){#navshade{display:block;position:fixed;inset:0;background:rgba(1,4,9,.28);z-index:110}}
+@media(max-width:760px){
+  #app{display:block;min-height:100vh}
+  #rail{position:fixed;inset-block:0;inset-inline-start:0;width:min(82vw,280px);height:100vh;transform:translateX(-105%);z-index:120;align-items:stretch;padding:10px 9px;background:var(--p);border-inline-end:1px solid var(--ln);overflow:auto;transition:transform .12s ease}
+  [dir=rtl] #rail{transform:translateX(105%)}
+  #app.navopen #rail{transform:none}
+  #rail .logo{display:grid;align-self:flex-start;width:40px}.nb{width:100%;display:flex;justify-content:flex-start;gap:10px;padding:10px 12px;font-size:13px}.nb i{width:22px;text-align:center;font-size:16px}.railbottom{display:flex}
+  #main{padding-bottom:0;min-width:0}
+  #top{position:sticky;top:0;padding:8px 10px;z-index:100;overflow:hidden}
+  #mobileNav{display:inline-flex;flex:none;width:34px;height:34px;padding:0;align-items:center;justify-content:center;border:1px solid var(--ln);background:var(--p2);border-radius:7px;color:var(--tx);font-size:18px}
+  #ttl{font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+  #chips{display:none}
+  #top .sp{display:none}
+  #hdock,#hnext{display:none}
+  #hadd{margin-inline-start:auto}
+  .page{padding:10px;max-width:none;animation:none}
+  #p-chat.on{grid-template-columns:1fr;height:calc(100vh - 52px)}
+  #cl{display:none}
+  #cbar{padding:8px 8px 10px}
+  #cbox{border-radius:9px;padding:6px 8px}
+  #cscroll{padding-inline:8px}
+  .tiles{grid-template-columns:1fr 1fr;gap:8px}.tile{padding:11px 12px}.tile b{font-size:19px}
+  .grid{grid-template-columns:1fr;gap:8px}.box,.card{padding:12px;margin-bottom:10px}.row{gap:10px}.row input[type=number]{width:70px}
+  .kvl{grid-template-columns:1fr;gap:4px}.g2{grid-template-columns:1fr}.mode{grid-template-columns:1fr}.pvg{grid-template-columns:1fr}.fg2{grid-template-columns:1fr}.ags{grid-template-columns:1fr}
+  #toast{inset-inline:10px;bottom:10px}.fcard{padding:8px;font-size:12px}
+  #ccmirror{margin-bottom:8px}.ccm{padding:9px}.ccmrow{gap:6px}.ccmagents{gap:4px}
+  .mdl,.mdl.big{width:100%;max-height:92vh;padding:14px}
+}
 </style></head><body>
-<div id="app"><aside id="rail"><div class="logo">⚡</div>
-<button class="nb" data-go="dash"><i>🏠</i><span data-t="n_dash"></span></button><button class="nb" data-go="live"><i>📺</i><span data-t="n_live"></span></button><button class="nb" data-go="chat"><i>💬</i><span data-t="n_chat"></span></button><button class="nb" data-go="swarm"><i>🐝</i><span data-t="n_swarm"></span></button>
-<button class="nb" data-go="launch"><i>🚀</i><span data-t="n_launch"></span></button><button class="nb" data-go="console"><i>⌨️</i><span data-t="n_console"></span></button>
-<button class="nb" data-go="connect"><i>🔌</i><span data-t="n_connect"></span></button><button class="nb" data-go="settings"><i>⚙️</i><span data-t="n_settings"></span></button>
-<div class="sp"></div><button class="nb" id="bpal"><i>🔎</i><span>Ctrl+K</span></button><button class="nb" id="bth"><i>🌓</i><span data-t="theme"></span></button><button class="nb" id="blang"><i>🌐</i><span>EN</span></button></aside>
-<div id="main"><div id="off"></div><header id="top"><h1 id="ttl"></h1><span id="chips"></span><div class="sp"></div><button class="btn" id="hdock">📺 <span data-t="dock"></span></button><button class="btn" id="hnext">⏭ <span data-t="nextAcct"></span></button><button class="btn pri" id="hadd">＋ <span data-t="add"></span></button></header>
+<div id="app"><aside id="rail"><div class="logo" aria-label="DeepSeek Bridge">DB</div>
+<button class="nb" data-go="dash"><i>⌂</i><span data-t="n_dash"></span></button><button class="nb" data-go="live"><i>◉</i><span data-t="n_live"></span></button><button class="nb" data-go="chat"><i>▱</i><span data-t="n_chat"></span></button><button class="nb" data-go="swarm"><i>✣</i><span data-t="n_swarm"></span></button>
+<button class="nb" data-go="launch"><i>↗</i><span data-t="n_launch"></span></button><button class="nb" data-go="console"><i>&gt;_</i><span data-t="n_console"></span></button>
+<button class="nb" data-go="connect"><i>⊕</i><span data-t="n_connect"></span></button><button class="nb" data-go="settings"><i>⚙</i><span data-t="n_settings"></span></button>
+<div class="sp"></div><button class="nb" id="bpal"><i>⌕</i><span>Ctrl+K</span></button><button class="nb" id="bth"><i>◐</i><span data-t="theme"></span></button><button class="nb" id="blang"><i>A</i><span>EN</span></button></aside>
+<div id="main"><div id="off"></div><header id="top"><button id="mobileNav" aria-label="Menu" title="Menu">☰</button><h1 id="ttl"></h1><span id="chips"></span><div class="sp"></div><button class="btn" id="hdock">▣ <span data-t="dock"></span></button><button class="btn" id="hnext">› <span data-t="nextAcct"></span></button><button class="btn pri" id="hadd">＋ <span data-t="add"></span></button></header>
 <section class="page" id="p-dash"><div class="tiles" id="tiles"></div>
-<div class="box"><h3>🧭 <span data-t="routing"></span></h3><div class="seg" id="seg"></div>
+<div class="box"><h3>↗ <span data-t="routing"></span></h3><div class="seg" id="seg"></div>
 <div class="row"><label><span class="sw"><input type="checkbox" id="fo"><i></i></span> <span data-t="autofo"></span></label><label><span data-t="rotReq"></span> <input class="inp" type="number" id="rr" min="0"></label><label><span data-t="rotMin"></span> <input class="inp" type="number" id="rm" min="0"></label><span class="tip" data-t="rotTip"></span></div>
 <div class="row"><label><span class="sw"><input type="checkbox" id="sm"><i></i></span> <span data-t="smart"></span></label><label><span data-t="tierStrong"></span> <select class="inp" id="ts"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></label><label><span data-t="tierBal"></span> <select class="inp" id="tbl"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select></label><span class="tip" data-t="tierTip"></span></div></div>
-<div class="grid" id="grid"></div><div class="box"><h3>📜 <span data-t="events"></span></h3><div class="ev" id="ev"></div></div></section>
+<div class="grid" id="grid"></div><div class="box"><h3>≡ <span data-t="events"></span></h3><div class="ev" id="ev"></div></div></section>
 <section class="page" id="p-chat"><aside id="cl"><button class="btn pri wide" id="cnew">＋ <span data-t="newchat"></span></button><div id="clist"></div></aside>
 <div id="cm"><div id="chd"><b id="ctitle"></b><span class="sp"></span><select class="inp" id="cacct"></select><select class="inp" id="cpow"><option value="" data-t="powAuto"></option><option value="strong" data-t="powStrong"></option></select><button class="btn sm" id="cexp">⬇ <span data-t="export"></span></button><button class="btn sm dng" id="cdel">🗑</button></div>
-<div id="cscroll"><div id="ctx"></div></div><div id="cbar"><div id="pal" hidden></div><div id="chips2"></div><div id="cbox"><span class="pr">&gt;</span><textarea id="cin" rows="1"></textarea><button class="ib" id="catt" title="Attach">📎</button><button class="ib snd" id="csend">➤</button></div><div class="tip" id="chint" style="text-align:center;margin-top:6px"></div></div></div></section>
-<section class="page" id="p-live"><div class="tb" id="livetb"></div><div class="feed" id="livefeed" style="max-height:calc(100vh - 180px)"></div></section><section class="page" id="p-swarm"><div id="swf"></div><div id="swr"></div></section><section class="page" id="p-launch"><div id="lw"></div></section><section class="page" id="p-console"><div id="cw"></div></section>
-<section class="page" id="p-connect"><div id="kw"></div></section><section class="page" id="p-settings"><div id="sw"></div></section></div><aside id="dockp"><div class="dh"><b>📺 <span data-t="n_live"></span></b><button class="ib" id="dockx">✕</button></div><div class="feed" id="dockfeed"></div></aside></div>
-<div id="toast"></div><input type="file" id="cfile" multiple hidden>
+<div id="cscroll"><div id="ctx"></div></div><div id="cbar"><div id="pal" hidden></div><div id="chips2"></div><div id="cbox"><span class="pr">&gt;</span><textarea id="cin" rows="1"></textarea><button class="ib" id="catt" title="Attach">＋</button><button class="ib snd" id="csend">→</button></div><div class="tip" id="chint" style="text-align:center;margin-top:6px"></div></div></div></section>
+<section class="page" id="p-live"><div id="ccmirror"></div><div class="tb" id="livetb"></div><div class="feed" id="livefeed" style="max-height:calc(100vh - 180px)"></div></section><section class="page" id="p-swarm"><div id="swf"></div><div id="swr"></div></section><section class="page" id="p-launch"><div id="lw"></div></section><section class="page" id="p-console"><div id="cw"></div></section>
+<section class="page" id="p-connect"><div id="kw"></div></section><section class="page" id="p-settings"><div id="sw"></div></section></div><aside id="dockp"><div class="dh"><b>▣ <span data-t="n_live"></span></b><button class="ib" id="dockx">✕</button></div><div class="feed" id="dockfeed"></div></aside></div>
+<div id="navshade" hidden></div><div id="toast"></div><input type="file" id="cfile" multiple hidden><input type="file" id="sfiles" multiple hidden>
 <script>
 "use strict";
+/* Define live-mirror state before any boot-time callback can touch it. */
+var CC_SESSION=window.CC_SESSION={cwd:"",model:"",tool:"",text:"",event:"",status:"idle"},CC_AGENTS={},CC_SWARM={},CC_LOGS=[];
 const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const K={
@@ -6251,7 +7178,7 @@ confirmRm:["این اکانت حذف شود؟ (اطلاعات ورودش هم پ
 testing:["در حال تست…","Testing…"],okTest:["سالم","OK"],newName:["نام جدید","New name"],offline:["ارتباط با bridge قطع است","Lost connection to the bridge"],keyPrompt:["API key را وارد کنید","Enter the API key"],
 newchat:["گفتگوی جدید","New chat"],export:["خروجی","Export"],autoAcct:["خودکار (متعادل)","Auto (balanced)"],cph:["پیام بنویسید…  ( / برای دستورها )","Message…  ( / for commands )"],
 chint:["Enter ارسال · Shift+Enter خط جدید · / دستورها · فایل را بکشید و رها کنید یا Ctrl+V · Esc توقف","Enter send · Shift+Enter newline · / commands · drop files or Ctrl+V · Esc stop"],
-welcome:["✻ به پل DeepSeek خوش آمدید","✻ Welcome to DeepSeek Bridge"],w1:["/help راهنما · /ds next تعویض اکانت · 📎 ارسال فایل و عکس","/help for help · /ds next switches account · 📎 send files & images"],w2:["حساب:","account:"],
+welcome:["* به پل DeepSeek خوش آمدید","* Welcome to DeepSeek Bridge"],w1:["/help راهنما · /ds next تعویض اکانت · ＋ ارسال فایل و عکس","/help for help · /ds next switches account · ＋ send files & images"],w2:["حساب:","account:"],
 spin:[["در حال فکر کردن","در حال بررسی","در حال نوشتن","در حال پختن","در حال کاویدن"],["Thinking","Pondering","Cooking","Brewing","Noodling"]],esc:["Esc برای توقف","esc to interrupt"],interrupted:["متوقف شد","interrupted"],seeAtt:["(فایل پیوست را ببین)","(see the attached file)"],
 tooBig:["فایل بزرگ است","File is too large"],tooMany:["تعداد فایل‌ها زیاد است","Too many files"],
 hlp:["/new گفتگوی جدید · /clear پاک کردن · /account [n|نام|auto] · /system متن · /ds دستور · /attach · /copy · /export · /retry","/new · /clear · /account [n|name|auto] · /system text · /ds cmd · /attach · /copy · /export · /retry"],
@@ -6287,6 +7214,8 @@ swNone:["هنوز اجرایی نیست","No runs yet"],swStop:["توقف","Stop
 swApplyQ:["نتیجه با branch فعلی شما ادغام شود؟","Merge the result into your current branch?"],swCleanQ:["worktreeها و branchهای موقت پاک شوند؟","Remove the temporary worktrees and branches?"],swContracts:["قراردادهای مشترک","Shared contracts"],swTask:["تسک","Task"],
 sg_queued:["در صف","queued"],sg_starting:["شروع","starting"],sg_running:["در حال کار","working"],sg_verifying:["بررسی","checking"],sg_reviewing:["بازبینی","reviewing"],sg_merging:["ادغام","merging"],sg_merged:["ادغام شد","merged"],sg_done:["تمام","done"],
 sg_failed:["ناموفق","failed"],sg_conflict:["تداخل","conflict"],sg_skipped:["رد شد","skipped"],sg_stopped:["متوقف","stopped"],sg_planning:["برنامه‌ریزی","planning"],sg_done_with_issues:["تمام با مشکل","done with issues"],
+ccMirror:["آینه زنده Claude Code","Claude Code live mirror"],ccConnected:["متصل","connected"],ccSnapshot:["نمای ایستا","snapshot"],ccEvent:["رویداد","event"],ccProject:["پروژه","Project"],ccAgents:["ایجنت‌ها","Agents"],ccNoAgents:["هنوز ایجنتی فعال نیست","No active agents"],
+swImprove:["＋ بهبود با AI","＋ Improve with AI"],swImproving:["در حال بهبود…","Improving…"],swOriginal:["پرامپت اصلی","Original prompt"],swImproved:["نسخه بهبود‌یافته","AI-improved prompt"],swCustom:["تغییرات/توضیحات بیشتر","Additional changes / instructions"],swUseImproved:["استفاده به‌عنوان نهایی","Use as final"],swImproveAgain:["بهبود دوباره","Improve again"],swApplyCustom:["اعمال تغییرات به نسخه AI","Apply changes to AI version"],swFinalReady:["این نسخه برای ایجنت‌ها ارسال می‌شود","This version will be sent to the agents"],swAttach:["پیوست فایل","Attach files"],swAttachTip:["هر فرمت فایل قابل ارسال است؛ فایل‌ها در ورودی ایزوله Agent قرار می‌گیرند.","Any file format is accepted; files are placed in an isolated Agent input folder."],swUploading:["در حال آپلود فایل…","Uploading files…"],swAttached:["پیوست","attachments"],swRemoveAttachment:["حذف پیوست","Remove attachment"],
 };
 let L=localStorage.dsb_lang||"fa";const t=k=>(K[k]||[k,k])[L==="fa"?0:1];
 let KEY=localStorage.dsb_key||"";const hm=location.hash.match(/[#&]k=([^&]+)/);if(hm){KEY=decodeURIComponent(hm[1]);localStorage.dsb_key=KEY}
@@ -6297,7 +7226,7 @@ function toast(m){const d=document.createElement("div");d.textContent=m;$("#toas
 async function api(p,b){const o={headers:{Authorization:"Bearer "+KEY}};if(b!==undefined){o.method="POST";o.headers["Content-Type"]="application/json";o.body=JSON.stringify(b)}
 const r=await fetch("/dash/api/"+p,o);if(r.status===401){KEY=prompt(t("keyPrompt"))||"";localStorage.dsb_key=KEY;const e=new Error("401");e.status=401;throw e}
 const j=await r.json().catch(()=>({}));if(!r.ok){const e=new Error(j.error&&j.error.message||r.status);e.status=r.status;throw e}return j}
-async function act(a,b){try{const r=await api(a,b||{});if(r.text)toast(r.text);return r}catch(e){toast("⚠ "+e.message);return null}}
+async function act(a,b){try{const r=await api(a,b||{});if(r.text)toast(r.text);return r}catch(e){toast("! "+e.message);return null}}
 function modal(html,cls="",dismiss=true){const ov=document.createElement("div");ov.className="ov";ov.innerHTML=`<div class="mdl ${cls}">${html}</div>`;
 if(dismiss)ov.addEventListener("mousedown",e=>{if(e.target===ov)ov.close()});document.body.append(ov);requestAnimationFrame(()=>ov.classList.add("on"));ov.close=()=>{ov.classList.remove("on");setTimeout(()=>ov.remove(),180)};return ov}
 const ask=(msg,ok)=>new Promise(res=>{const o=modal(`<p>${esc(msg)}</p><div class="rowb"><button class="btn" data-x>${t("cancel")}</button><button class="btn pri" data-ok>${ok||t("yes")}</button></div>`,"",false);
@@ -6307,12 +7236,82 @@ const i=$("#mi",o);i.focus();i.select();const done=v=>{o.close();res(v)};o.oncli
 const copyText=async s=>{try{await navigator.clipboard.writeText(s)}catch{const x=document.createElement("textarea");x.value=s;document.body.append(x);x.select();document.execCommand("copy");x.remove()}toast(t("copied"))};
 const mk=h=>{const d=document.createElement("div");d.innerHTML=h.trim();return d.firstChild};
 /* ---------- theme / language / router ---------- */
-function applyTheme(){document.documentElement.dataset.theme=localStorage.dsb_theme||"dark";document.documentElement.dataset.acc=localStorage.dsb_acc||"violet"}
+function applyTheme(){document.documentElement.dataset.theme=localStorage.dsb_theme||"dark";document.documentElement.dataset.acc=localStorage.dsb_acc||"sky"}
 let S=null,INFO=null,page="dash";const PAGES=["dash","live","chat","swarm","launch","console","connect","settings"];
-async function loadInfo(force){if(!INFO||force)INFO=await api("info");return INFO}
+let dashStream=null,dashStreamReady=false,dashReconnectTimer=null;
+
+function applyUiPerformance(){const configured=(INFO&&INFO.ui_performance_mode)||"auto";let mode=configured;if(mode==="auto"){const ram=Number(navigator.deviceMemory||0),cpu=Number(navigator.hardwareConcurrency||0);mode=(ram&&ram<=8)||(cpu&&cpu<=4)?"light":"balanced"}document.documentElement.dataset.perf=mode}
+function renderClaudeMirror(){
+ const box=$("#ccmirror");
+ if(!box)return;
+ const sess=window.CC_SESSION||(window.CC_SESSION={cwd:"",model:"",tool:"",text:"",event:"",status:"idle"});
+ const project=(sess.cwd||(INFO&&INFO.project))||"—";
+ const active=Object.values(CC_AGENTS).filter(a=>["starting","running","verifying","reviewing","merging"].includes(a.status));
+ const rs=CC_SWARM.status||"idle";
+ const chips=active.length?active.slice(-8).map(a=>`<span class="ccma"><b>${esc(a.agent||"agent")}</b> <span>${esc(a.activity||a.status||"")}</span></span>`).join(""):`<span class="tip">${t("ccNoAgents")}</span>`;
+ const logs=CC_LOGS.slice(-4).map(x=>`<div class="ccmrow"><span>${esc(x.level||"info")}:</span><span>${esc(x.message||"")}</span></div>`).join("");
+ const liveText=sess.text?`<div class="ccmtext" dir="auto">${esc(sess.text)}</div>`:"";
+ const model=sess.model?`<span class="chip">${esc(sess.model)}</span>`:"";
+ const evt=sess.event?`<div class="ccmrow"><span>${t("ccEvent")}:</span><span>${esc(sess.event)}${sess.tool?` · ${esc(sess.tool)}`:""}</span></div>`:"";
+ box.innerHTML=`<div class="ccm"><div class="ccmhead"><b>* ${t("ccMirror")}</b><span class="ccmstate">• ${dashStreamReady?t("ccConnected"):t("ccSnapshot")}</span></div><div class="ccmrow"><span>${t("ccProject")}:</span><span class="pth">${esc(project)}</span>${model}<span class="chip">${esc(rs)}</span><span class="chip">${t("ccAgents")}: ${active.length}</span></div>${evt}<div class="ccmagents">${chips}</div>${liveText}${logs}</div>`;
+}
+function applyDashEvent(kind,data){
+ if(kind==="settings"){
+  if(INFO&&Array.isArray(data.settings))INFO.settings=data.settings;
+  if(INFO&&data.project)INFO.project=data.project;
+  applyUiPerformance();
+  if(page==="settings")renderSettings();
+  renderClaudeMirror();
+ }else if(kind==="project"){
+  if(INFO&&data.project){
+   INFO.project=data.project;
+   const p=$("#sp");
+   if(p&&p.dataset.autoProject!=="0")p.value=data.project;
+  }
+  renderClaudeMirror();
+ }else if(kind==="activity"){
+  if(data&&data.n){
+   FEED.push(data);feedLast=Math.max(feedLast,data.n);
+   if(FEED.length>400)FEED.splice(0,FEED.length-400);
+   addFeed(data);renderClaudeMirror();
+  }
+ }else if(kind==="agent"){
+  if(data&&data.agent)CC_AGENTS[data.agent]={...(CC_AGENTS[data.agent]||{}),...data};
+  renderClaudeMirror();
+ }else if(kind==="swarm"){
+  if(data&&data.run)CC_SWARM={...CC_SWARM,...data};
+  renderClaudeMirror();
+ }else if(kind==="pool"){
+  CC_LOGS.push({level:data.level||"info",message:data.msg||""});
+  if(CC_LOGS.length>60)CC_LOGS.splice(0,CC_LOGS.length-60);
+  renderClaudeMirror();
+ }else if(kind==="console"){
+  CC_LOGS.push({level:data.level||"info",message:data.message||""});
+  if(CC_LOGS.length>60)CC_LOGS.splice(0,CC_LOGS.length-60);
+  renderClaudeMirror();
+ }else if(kind==="request"){
+  CC_LOGS.push({level:"info",message:`request · ${data.model||""}${data.tag?` · ${data.tag}`:""}`});
+  if(CC_LOGS.length>60)CC_LOGS.splice(0,CC_LOGS.length-60);
+  renderClaudeMirror();
+ }else if(kind==="claude"){
+  window.CC_SESSION={...(window.CC_SESSION||{}),...data,status:data.event||"active",cwd:data.cwd||(window.CC_SESSION&&window.CC_SESSION.cwd)||"",model:data.model||(window.CC_SESSION&&window.CC_SESSION.model)||"",tool:data.tool_name||"",text:data.text||"",event:data.event||""};
+  if(data.event!=="MessageDisplay"){
+   CC_LOGS.push({level:"info",message:`Claude · ${data.event||"event"}${data.tool_name?` · ${data.tool_name}`:""}`});
+   if(CC_LOGS.length>60)CC_LOGS.splice(0,CC_LOGS.length-60);
+  }
+  renderClaudeMirror();
+ }else if(kind==="prompt_improved"){
+  renderClaudeMirror();
+ }
+}
+
+function connectDashStream(){if(!KEY||dashStream||document.hidden)return;try{dashStream=new EventSource("/dash/api/stream?key="+encodeURIComponent(KEY));dashStreamReady=false;for(const k of ["activity","agent","swarm","pool","console","request","project","settings","attachment","prompt_improved","claude"])dashStream.addEventListener(k,e=>{try{applyDashEvent(k,JSON.parse(e.data||"{}"))}catch{}});dashStream.onopen=()=>{dashStreamReady=true;syncFeed()};dashStream.onerror=()=>{dashStreamReady=false;if(dashStream){dashStream.close();dashStream=null}if(!dashReconnectTimer&&!document.hidden)dashReconnectTimer=setTimeout(()=>{dashReconnectTimer=null;connectDashStream()},2500)}}catch{dashStream=null;dashStreamReady=false}}
+function closeDashStream(){if(dashReconnectTimer){clearTimeout(dashReconnectTimer);dashReconnectTimer=null}if(dashStream){dashStream.close();dashStream=null}dashStreamReady=false}
+document.addEventListener("visibilitychange",()=>{if(document.hidden)closeDashStream();else{connectDashStream();tick()}});
+async function loadInfo(force){if(!INFO||force){INFO=await api("info");applyUiPerformance()}connectDashStream();return INFO}
 function applyLang(){document.documentElement.lang=L;document.documentElement.dir=L==="fa"?"rtl":"ltr";$("#blang span").textContent=L==="fa"?"EN":"فا";
 $$("[data-t]").forEach(e=>e.textContent=t(e.dataset.t));$("#cin").placeholder=t("cph");$("#chint").textContent=t("chint");for(const k in cards){cards[k].remove();delete cards[k]}segKey="";go(page,true)}
-function go(p,again){if(!PAGES.includes(p))p="dash";page=p;$$(".page").forEach(e=>e.classList.toggle("on",e.id==="p-"+p));$$(".nb[data-go]").forEach(e=>e.classList.toggle("on",e.dataset.go===p));
+function go(p,again){if(!PAGES.includes(p))p="dash";page=p;document.querySelector("#app")?.classList.remove("navopen");const ns=document.querySelector("#navshade");if(ns)ns.hidden=true;$$(".page").forEach(e=>e.classList.toggle("on",e.id==="p-"+p));$$('.nb[data-go]').forEach(e=>e.classList.toggle('on',e.dataset.go===p));
 $("#ttl").textContent=t("n_"+p);history.replaceState(null,"","#/"+p);if(p!=="console")stopLogs();
 ({dash:()=>S&&renderDash(),live:enterLive,chat:enterChat,swarm:enterSwarm,launch:renderLaunch,console:enterConsole,connect:renderConnect,settings:renderSettings})[p]();syncFeed()}
 /* ---------- state poll + dashboard ---------- */
@@ -6320,18 +7319,18 @@ let segKey="";const cards={};
 function cardTpl(a){return `<div class="card" data-id="${a.id}"><div class="ch"><span class="idx" data-f="idx"></span><b data-f="name"></b><span class="tag live" data-f="live">${t("inuse")}</span><span class="tag pin" data-f="pin">${t("pin")}</span><span class="pill" data-f="pill"></span></div><div class="sub" data-f="sub"></div>
 <div class="kv">${["tin","tout","today","msgs","errs","avg","active","streak","last"].map(k=>`<div><span>${t("k_"+k)}</span><b data-f="kv_${k}"></b></div>`).join("")}</div>
 <div class="bar"><i data-f="bar"></i></div><div data-f="spark"></div><div class="err" data-f="err"></div><div class="tip" data-f="chats"></div>
-<div class="act"><button class="btn sm pri" data-a="use">${t("use")}</button><button class="btn sm" data-a="chat">💬 ${t("chatw")}</button><button class="btn sm" data-a="connect">🔌 ${t("conn")}</button><button class="btn sm" data-a="test">${t("test")}</button>
+<div class="act"><button class="btn sm pri" data-a="use">${t("use")}</button><button class="btn sm" data-a="chat">» ${t("chatw")}</button><button class="btn sm" data-a="connect">⌁ ${t("conn")}</button><button class="btn sm" data-a="test">${t("test")}</button>
 <details class="more"><summary class="btn sm">⋯</summary><div class="menu"><button data-a="edit">${t("editAcc")}</button><button data-a="login" data-web>${t("login")}</button><button data-a="show" data-f="bshow">${t("show")}</button><button data-a="hide" data-f="bhide">${t("hide")}</button><button data-a="restart">${t("restart")}</button>
 <button data-a="enable" data-f="ben">${t("enable")}</button><button data-a="disable" data-f="bdis">${t("disable")}</button><button data-a="reset_convs" data-web>${t("reset_convs")}</button><button data-a="purge" data-web>${t("purge")}</button><button data-a="rename">${t("rename")}</button><button data-a="up">▲</button><button data-a="down">▼</button><button class="dng" data-a="remove">${t("remove")}</button></div></details></div></div>`}
 const F=(el,f)=>el.querySelector(`[data-f=${f}]`),setf=(el,f,v)=>{const n=F(el,f);if(n&&n.textContent!==String(v))n.textContent=v};
-const pvIcon=id=>{const p=((INFO&&INFO.providers)||[]).find(x=>x.id===id);return p?p.icon:"🔌"};
+const pvIcon=id=>{const p=((INFO&&INFO.providers)||[]).find(x=>x.id===id);return p?p.icon:"⌁"};
 function spark(v){const m=Math.max(1,...v),w=240,H=34;return `<svg class="sp" viewBox="0 0 ${w} ${H}" preserveAspectRatio="none"><polyline fill="none" stroke="var(--ac)" stroke-width="1.7" stroke-linejoin="round" points="${v.map((x,i)=>(i*w/59).toFixed(1)+","+(H-2-x/m*(H-6)).toFixed(1)).join(" ")}"/></svg>`}
 function updCard(el,a,tt){const s=a.stats;el.classList.toggle("cur",a.current);el.classList.toggle("off",!a.enabled);setf(el,"idx","#"+a.idx);setf(el,"name",a.name);
 F(el,"live").hidden=!a.current;F(el,"pin").hidden=!(S.settings.strategy==="pinned"&&a.pinned);const p=F(el,"pill");p.className="pill st-"+a.state;p.textContent=t("s_"+a.state)+(a.state==="cooldown"?" "+dur(a.cooldown_left):"");
-const v={tin:tok(s.in_tok),tout:tok(s.out_tok),today:tok(s.today_in+s.today_out),msgs:s.req,errs:s.err+" / "+s.rate_limits,avg:s.avg_s+"s",active:dur(s.active_s),streak:dur(s.streak_s)+(s.streak_live?" ●":""),last:s.last_used_ago==null?t("never"):dur(s.last_used_ago)+" "+t("ago")};
+const v={tin:tok(s.in_tok),tout:tok(s.out_tok),today:tok(s.today_in+s.today_out),msgs:s.req,errs:s.err+" / "+s.rate_limits,avg:s.avg_s+"s",active:dur(s.active_s),streak:dur(s.streak_s)+(s.streak_live?" •":""),last:s.last_used_ago==null?t("never"):dur(s.last_used_ago)+" "+t("ago")};
 for(const k in v)setf(el,"kv_"+k,v[k]);F(el,"bar").style.width=((s.in_tok+s.out_tok)/tt*100).toFixed(0)+"%";F(el,"spark").innerHTML=spark(s.spark);
 setf(el,"err",a.status_err||(s.last_error&&s.last_error_ago<1800?s.last_error:""));const web=a.kind==="web";setf(el,"sub",pvIcon(a.provider)+" "+(web?"DeepSeek":a.model)+" · T"+a.tier+" "+stars(a.tier));
-setf(el,"chats",web?a.chats+" "+t("chats")+(a.headed?" · 🪟":""):"⚡ ×"+a.max_parallel+(a.cost>0||a.budget>0?" · $"+a.cost.toFixed(4)+(a.budget>0?" / $"+a.budget:""):""));
+setf(el,"chats",web?a.chats+" "+t("chats")+(a.headed?" · □":""):"⚡ ×"+a.max_parallel+(a.cost>0||a.budget>0?" · $"+a.cost.toFixed(4)+(a.budget>0?" / $"+a.budget:""):""));
 el.querySelectorAll("[data-web]").forEach(b=>b.hidden=!web);F(el,"bshow").hidden=!web||a.headed;F(el,"bhide").hidden=!web||!a.headed;F(el,"ben").hidden=a.enabled;F(el,"bdis").hidden=!a.enabled}
 function renderDash(){const T=S.totals,A=S.accounts,st=S.settings;
 $("#tiles").innerHTML=[[S.ready+" / "+A.length,t("accounts")],[T.req,t("msgs")],["~"+tok(T.in_tok),t("tin")],["~"+tok(T.out_tok),t("tout")],[S.capacity,t("capacity")],[dur(S.uptime),t("up")],...(T.cost>0?[["$"+T.cost.toFixed(4),t("cost")]]:[])].map(x=>`<div class="tile"><b>${esc(x[0])}</b><span>${esc(x[1])}</span></div>`).join("");
@@ -6342,12 +7341,12 @@ A.forEach((a,i)=>{seen.add(a.id);let el=cards[a.id];if(!el)el=cards[a.id]=mk(car
 for(const id in cards)if(!seen.has(id)){cards[id].remove();delete cards[id]}
 $("#ev").innerHTML=S.events.map(e=>`<div class="${e.level}"><time>${new Date(e.t*1e3).toLocaleTimeString()}</time>${esc(e.msg)}</div>`).join("")}
 function renderChips(){const a=S.accounts.find(x=>x.current);$("#chips").innerHTML=`<span class="chip"><i class="dot ${S.ready?"":"off"}"></i>${S.ready}/${S.accounts.length}</span> <span class="chip">${t(S.settings.strategy)}</span>${a?` <span class="chip">▶ ${esc(a.name)}</span>`:""}`}
-let timer;async function tick(){clearTimeout(timer);try{S=await api("state");$("#off").style.display="none";renderChips();if(page==="dash")renderDash();if(page==="chat")fillAcct()}catch(e){if(e.status!==401){$("#off").textContent=t("offline");$("#off").style.display="block"}}timer=setTimeout(tick,document.hidden?5000:1500)}
+let timer;async function tick(){clearTimeout(timer);try{S=await api("state");$("#off").style.display="none";renderChips();if(page==="dash")renderDash();if(page==="chat")fillAcct()}catch(e){if(e.status!==401){$("#off").textContent=t("offline");$("#off").style.display="block"}}timer=setTimeout(tick,document.hidden?8000:(dashStreamReady?4500:2200))}
 $("#grid").addEventListener("click",async e=>{const b=e.target.closest("button[data-a]");if(!b)return;const id=b.closest(".card").dataset.id,a=b.dataset.a,acc=S.accounts.find(x=>x.id===id);const dt=b.closest("details");if(dt)dt.removeAttribute("open");
 if(a==="remove"){if(await ask(t("confirmRm")))await act("remove",{id})}else if(a==="purge"){if(await ask(t("confirmPurge")))await act("purge",{id})}
 else if(a==="rename"){const n=await inputBox(t("newName"),acc.name);if(n)await act("rename",{id,name:n})}else if(a==="up"||a==="down")await act("move",{id,dir:a==="up"?-1:1});
 else if(a==="chat"){chatAcctPref=id;go("chat")}else if(a==="connect"){connAcct=id;go("connect")}
-else if(a==="test"){toast(t("testing"));const r=await act("test",{id});if(r)toast(r.ok?`✔ ${acc.name}: ${t("okTest")} (${r.seconds}s)`:"✖ "+r.error)}else await act(a,{id});tick()});
+else if(a==="test"){toast(t("testing"));const r=await act("test",{id});if(r)toast(r.ok?`✓ ${acc.name}: ${t("okTest")} (${r.seconds}s)`:"× "+r.error)}else await act(a,{id});tick()});
 $("#seg").addEventListener("change",async e=>{await act("settings",{strategy:e.target.value});tick()});
 const sv=async()=>{await act("settings",{auto_failover:$("#fo").checked,rotate_requests:+$("#rr").value||0,rotate_minutes:+$("#rm").value||0,smart_routing:$("#sm").checked,tier_strong:+$("#ts").value,tier_balanced:+$("#tbl").value})};["fo","rr","rm","sm","ts","tbl"].forEach(i=>$("#"+i).onchange=sv);
 $("#hnext").onclick=async()=>{await act("command",{text:"next"});tick()};
@@ -6368,22 +7367,22 @@ if(m=/^(#{1,4})\s+(.*)$/.exec(ln)){close();out+=`<h${m[1].length+1}>${m[2]}</h${
 else if(m=/^\s*[-*]\s+(.*)$/.exec(ln)){if(li!=="ul"){close();out+="<ul>";li="ul"}out+=`<li>${m[1]}</li>`}
 else if(m=/^\s*\d+[.)]\s+(.*)$/.exec(ln)){if(li!=="ol"){close();out+="<ol>";li="ol"}out+=`<li>${m[1]}</li>`}
 else if(m=/^&gt;\s?(.*)$/.exec(ln)){close();out+=`<blockquote>${m[1]}</blockquote>`}else if(!ln.trim()){close();out+="<br>"}else{close();out+=ln+"<br>"}}close();return out}
-function md(src){return String(src).split(/(```[\s\S]*?(?:```|$))/g).map(p=>{if(p.startsWith("```")){const m=/^```([\w+#.-]*)\n?([\s\S]*?)(?:```)?$/.exec(p);return `<div class="code"><div class="cb"><span>${esc(m[1]||"text")}</span><button data-copy>⧉ ${t("copy")}</button></div><pre><code>${esc(m[2].replace(/\n$/,""))}</code></pre></div>`}return inl(p)}).join("")}
-function userEl(m){const bl=typeof m.content==="string"?[{type:"text",text:m.content}]:m.content;let h="",txt="";for(const b of bl){if(b.type==="image")h+=`<img class="th" src="data:${b.source.media_type};base64,${b.source.data}">`;else if(b.type==="document")h+=`<span class="fc">📄 ${esc(b.title||"file")}</span>`;else txt+=b.text}
+function md(src){return String(src).split(/(```[\s\S]*?(?:```|$))/g).map(p=>{if(p.startsWith("```")){const m=/^```([\w+#.-]*)\n?([\s\S]*?)(?:```)?$/.exec(p);return `<div class="code"><div class="cb"><span>${esc(m[1]||"text")}</span><button data-copy>□ ${t("copy")}</button></div><pre><code>${esc(m[2].replace(/\n$/,""))}</code></pre></div>`}return inl(p)}).join("")}
+function userEl(m){const bl=typeof m.content==="string"?[{type:"text",text:m.content}]:m.content;let h="",txt="";for(const b of bl){if(b.type==="image")h+=`<img class="th" src="data:${b.source.media_type};base64,${b.source.data}">`;else if(b.type==="document")h+=`<span class="fc">□ ${esc(b.title||"file")}</span>`;else txt+=b.text}
 return mk(`<div class="um"><span class="pr">&gt;</span><div class="ub">${h}${esc(txt)}</div></div>`)}
-const asstEl=txt=>mk(`<div class="am"><span class="bl">●</span><div class="md">${md(txt)}</div></div>`);
+const asstEl=txt=>mk(`<div class="am"><span class="bl">•</span><div class="md">${md(txt)}</div></div>`);
 function renderTx(){const box=$("#ctx");box.innerHTML="";if(!cur||!cur.msgs.length){const a=S&&S.accounts.find(x=>x.id===(cur?cur.acct:chatAcctPref));box.append(mk(`<div class="wel"><b>${t("welcome")}</b><div>${t("w1")}</div><div>${t("w2")} ${esc(a?a.name:t("autoAcct"))}</div></div>`))}
 if(cur)for(const m of cur.msgs){if(m.role==="user")box.append(userEl(m));else if(m.role==="assistant")box.append(asstEl(typeof m.content==="string"?m.content:m.content.map(b=>b.text||"").join("")));else box.append(mk(`<div class="nt ${m.err?"e":""}">⎿ ${esc(m.text)}</div>`))}
 scrollEnd(true)}
 function scrollEnd(f){const s=$("#cscroll");if(f||s.scrollHeight-s.scrollTop-s.clientHeight<140)s.scrollTop=s.scrollHeight}
 $("#ctx").addEventListener("click",e=>{const b=e.target.closest("[data-copy]");if(b)copyText(b.closest(".code").querySelector("code").textContent)});
-function setBusy(b){$("#csend").textContent=b?"■":"➤"}
+function setBusy(b){$("#csend").textContent=b?"■":"→"}
 async function sendMsg(){if(busy){busy.abort();return}const ta=$("#cin"),txt=ta.value.trim();if(!txt&&!atts.length)return;
 if(txt[0]==="/"&&!atts.length){ta.value="";autosize();hidePal();await slash(txt);return}
 const c=cur||newChat();const bl=atts.map(a=>a.kind==="image"?{type:"image",source:{type:"base64",media_type:a.mime,data:a.data}}:{type:"document",title:a.name,source:{type:"base64",media_type:a.mime,data:a.data}});
 bl.push({type:"text",text:txt||t("seeAtt")});c.msgs.push({role:"user",content:bl});if(!c.title)c.title=(txt||(atts[0]&&atts[0].name)||"").slice(0,40);
 lastAtts=atts;const keep=txt;atts=[];renderAtts();ta.value="";autosize();persist();renderList();renderTx();await runChat(c,keep)}
-async function runChat(c,keepText){const ctl=new AbortController();busy=ctl;setBusy(true);const verbs=K.spin[L==="fa"?0:1];const live=mk(`<div class="stat"><span class="spin">✻</span><span data-v></span><span class="dim" data-m></span></div>`);$("#ctx").append(live);
+async function runChat(c,keepText){const ctl=new AbortController();busy=ctl;setBusy(true);const verbs=K.spin[L==="fa"?0:1];const live=mk(`<div class="stat"><span class="spin">*</span><span data-v></span><span class="dim" data-m></span></div>`);$("#ctx").append(live);
 const am=asstEl("");am.hidden=true;$("#ctx").append(am);scrollEnd(true);const t0=Date.now();let acc="",err="",abort=false,raf=0;
 const tm=setInterval(()=>{const s=(Date.now()-t0)/1e3;live.querySelector("[data-v]").textContent=verbs[(s/4|0)%verbs.length]+"…";live.querySelector("[data-m]").textContent=`(${s|0}s · ↓ ${tok(acc.length/4)} tokens · ${t("esc")})`},250);
 const paint=()=>{raf=0;am.hidden=!acc;am.querySelector(".md").innerHTML=md(acc);scrollEnd()};
@@ -6395,8 +7394,8 @@ while((i=buf.indexOf("\n\n"))>=0){const blk=buf.slice(0,i);buf=buf.slice(i+2);co
 if(o.type==="content_block_delta"&&o.delta&&o.delta.type==="text_delta"){acc+=o.delta.text;if(!raf)raf=requestAnimationFrame(paint)}else if(o.type==="error")err=(o.error&&o.error.message)||"error"}}}
 catch(e){if(e.name==="AbortError")abort=true;else err=e.message||String(e)}
 clearInterval(tm);busy=null;setBusy(false);const sec=((Date.now()-t0)/1e3).toFixed(1);
-if(acc){c.msgs.push({role:"assistant",content:acc+(abort?`\n\n*[${t("interrupted")}]*`:"")});if(err)c.msgs.push({role:"note",text:"✖ "+err,err:1})}
-else{c.msgs.pop();if(err)c.msgs.push({role:"note",text:"✖ "+err,err:1});else if(abort)c.msgs.push({role:"note",text:t("interrupted")});$("#cin").value=keepText||"";atts=lastAtts;renderAtts();autosize()}
+if(acc){c.msgs.push({role:"assistant",content:acc+(abort?`\n\n*[${t("interrupted")}]*`:"")});if(err)c.msgs.push({role:"note",text:"× "+err,err:1})}
+else{c.msgs.pop();if(err)c.msgs.push({role:"note",text:"× "+err,err:1});else if(abort)c.msgs.push({role:"note",text:t("interrupted")});$("#cin").value=keepText||"";atts=lastAtts;renderAtts();autosize()}
 if(acc&&!err&&!abort)c.msgs.push({role:"note",text:`${sec}s · ~${tok(acc.length/4)} tokens`});persist();renderList();renderTx()}
 function note(text,err){const c=cur||newChat();c.msgs.push({role:"note",text,err});persist();renderTx()}
 const SLASH=[["/new",{fa:"گفتگوی جدید",en:"new chat"}],["/clear",{fa:"پاک کردن",en:"clear"}],["/account",{fa:"انتخاب اکانت",en:"pick account"}],["/system",{fa:"پرامپت سیستمی",en:"system prompt"}],["/ds",{fa:"دستور bridge",en:"bridge command"}],["/attach",{fa:"پیوست فایل",en:"attach files"}],["/copy",{fa:"کپی آخرین پاسخ",en:"copy last reply"}],["/export",{fa:"خروجی Markdown",en:"export markdown"}],["/retry",{fa:"ارسال دوباره",en:"retry"}],["/help",{fa:"راهنما",en:"help"}]];
@@ -6421,7 +7420,7 @@ async function addFiles(list){await loadInfo().catch(()=>{});const lim=(INFO&&IN
 const tot=atts.reduce((s,a)=>s+a.size,0)+f.size;if(f.size>lim.file_bytes||tot*1.4>lim.body_bytes*.9){toast(t("tooBig")+": "+f.name);continue}
 const data=await new Promise(res=>{const r=new FileReader();r.onload=()=>res(String(r.result).split(",")[1]||"");r.readAsDataURL(f)});const ext=(f.name.split(".").pop()||"").toLowerCase(),mime=f.type||MIME[ext]||"application/octet-stream";
 atts.push({name:f.name||"pasted."+(mime.split("/")[1]||"png"),mime,data,size:f.size,kind:mime.startsWith("image/")?"image":"document"})}renderAtts()}
-function renderAtts(){$("#chips2").innerHTML=atts.map((a,i)=>`<span class="ach">${a.kind==="image"?`<img src="data:${a.mime};base64,${a.data}">`:"📄"} ${esc(a.name)} <small>${(a.size/1024).toFixed(0)}KB</small><button data-i="${i}">✕</button></span>`).join("")}
+function renderAtts(){$("#chips2").innerHTML=atts.map((a,i)=>`<span class="ach">${a.kind==="image"?`<img src="data:${a.mime};base64,${a.data}">`:"□"} ${esc(a.name)} <small>${(a.size/1024).toFixed(0)}KB</small><button data-i="${i}">✕</button></span>`).join("")}
 $("#chips2").addEventListener("click",e=>{const b=e.target.closest("button[data-i]");if(b){atts.splice(+b.dataset.i,1);renderAtts()}});
 $("#cfile").onchange=async e=>{await addFiles([...e.target.files]);e.target.value=""};
 $("#cin").addEventListener("paste",e=>{const fs=[...(e.clipboardData&&e.clipboardData.files||[])];if(fs.length){e.preventDefault();addFiles(fs)}});
@@ -6433,26 +7432,26 @@ document.addEventListener("keydown",e=>{if(e.key==="Escape"&&busy)busy.abort()})
 "use strict";
 /* ---------- launch ---------- */
 let LS={};try{LS=JSON.parse(localStorage.dsb_launch||"{}")}catch{}
-function pickFolder(start){return new Promise(res=>{let cur=start;const o=modal(`<h3>📁 ${t("lProj")}</h3><div class="pth" data-fp></div><div class="tb" data-lk style="margin-top:8px"></div><div class="fl" data-fl></div><div class="rowb"><button class="btn" data-nf>＋ ${t("newF")}</button><button class="btn" data-x>${t("cancel")}</button><button class="btn pri" data-ok>${t("chooseF")}</button></div>`,"big",false);
+function pickFolder(start){return new Promise(res=>{let cur=start;const o=modal(`<h3>□ ${t("lProj")}</h3><div class="pth" data-fp></div><div class="tb" data-lk style="margin-top:8px"></div><div class="fl" data-fl></div><div class="rowb"><button class="btn" data-nf>＋ ${t("newF")}</button><button class="btn" data-x>${t("cancel")}</button><button class="btn pri" data-ok>${t("chooseF")}</button></div>`,"big",false);
 async function load(p){const r=await act("fs",{path:p});if(!r)return;cur=r.path;$("[data-fp]",o).textContent=cur;$("[data-lk]",o).innerHTML=[...r.drives.map(d=>[d,d]),...r.links].map(([n,q])=>`<span class="fchip" data-p="${esc(q)}">${esc(n)}</span>`).join("");
-$("[data-fl]",o).innerHTML=(r.parent?`<div data-p="${esc(r.parent)}">⬆ ${t("up1")}</div>`:"")+r.dirs.map(d=>`<div data-d="${esc(d)}">📁 ${esc(d)}</div>`).join("")+(r.error?`<div class="err">${esc(r.error)}</div>`:"")}
+$("[data-fl]",o).innerHTML=(r.parent?`<div data-p="${esc(r.parent)}">↑ ${t("up1")}</div>`:"")+r.dirs.map(d=>`<div data-d="${esc(d)}">□ ${esc(d)}</div>`).join("")+(r.error?`<div class="err">${esc(r.error)}</div>`:"")}
 o.onclick=async e=>{const el=e.target.closest("[data-p],[data-d],button");if(!el)return;if(el.dataset.p!==undefined)load(el.dataset.p);else if(el.dataset.d!==undefined){const sep=cur.includes("\\")&&!cur.includes("/")?"\\":"/";load(cur.replace(/[\\/]$/,"")+sep+el.dataset.d)}
 else if(el.hasAttribute("data-nf")){const n=await inputBox(t("newF"));if(n){const r=await act("mkdir",{path:cur,name:n});if(r)load(r.path)}}else{o.close();res(el.hasAttribute("data-ok")?cur:null)}};load(start)})}
 function collectLaunch(){LS={project:$("#lproj").value.trim(),mode:($("input[name=lm]:checked")||{}).value||"safe",extra:$("#lextra").value,cont:$("#lcont").checked,resume:$("#lres").checked,prompt:$("#lprompt").value};localStorage.dsb_launch=JSON.stringify({...LS,prompt:""});
 return {project:LS.project,mode:LS.mode,extra:LS.extra,continue:LS.cont,resume:LS.resume,prompt:LS.prompt}}
 async function renderLaunch(){const I=await loadInfo(true);LS.project=LS.project||I.project;LS.mode=LS.mode||I.mode;
-$("#lw").innerHTML=`<div class="box"><h3>🧠 Claude Code</h3>${I.claude?`<div>✅ ${t("ccOk")} <span class="tip mono">${esc(I.claude)}</span></div>`:`<div>❌ ${t("ccNo")}</div><div class="rowb" style="justify-content:flex-start"><button class="btn pri" data-task="install_claude">⬇ ${t("install")}</button></div>`}</div>
-<div class="g2"><div class="box"><h3>📁 ${t("lProj")}</h3><div style="display:flex;gap:8px"><input class="inp mono" id="lproj" value="${esc(LS.project)}"><button class="btn" id="lbrowse">${t("browse")}</button></div>
+$("#lw").innerHTML=`<div class="box"><h3>AI Claude Code</h3>${I.claude?`<div>✓ ${t("ccOk")} <span class="tip mono">${esc(I.claude)}</span></div>`:`<div>× ${t("ccNo")}</div><div class="rowb" style="justify-content:flex-start"><button class="btn pri" data-task="install_claude">⬇ ${t("install")}</button></div>`}</div>
+<div class="g2"><div class="box"><h3>□ ${t("lProj")}</h3><div style="display:flex;gap:8px"><input class="inp mono" id="lproj" value="${esc(LS.project)}"><button class="btn" id="lbrowse">${t("browse")}</button></div>
 <div class="tb" style="margin-top:10px">${I.recent.length?`<span class="tip">${t("recent")}:</span>`:""}${I.recent.map(p=>`<span class="fchip" data-rp="${esc(p)}">${esc(p.split(/[\\/]/).filter(Boolean).pop()||p)}</span>`).join("")}</div></div>
-<div class="box"><h3>🛡 ${t("lMode")}</h3><div class="mode">${["safe","ask","auto"].map(m=>`<label><input type="radio" name="lm" value="${m}" ${LS.mode===m?"checked":""}><b>${m==="safe"?"🛡":m==="ask"?"🙋":"⚡"} ${t("m_"+m)}</b><small>${t("m_"+m+"D")}</small></label>`).join("")}</div></div></div>
-<div class="box"><h3>🎛 ${t("lOpts")}</h3><div class="row" style="margin:0 0 10px"><label><span class="sw"><input type="checkbox" id="lcont" ${LS.cont?"checked":""}><i></i></span> ${t("cont")}</label><label><span class="sw"><input type="checkbox" id="lres" ${LS.resume?"checked":""}><i></i></span> ${t("resume")}</label></div>
+<div class="box"><h3>[] ${t("lMode")}</h3><div class="mode">${["safe","ask","auto"].map(m=>`<label><input type="radio" name="lm" value="${m}" ${LS.mode===m?"checked":""}><b>${m==="safe"?"[]":m==="ask"?"🙋":"⚡"} ${t("m_"+m)}</b><small>${t("m_"+m+"D")}</small></label>`).join("")}</div></div></div>
+<div class="box"><h3>≡ ${t("lOpts")}</h3><div class="row" style="margin:0 0 10px"><label><span class="sw"><input type="checkbox" id="lcont" ${LS.cont?"checked":""}><i></i></span> ${t("cont")}</label><label><span class="sw"><input type="checkbox" id="lres" ${LS.resume?"checked":""}><i></i></span> ${t("resume")}</label></div>
 <input class="inp mono" id="lextra" placeholder="${t("extra")}" value="${esc(LS.extra||"")}" style="margin-bottom:10px"><textarea class="inp mono" id="lprompt" rows="5" placeholder="${esc(t("longpH"))}">${esc(LS.prompt||"")}</textarea></div>
-<div class="rowb" style="justify-content:flex-start"><button class="btn pri" id="lgo">🚀 ${t("openCC")}</button><button class="btn" id="lcopy">📋 ${t("copyCmd")}</button></div>`}
+<div class="rowb" style="justify-content:flex-start"><button class="btn pri" id="lgo">→ ${t("openCC")}</button><button class="btn" id="lcopy">≡ ${t("copyCmd")}</button></div>`}
 $("#lw").addEventListener("click",async e=>{const el=e.target.closest("button,[data-rp]");if(!el)return;if(el.dataset.rp){$("#lproj").value=el.dataset.rp;return}
 if(el.id==="lbrowse"){const p=await pickFolder($("#lproj").value);if(p)$("#lproj").value=p}
-else if(el.id==="lgo"){const r=await act("launch",collectLaunch());if(r)toast(`🚀 ${t("opened")} ${r.where}\n${r.project}`)}
+else if(el.id==="lgo"){const r=await act("launch",collectLaunch());if(r)toast(`→ ${t("opened")} ${r.where}\n${r.project}`)}
 else if(el.id==="lcopy"){const r=await act("launch",{...collectLaunch(),dry:true});if(r){const P=r.preview,order=INFO.platform==="win32"?["powershell","cmd","bash"]:["bash","powershell","cmd"];
-modal(`<h3>📋 ${t("copyCmd")}</h3>${order.map(k=>`<div class="sn"><div class="cb"><span>${k}</span><button data-cp="${k}">⧉ ${t("copy")}</button></div><pre>${esc(P[k])}</pre></div>`).join("")}<div class="rowb"><button class="btn" data-x>${t("close")}</button></div>`,"big").onclick=ev=>{const c=ev.target.closest("[data-cp]");if(c)copyText(P[c.dataset.cp]);if(ev.target.closest("[data-x]"))ev.currentTarget.close()}}}
+modal(`<h3>≡ ${t("copyCmd")}</h3>${order.map(k=>`<div class="sn"><div class="cb"><span>${k}</span><button data-cp="${k}">□ ${t("copy")}</button></div><pre>${esc(P[k])}</pre></div>`).join("")}<div class="rowb"><button class="btn" data-x>${t("close")}</button></div>`,"big").onclick=ev=>{const c=ev.target.closest("[data-cp]");if(c)copyText(P[c.dataset.cp]);if(ev.target.closest("[data-x]"))ev.currentTarget.close()}}}
 else if(el.dataset.task){const r=await act("task",{name:el.dataset.task});if(r){toast(t("started"));go("console")}}});
 /* ---------- console ---------- */
 let LOGS=[],logLast=0,logTimer=null,logF="all",logQ="",logPause=false,hist=[],hi=0;const CMDS=["status","next","prev","use ","auto","rr","failover","on ","off ","add ","test","login ","show ","hide ","restart ","reset","purge","clear","usage-reset","url","key","help"];
@@ -6460,7 +7459,7 @@ function lineEl(l){const d=document.createElement("div");d.className="ll "+l.l;d
 const lineOk=l=>(logF==="all"||(logF==="warn"&&(l.l==="warn"||l.l==="error"))||(logF==="error"&&l.l==="error"))&&(!logQ||strip(l.m).toLowerCase().includes(logQ));
 function addLine(l){LOGS.push(l);if(LOGS.length>2500)LOGS.shift();if(!lineOk(l))return;const box=$("#clog"),near=box.scrollHeight-box.scrollTop-box.clientHeight<60;box.append(lineEl(l));while(box.childElementCount>1200)box.firstChild.remove();if(near&&!logPause)box.scrollTop=box.scrollHeight}
 function refilter(){const box=$("#clog");box.innerHTML="";LOGS.filter(lineOk).slice(-1000).forEach(l=>box.append(lineEl(l)));box.scrollTop=box.scrollHeight}
-function buildConsole(){$("#cw").innerHTML=`<div class="tb"><span class="fchip on" data-f="all">${t("all")}</span><span class="fchip" data-f="warn">${t("warn")}</span><span class="fchip" data-f="error">${t("error")}</span><input class="inp" id="lq" placeholder="🔍" style="width:180px"><span class="fchip" id="lpause">⏸ ${t("pause")}</span><span class="fchip" id="lclr">🧹 ${t("clearv")}</span><span class="fchip" id="ldl">⬇ ${t("dl")}</span></div>
+function buildConsole(){$("#cw").innerHTML=`<div class="tb"><span class="fchip on" data-f="all">${t("all")}</span><span class="fchip" data-f="warn">${t("warn")}</span><span class="fchip" data-f="error">${t("error")}</span><input class="inp" id="lq" placeholder="🔍" style="width:180px"><span class="fchip" id="lpause">Ⅱ ${t("pause")}</span><span class="fchip" id="lclr">× ${t("clearv")}</span><span class="fchip" id="ldl">⬇ ${t("dl")}</span></div>
 <div class="tb">${["status","next","auto","test","clear","reset","url","help"].map(c=>`<span class="fchip" data-c="${c}">${c}</span>`).join("")}</div><div id="clog" class="mono"></div><div id="cin2"><span>bridge ›</span><input id="cmd" autocomplete="off" placeholder="${t("cons")}"></div>`;
 $("#cw").onclick=e=>{const f=e.target.closest("[data-f]");if(f){logF=f.dataset.f;$$(".tb [data-f]").forEach(x=>x.classList.toggle("on",x===f));refilter()}const c=e.target.closest("[data-c]");if(c)runCmd(c.dataset.c);
 if(e.target.id==="lpause"){logPause=!logPause;e.target.classList.toggle("on",logPause)}if(e.target.id==="lclr"){LOGS=[];$("#clog").innerHTML=""}
@@ -6486,11 +7485,11 @@ SN=[["Claude Code · PowerShell",`$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHRO
 ["Python · anthropic",`import anthropic\nc = anthropic.Anthropic(base_url="${base}", api_key="${key}")\nr = c.messages.create(model="${I.model}", max_tokens=1024, messages=[{"role": "user", "content": "Hello"}])\nprint(r.content[0].text)`],
 ["curl",`curl ${base}/v1/messages \\\n  -H "x-api-key: ${key}" -H "content-type: application/json" \\\n  -d '{"model":"${I.model}","max_tokens":512,"messages":[{"role":"user","content":"Hello"}]}'`],
 ["Files & images (Anthropic content blocks)",`${ex.img}\n${ex.files}\n\n// OpenAI style: {"type":"image_url","image_url":{"url":"data:image/png;base64,<BASE64>"}}\n//               {"type":"file","file":{"filename":"a.pdf","file_data":"data:application/pdf;base64,<BASE64>"}}`]];
-const row=(k,v,i)=>`<div class="kvl"><b>${k}</b><code>${esc(v)}</code><button class="btn sm" data-cv="${i}">⧉ ${t("copy")}</button></div>`;const kv=[base,keyShown?key:key.slice(0,6)+"••••••••••••",m];
+const row=(k,v,i)=>`<div class="kvl"><b>${k}</b><code>${esc(v)}</code><button class="btn sm" data-cv="${i}">□ ${t("copy")}</button></div>`;const kv=[base,keyShown?key:key.slice(0,6)+"••••••••••••",m];
 $("#kw").innerHTML=`<div class="box"><div class="tb"><select class="inp" id="cscope"><option value="">${t("cAuto")}</option>${I.accounts.map(a=>`<option value="${a.id}" ${a.id===connAcct?"selected":""}>${t("cOnly")}: ${esc(a.name)}</option>`).join("")}</select></div>
-<div class="kvl"><b>${t("cBase")}</b><code>${esc(base)}</code><button class="btn sm" data-copy="${esc(base)}">⧉ ${t("copy")}</button></div><div class="kvl"><b>${t("cKey")}</b><code>${esc(kv[1])}</code><span><button class="btn sm" id="kshow">👁 ${t("reveal")}</button> <button class="btn sm" data-copy="${esc(key)}">⧉ ${t("copy")}</button></span></div>
-<div class="kvl"><b>${t("cModel")}</b><code>${esc(m)}</code><button class="btn sm" data-copy="${esc(m)}">⧉ ${t("copy")}</button></div><div class="tip" style="margin-top:8px">${t("cNote")}</div>${ac?`<div class="kvl"><b>${t("cProf")}</b><code>${esc(ac.profile)}</code><span></span></div>`:""}</div>
-${SN.map((s,i)=>`<div class="sn"><div class="cb"><span>${esc(s[0])}</span><button data-cs="${i}">⧉ ${t("copy")}</button></div><pre>${esc(s[1])}</pre></div>`).join("")}`;
+<div class="kvl"><b>${t("cBase")}</b><code>${esc(base)}</code><button class="btn sm" data-copy="${esc(base)}">□ ${t("copy")}</button></div><div class="kvl"><b>${t("cKey")}</b><code>${esc(kv[1])}</code><span><button class="btn sm" id="kshow">👁 ${t("reveal")}</button> <button class="btn sm" data-copy="${esc(key)}">□ ${t("copy")}</button></span></div>
+<div class="kvl"><b>${t("cModel")}</b><code>${esc(m)}</code><button class="btn sm" data-copy="${esc(m)}">□ ${t("copy")}</button></div><div class="tip" style="margin-top:8px">${t("cNote")}</div>${ac?`<div class="kvl"><b>${t("cProf")}</b><code>${esc(ac.profile)}</code><span></span></div>`:""}</div>
+${SN.map((s,i)=>`<div class="sn"><div class="cb"><span>${esc(s[0])}</span><button data-cs="${i}">□ ${t("copy")}</button></div><pre>${esc(s[1])}</pre></div>`).join("")}`;
 $("#cscope").onchange=e=>{connAcct=e.target.value;renderConnect()};$("#kshow").onclick=()=>{keyShown=!keyShown;renderConnect()}}
 $("#kw").addEventListener("click",e=>{const c=e.target.closest("[data-copy]");if(c)copyText(c.dataset.copy);const s=e.target.closest("[data-cs]");if(s)copyText(SN[+s.dataset.cs][1])});
 /* ---------- settings ---------- */
@@ -6501,9 +7500,9 @@ if(s.kind==="choice")return `<select class="inp" data-n="${n}" style="width:100%
 if(s.kind==="str")return `<input class="inp" data-n="${n}" value="${esc(s.value)}">`;return `<input class="inp" type="number" data-n="${n}" value="${s.value}" min="${s.min}" max="${s.max}" step="${s.kind==="int"?1:.1}">`};
 const grp=g=>`<div class="box"><h3>${t("g_"+g)}</h3>${I.settings.filter(s=>s.group===g).map(s=>`<div class="srow" data-r="${esc(s.name)}"><div><b>${esc(lab(s))}</b><small>${esc(s.name)} · ${t("w_"+s.when)}</small></div><div class="ctl">${ctl(s)}</div><button class="ib" data-reset="${esc(s.name)}" title="↺">↺</button></div>`).join("")}</div>`;
 const th=localStorage.dsb_theme||"dark",ac=localStorage.dsb_acc||"violet";
-$("#sw").innerHTML=`<div class="box"><h3>🎨 ${t("look")}</h3><div class="tb"><button class="btn ${th==="dark"?"pri":""}" data-th="dark">🌙 Dark</button><button class="btn ${th==="light"?"pri":""}" data-th="light">☀️ Light</button><button class="btn" id="slang">🌐 ${t("lang")}</button>
+$("#sw").innerHTML=`<div class="box"><h3>🎨 ${t("look")}</h3><div class="tb"><button class="btn ${th==="dark"?"pri":""}" data-th="dark">◐ Dark</button><button class="btn ${th==="light"?"pri":""}" data-th="light">○ Light</button><button class="btn" id="slang">🌐 ${t("lang")}</button>
 <span class="tip">${t("accent")}:</span>${["violet","emerald","amber","sky"].map(c=>`<button class="btn sm ${ac===c?"pri":""}" data-ac="${c}">${c}</button>`).join("")}</div></div>
-${["claude","rel","ctx","browser","swarm","panel"].map(grp).join("")}<div class="box"><h3>🧰 ${t("maint")}</h3><div class="tb"><button class="btn" data-m="restart">🔄 ${t("restartB")}</button><button class="btn dng" data-m="stop">⏹ ${t("stopB")}</button><button class="btn" data-m="usage">🧹 ${t("resetU")}</button><button class="btn" data-task="selftest">🧪 ${t("selftest")}</button><button class="btn" data-task="verify">🛡 ${t("verify")}</button></div>
+${["claude","rel","ctx","browser","swarm","panel"].map(grp).join("")}<div class="box"><h3>＋ ${t("maint")}</h3><div class="tb"><button class="btn" data-m="restart">↻ ${t("restartB")}</button><button class="btn dng" data-m="stop">⏹ ${t("stopB")}</button><button class="btn" data-m="usage">× ${t("resetU")}</button><button class="btn" data-task="selftest">🧪 ${t("selftest")}</button><button class="btn" data-task="verify">[] ${t("verify")}</button></div>
 <div class="tip mono">${esc(I.config)}<br>${esc(I.log)}<br>${esc(I.profiles)}</div></div><div id="savebar" hidden><span id="sbn"></span><button class="btn pri" id="sbsave">${t("saveChg")}</button></div>`}
 function setPend(el){const n=el.dataset.n,s=INFO.settings.find(x=>x.name===n);let v=el.type==="checkbox"?el.checked:el.value;if(s.kind==="int"||s.kind==="float")v=el.value===""?s.value:+el.value;
 if(v===s.value)delete pend[n];else pend[n]=v;el.closest(".srow").classList.toggle("chg",n in pend);const c=Object.keys(pend).length;$("#savebar").hidden=!c;$("#sbn").textContent=c+" "+t("unsaved")}
@@ -6511,13 +7510,13 @@ $("#sw").addEventListener("input",e=>{if(e.target.dataset.n)setPend(e.target)});
 $("#sw").addEventListener("click",async e=>{const el=e.target.closest("button");if(!el)return;
 if(el.dataset.reset){const s=INFO.settings.find(x=>x.name===el.dataset.reset),i=$(`[data-n="${s.name}"]`);if(i.type==="checkbox")i.checked=!!s.default;else i.value=s.default;setPend(i)}
 else if(el.dataset.th){localStorage.dsb_theme=el.dataset.th;applyTheme();renderSettings()}else if(el.dataset.ac){localStorage.dsb_acc=el.dataset.ac;applyTheme();renderSettings()}else if(el.id==="slang")$("#blang").click();
-else if(el.id==="sbsave"){const r=await act("settings_set",{values:pend});if(r){toast("✔ "+t("saved")+(r.restart.length?"\n"+t("needRestart")+" "+r.restart.join(", "):""));await loadInfo(true);renderSettings()}}
-else if(el.dataset.m==="usage"){if(await ask(t("resetU")+"?")){await act("reset_usage");toast("✔")}}
+else if(el.id==="sbsave"){const r=await act("settings_set",{values:pend});if(r){toast("✓ "+t("saved")+(r.restart.length?"\n"+t("needRestart")+" "+r.restart.join(", "):""));await loadInfo(true);renderSettings()}}
+else if(el.dataset.m==="usage"){if(await ask(t("resetU")+"?")){await act("reset_usage");toast("✓")}}
 else if(el.dataset.m){if(await ask(t(el.dataset.m==="restart"?"restartB":"stopB")+"?")){const r=await act("bridge",{action:el.dataset.m});if(r)toast("…")}}
 else if(el.dataset.task){const r=await act("task",{name:el.dataset.task});if(r){toast(t("started"));go("console")}}});
 /* ---------- command palette ---------- */
-function openPalette(){const items=[...PAGES.map(p=>({n:"→ "+t("n_"+p),r:()=>go(p)})),{n:"⏭ "+t("nextAcct"),r:()=>act("command",{text:"next"})},{n:"⚖ "+t("balanced"),r:()=>act("settings",{strategy:"balanced"})},{n:"＋ "+t("newchat"),r:()=>{go("chat");newChat()}},{n:"＋ "+t("add"),r:addWizard},
-{n:"🌓 "+t("theme"),r:()=>$("#bth").click()},{n:"🌐 "+t("lang"),r:()=>$("#blang").click()},{n:"🚀 "+t("openCC"),r:async()=>{const r=await act("launch",{project:LS.project,mode:LS.mode});if(r)toast(`🚀 ${t("opened")} ${r.where}`)}},
+function openPalette(){const items=[...PAGES.map(p=>({n:"→ "+t("n_"+p),r:()=>go(p)})),{n:"› "+t("nextAcct"),r:()=>act("command",{text:"next"})},{n:"⚖ "+t("balanced"),r:()=>act("settings",{strategy:"balanced"})},{n:"＋ "+t("newchat"),r:()=>{go("chat");newChat()}},{n:"＋ "+t("add"),r:addWizard},
+{n:"🌓 "+t("theme"),r:()=>$("#bth").click()},{n:"🌐 "+t("lang"),r:()=>$("#blang").click()},{n:"→ "+t("openCC"),r:async()=>{const r=await act("launch",{project:LS.project,mode:LS.mode});if(r)toast(`→ ${t("opened")} ${r.where}`)}},
 ...(S?S.accounts.map(a=>({n:"▶ "+t("use")+": "+a.name,r:()=>act("use",{id:a.id})})):[])];
 const o=modal(`<input class="inp" id="pq" placeholder="${t("palPh")}"><div class="fl" id="pl"></div>`);let q="",ix=0,list=items;const draw=()=>{$("#pl",o).innerHTML=list.map((x,i)=>`<div data-i="${i}" ${i===ix?'style="background:var(--p2)"':""}>${esc(x.n)}</div>`).join("")};
 const pick=i=>{const x=list[i];o.close();if(x)x.r()};$("#pq",o).focus();draw();$("#pq",o).oninput=e=>{q=e.target.value.toLowerCase();list=items.filter(x=>x.n.toLowerCase().includes(q));ix=0;draw()};
@@ -6530,7 +7529,7 @@ document.addEventListener("keydown",e=>{if((e.ctrlKey||e.metaKey)&&e.key.toLower
 const guessTier=m=>{m=(m||"").toLowerCase();if(!m)return 3;if(/mini|haiku|flash|lite|nano|small|instant|-fast/.test(m))return 2;if(/opus|gpt-5|o3|o4|grok-4|gemini-2\.5-pro|gemini-3|ultra/.test(m))return 5;if(/sonnet|gpt-4\.1|gpt-4o|gpt-4-turbo|grok-3|reasoner|r1|gemini|70b|405b/.test(m))return 4;return 3};
 const stars=n=>"★".repeat(n)+"☆".repeat(5-n),tierName=n=>t("tier"+n);
 async function addWizard(){await loadInfo(true);const prov=INFO.providers;const o=modal(`<h3>${t("wizTitle")}</h3><div class="pvg">${prov.map(p=>`<div class="pv" data-p="${p.id}"><i>${p.icon}</i><b>${esc(p.name)}</b><small>${esc(p.sub)}</small><span class="tb2">T${p.tier} · ${tierName(p.tier)}</span></div>`).join("")}</div><div class="rowb"><button class="btn" data-x>${t("cancel")}</button></div>`,"big");
-o.onclick=async e=>{if(e.target.closest("[data-x]"))return o.close();const c=e.target.closest(".pv");if(!c)return;const p=prov.find(x=>x.id===c.dataset.p);o.close();if(p.kind==="web"){const n=await inputBox(t("addTitle"),"",t("addTip"));if(n===null)return;const r=await act("add",{name:n});if(r){toast(t("addTip"));tick()}}else accForm(p,null)}}
+o.onclick=async e=>{if(e.target.closest("[data-x]"))return o.close();const c=e.target.closest(".pv");if(!c)return;const p=prov.find(x=>x.id===c.dataset.p);o.close();if(p.kind==="web"){const n=await inputBox(t("addTitle"),p.name,"Login account name / نام اکانت");if(n===null)return;const r=await act("add_web",{provider:p.id,name:n,headed:true,tier:p.tier});if(r){toast(`🔐 ${p.name}: login window opened`);tick()}}else accForm(p,null)}}
 function accForm(p,acc){const edit=!!acc,web=edit&&acc.kind==="web",v=acc||{name:p.name,base_url:p.base,model:p.models[0]||"",tier:p.tier,max_parallel:4,price_in:0,price_out:0,budget:0};let touched=edit;
 const o=modal(`<h3>${p?p.icon:""} ${edit?t("editAcc")+": "+esc(acc.name):esc(p.name)}</h3><div class="fg"><label>${t("f_name")}<input class="inp" id="fn" value="${esc(v.name)}"></label>
 <label>${t("f_base")}<input class="inp mono" id="fb" value="${esc(v.base_url||"")}" ${web?"disabled":""}></label>
@@ -6538,72 +7537,81 @@ const o=modal(`<h3>${p?p.icon:""} ${edit?t("editAcc")+": "+esc(acc.name):esc(p.n
 <label>${t("f_model")}<div style="display:flex;gap:8px"><input class="inp mono" id="fm" list="fml" value="${esc(v.model||"")}" ${web?"disabled":""}><datalist id="fml">${(p?p.models:[]).map(m=>`<option>${esc(m)}</option>`).join("")}</datalist><button class="btn" id="ffetch" ${web?"disabled":""}>${t("fetchM")}</button></div></label>
 <div class="fg2"><label>${t("f_tier")} <b id="ftl"></b><input type="range" id="ft" min="1" max="5" value="${v.tier}"></label><label>${t("f_par")}<input class="inp" id="fp" type="number" min="1" max="32" value="${v.max_parallel}" ${web?"disabled":""}></label></div>
 <div class="fg2"><label>${t("f_pin")}<input class="inp" id="fpi" type="number" step="0.01" min="0" value="${v.price_in}"></label><label>${t("f_pout")}<input class="inp" id="fpo" type="number" step="0.01" min="0" value="${v.price_out}"></label></div>
-<label>${t("f_budget")}<input class="inp" id="fbu" type="number" step="0.5" min="0" value="${v.budget}"></label>${p&&p.link?`<div class="tip">🔑 <a href="${esc(p.link)}" target="_blank" rel="noopener" style="color:var(--ac)">${esc(p.link)}</a></div>`:""}</div>
+<label>${t("f_budget")}<input class="inp" id="fbu" type="number" step="0.5" min="0" value="${v.budget}"></label>${p&&p.link?`<div class="tip"># <a href="${esc(p.link)}" target="_blank" rel="noopener" style="color:var(--ac)">${esc(p.link)}</a></div>`:""}</div>
 <div class="rowb"><button class="btn" data-x>${t("cancel")}</button><button class="btn pri" data-ok>${edit?t("save"):t("testAdd")}</button></div>`,"big",false);
 const q=s=>$(s,o),tl=()=>q("#ftl").textContent=q("#ft").value+" · "+tierName(q("#ft").value);tl();q("#ft").oninput=()=>{touched=true;tl()};
 q("#fm").oninput=()=>{if(!touched){q("#ft").value=guessTier(q("#fm").value);tl()}};
 q("#ffetch").onclick=async()=>{const r=await act("models_probe",{kind:acc?acc.kind:p.kind,base_url:q("#fb").value,api_key:q("#fk").value});if(r){q("#fml").innerHTML=r.models.map(m=>`<option>${esc(m)}</option>`).join("");toast(r.models.length+" models");if(r.models.length&&!q("#fm").value)q("#fm").value=r.models[0]}};
 o.onclick=async e=>{const b=e.target.closest("button");if(!b)return;if(b.hasAttribute("data-x"))return o.close();if(!b.hasAttribute("data-ok"))return;
 const d={name:q("#fn").value,base_url:q("#fb").value,api_key:q("#fk").value,model:q("#fm").value,tier:+q("#ft").value,max_parallel:+q("#fp").value,price_in:+q("#fpi").value,price_out:+q("#fpo").value,budget:+q("#fbu").value};
-if(edit){const r=await act("update_account",{id:acc.id,...d});if(r){o.close();tick()}}else{const r=await act("add_api",{provider:p.id,...d});if(r){o.close();toast(t("testing"));const x=await act("test",{id:r.id});toast(x&&x.ok?`✔ ${d.name||p.name}: ${t("okTest")} (${x.seconds}s)`:"✖ "+(x?x.error:"?"));tick()}}}}
+if(edit){const r=await act("update_account",{id:acc.id,...d});if(r){o.close();tick()}}else{const r=await act("add_api",{provider:p.id,...d});if(r){o.close();toast(t("testing"));const x=await act("test",{id:r.id});toast(x&&x.ok?`✓ ${d.name||p.name}: ${t("okTest")} (${x.seconds}s)`:"× "+(x?x.error:"?"));tick()}}}}
 $("#hadd").onclick=addWizard;
 document.addEventListener("click",e=>{const b=e.target.closest('#grid button[data-a="edit"]');if(!b)return;const dt=b.closest("details");if(dt)dt.removeAttribute("open");const a=S.accounts.find(x=>x.id===b.closest(".card").dataset.id);accForm((INFO.providers||[]).find(p=>p.id===a.provider)||null,a)});
 $("#cpow").onchange=e=>{if(cur){cur.power=e.target.value;persist()}};
 /* ---------- live feed (mirror of Claude Code + dock) ---------- */
 let FEED=[],feedLast=0,feedTimer=null,feedF="all",feedPause=false;
 function fcardEl(it){const d=mk(`<div class="fcard ${it.kind}"><div class="fh"><time>${new Date(it.t*1e3).toLocaleTimeString()}</time><span class="bd">${esc(it.tag||t("lv_"+it.kind))}</span>${it.role?`<span>${esc(it.role)}</span>`:""}<span>${esc(it.account||"—")}${it.tier?" T"+it.tier:""}</span><span class="mono">${esc(it.model||"")}</span><span>${it.secs}s</span><span>↓${tok(it.tin)} ↑${tok(it.tout)}</span></div>
-<div class="fu">› ${esc(it.user||"")}</div>${it.reply?`<div class="fr">● ${esc(it.reply)}</div>`:""}${it.calls.length?`<div class="fcs">${it.calls.map(c=>`<span>🔧 ${esc(c)}</span>`).join("")}</div>`:""}${it.err?`<div class="err">✖ ${esc(it.err)}</div>`:""}</div>`);d.onclick=()=>d.classList.toggle("x");return d}
+<div class="fu">› ${esc(it.user||"")}</div>${it.reply?`<div class="fr">• ${esc(it.reply)}</div>`:""}${it.calls.length?`<div class="fcs">${it.calls.map(c=>`<span>⌁ ${esc(c)}</span>`).join("")}</div>`:""}${it.err?`<div class="err">× ${esc(it.err)}</div>`:""}</div>`);d.onclick=()=>d.classList.toggle("x");return d}
 const feedOk=(it,f)=>f==="all"||it.kind===f;
 function addFeed(it){for(const [box,f] of [[$("#livefeed"),feedF],[$("#dockfeed"),"all"]]){if(!box||!feedOk(it,f)||(box.id==="livefeed"&&page!=="live"))continue;const near=box.scrollHeight-box.scrollTop-box.clientHeight<80;box.append(fcardEl(it));while(box.childElementCount>300)box.firstChild.remove();if(near&&!feedPause)box.scrollTop=box.scrollHeight}}
 function refeed(){for(const [box,f] of [[$("#livefeed"),feedF],[$("#dockfeed"),"all"]]){box.innerHTML="";FEED.filter(it=>feedOk(it,f)).slice(-200).forEach(it=>box.append(fcardEl(it)));box.scrollTop=box.scrollHeight}if(!FEED.length){$("#livefeed").innerHTML=`<div class="tip" style="padding:20px;text-align:center">${t("lvEmpty")}</div>`;$("#dockfeed").innerHTML=`<div class="tip" style="padding:20px;text-align:center">${t("lvEmpty")}</div>`}}
-async function pollFeed(){try{const r=await api("activity?since="+feedLast);if(r.last<feedLast){feedLast=0;FEED=[];refeed()}if(r.items.length&&!FEED.length){$("#livefeed").innerHTML="";$("#dockfeed").innerHTML=""}r.items.forEach(it=>{FEED.push(it);feedLast=Math.max(feedLast,it.n);addFeed(it)});if(FEED.length>400)FEED.splice(0,FEED.length-400)}catch{}}
-function syncFeed(){clearInterval(feedTimer);if(page==="live"||$("#app").classList.contains("dock")){pollFeed();feedTimer=setInterval(pollFeed,1000)}}
-function enterLive(){$("#livetb").innerHTML=["all","main","agent","side"].map(k=>`<span class="fchip ${feedF===k?"on":""}" data-lf="${k}">${t("lv_"+k)}</span>`).join("")+`<span class="fchip ${feedPause?"on":""}" id="lvp">⏸ ${t("pause")}</span><span class="fchip" id="lvc">🧹 ${t("clearv")}</span>`;refeed();syncFeed()}
+async function pollFeed(){if(dashStreamReady)return;try{const r=await api("activity?since="+feedLast);if(r.last<feedLast){feedLast=0;FEED=[];refeed()}if(r.items.length&&!FEED.length){$("#livefeed").innerHTML="";$("#dockfeed").innerHTML=""}r.items.forEach(it=>{FEED.push(it);feedLast=Math.max(feedLast,it.n);addFeed(it)});if(FEED.length>400)FEED.splice(0,FEED.length-400)}catch{}}
+function syncFeed(){clearInterval(feedTimer);if(page==="live"||$("#app").classList.contains("dock")){pollFeed();if(!dashStreamReady)feedTimer=setInterval(pollFeed,5000)}}
+function enterLive(){connectDashStream();renderClaudeMirror();$("#livetb").innerHTML=["all","main","agent","side"].map(k=>`<span class="fchip ${feedF===k?"on":""}" data-lf="${k}">${t("lv_"+k)}</span>`).join("")+`<span class="fchip ${feedPause?"on":""}" id="lvp">Ⅱ ${t("pause")}</span><span class="fchip" id="lvc">× ${t("clearv")}</span>`;refeed();syncFeed()}
 $("#p-live").addEventListener("click",e=>{const f=e.target.closest("[data-lf]");if(f){feedF=f.dataset.lf;enterLive()}if(e.target.id==="lvp"){feedPause=!feedPause;enterLive()}if(e.target.id==="lvc"){FEED=[];refeed()}});
 function setDock(on){$("#app").classList.toggle("dock",on);localStorage.dsb_dock=on?"1":"";refeed();syncFeed()}$("#hdock").onclick=()=>setDock(!$("#app").classList.contains("dock"));$("#dockx").onclick=()=>setDock(false);
 /* ---------- swarm (parallel agents) ---------- */
 let swSel="",swMeta={runs:[],capacity:1},swOpen=new Set(),swPrev={},SW=null,swTimer=null;
 const beep=()=>{try{const a=new (window.AudioContext||window.webkitAudioContext)(),o=a.createOscillator(),g=a.createGain();o.connect(g);g.connect(a.destination);o.frequency.value=880;g.gain.value=.06;o.start();setTimeout(()=>{o.stop();a.close()},180)}catch{}};
-function swForm(){const I=INFO||{};const project=I.project||LS.project||"";$("#swf").innerHTML=`<div class="box"><h3>🐝 ${t("swNew")}</h3><div class="fg"><textarea class="inp" id="sg" rows="3" placeholder="${esc(t("swGoalPh"))}"></textarea>
-<div class="fg2"><label>${t("lProj")}<div style="display:flex;gap:8px"><input class="inp mono" id="sp" data-auto-project="1" value="${esc(project)}"><button class="btn" id="sbrowse">${t("browse")}</button></div></label>
-<label>${t("swAgents")} <span class="tip" id="scap"></span><input class="inp" id="sa" type="number" min="1" max="32" placeholder="${t("swAuto")}"></label></div>
-<div class="fg2"><label>${t("swVerify")}<select class="inp" id="sv2" style="width:100%"><option value="auto">${t("swAuto")}</option><option value="off">${t("swOff")}</option></select></label>
-<label>${t("swReview")}<select class="inp" id="sr" style="width:100%"><option value="">${t("swAuto")}</option><option value="on">${t("swOn")}</option><option value="off">${t("swOff")}</option></select></label></div>
-<div class="row" style="margin:0"><label><span class="sw"><input type="checkbox" id="sst"><i></i></span> ${t("swStrict")}</label><label><span class="sw"><input type="checkbox" id="sgi" checked><i></i></span> ${t("swInit")}</label></div>
-<details><summary class="tip" style="cursor:pointer">${t("swManual")}</summary><textarea class="inp mono" id="stk" rows="4" placeholder="${esc(t("swManualPh"))}" style="margin-top:8px"></textarea></details>
-<div class="rowb" style="justify-content:flex-start"><button class="btn pri" id="sgo">🚀 ${t("swStart")}</button><span class="tip">${t("swTip")}</span></div></div></div>`}
-async function enterSwarm(){try{await loadInfo(true)}catch{};if(!$("#sg"))swForm();else if($("#sp")&&$("#sp").dataset.autoProject!=="0")$("#sp").value=INFO&&INFO.project?INFO.project:($("#sp").value||LS.project||"");pollSwarm();clearInterval(swTimer);swTimer=setInterval(pollSwarm,1500)}
+function swForm(){const I=INFO||{};const project=I.project||LS.project||"";swFinalPrompt="";swAttachments=[];$("#swf").innerHTML=`<div class="box"><h3>* ${t("swNew")}</h3><div class="fg"><div class="swu"><div class="lbl"><span>${t("swOriginal")}</span><button class="btn sm" id="spImprove">${t("swImprove")}</button></div><textarea class="inp" id="sg" rows="4" placeholder="${esc(t("swGoalPh"))}"></textarea><div id="spp" hidden><div class="swpreview"><div><div class="lbl"><span>${t("swImproved")}</span><span class="tip">AI</span></div><textarea class="inp" id="sp2" rows="6"></textarea><div class="sactions"><button class="btn pri sm" id="spUse">${t("swUseImproved")}</button><button class="btn sm" id="spAgain">${t("swImproveAgain")}</button></div></div><div><div class="lbl"><span>${t("swCustom")}</span><span class="tip">${t("swFinalReady")}</span></div><textarea class="inp" id="sp3" rows="4" placeholder="${esc(t("swCustom"))}"></textarea><div class="sactions"><button class="btn sm" id="spApplyCustom">${t("swApplyCustom")}</button></div></div></div></div></div><div class="fg2"><label>${t("lProj")}<div style="display:flex;gap:8px"><input class="inp mono" id="sp" data-auto-project="1" value="${esc(project)}"><button class="btn" id="sbrowse">${t("browse")}</button></div></label><label>AI accounts<div id="swAccounts" class="accsel"></div></label><label>${t("swAgents")} <span class="tip" id="scap"></span><input class="inp" id="sa" type="number" min="1" max="32" placeholder="${t("swAuto")}"></label></div><div class="fg2"><label>${t("swVerify")}<select class="inp" id="sv2" style="width:100%"><option value="auto">${t("swAuto")}</option><option value="off">${t("swOff")}</option></select></label><label>${t("swReview")}<select class="inp" id="sr" style="width:100%"><option value="">${t("swAuto")}</option><option value="on">${t("swOn")}</option><option value="off">${t("swOff")}</select></label></div><div class="row" style="margin:0"><label><span class="sw"><input type="checkbox" id="sst"><i></i></span> ${t("swStrict")}</label><label><span class="sw"><input type="checkbox" id="sgi" checked><i></i></span> ${t("swInit")}</label></div><div class="swattach"><button class="btn sm" id="sattach">＋ ${t("swAttach")}</button><span class="tip">${t("swAttachTip")}</span><div id="satts"></div></div><details><summary class="tip" style="cursor:pointer">${t("swManual")}</summary><textarea class="inp mono" id="stk" rows="4" placeholder="${esc(t("swManualPh"))}" style="margin-top:8px"></textarea></details><div class="rowb" style="justify-content:flex-start"><button class="btn pri" id="sgo">→ ${t("swStart")}</button><span class="tip">${t("swTip")}</span></div></div></div>`;renderSwarmAttachments();renderSwarmAccounts()}
+function renderSwarmAccounts(){const box=$("#swAccounts");if(!box)return;const project=$("#sp")?.value.trim()||INFO?.project||"";const map=INFO?.project_accounts||{};let assigned=[];try{assigned=map[project]||map[project.replace(/\\/g,"/")]||[]}catch{};const enabled=(S?.accounts||[]).filter(a=>a.enabled);const chosen=assigned.length?new Set(assigned):new Set(enabled.map(a=>a.id));box.innerHTML=enabled.length?enabled.map(a=>`<label style="display:inline-flex;align-items:center;gap:6px;margin:3px 8px 3px 0"><input type="checkbox" value="${esc(a.id)}" ${chosen.has(a.id)?"checked":""}>${esc(a.name)} <span class="tip">T${a.tier}</span></label>`).join(""):`<span class="tip">No enabled accounts</span>`}
+let swFinalPrompt="",swAttachments=[];function renderSwarmAttachments(){const b=$("#satts");if(!b)return;b.innerHTML=swAttachments.map((a,i)=>`<span class="achip"><span>＋ ${esc(a.name)}</span><small>${Math.round((a.size||0)/1024)} KB</small><button data-rm-att="${i}" title="${t("swRemoveAttachment")}">✕</button></span>`).join("")}
+async function uploadSwarmFiles(list){await loadInfo();const lim=(INFO&&INFO.limits)||{files:6,file_bytes:25e6};for(const f of list){if(swAttachments.length>=lim.files){toast(t("tooMany")+" ("+lim.files+")");break}if(f.size>lim.file_bytes){toast(t("tooBig")+": "+f.name);continue}toast(t("swUploading")+" "+f.name);try{const r=await fetch("/dash/api/swarm_attachment",{method:"POST",headers:{Authorization:"Bearer "+KEY,"X-Filename":encodeURIComponent(f.name),"X-Mime":f.type||"application/octet-stream"},body:f});const j=await r.json();if(!r.ok)throw new Error(j.error?.message||String(r.status));swAttachments.push(j.attachment);renderSwarmAttachments()}catch(e){toast("! "+(e.message||e))}}}
+async function improveSwarmPrompt(){const original=$("#sg").value.trim();const current=$("#sp2")?.value.trim()||"";const custom=$("#sp3")?.value.trim()||"";if(!original){toast(t("swGoalPh"));$("#sg").focus();return}$("#spImprove").disabled=true;$("#spImprove").textContent=t("swImproving");try{const r=await act("swarm_prompt_improve",{prompt:original,current,custom});if(r){$("#sp2").value=r.improved;$("#spp").hidden=false;swFinalPrompt=r.improved}}finally{$("#spImprove").disabled=false;$("#spImprove").textContent=t("swImprove")}}
+async function refineSwarmPrompt(){const improved=$("#sp2").value.trim();const custom=$("#sp3").value.trim();const original=$("#sg").value.trim();if(!improved){return}$("#spApplyCustom").disabled=true;try{const r=await act("swarm_prompt_improve",{prompt:original,current:improved,custom});if(r){$("#sp2").value=r.improved;swFinalPrompt=r.improved}}finally{$("#spApplyCustom").disabled=false}}
+
+async function enterSwarm(){try{await loadInfo(true);S=await api("state")}catch{};if(!$("#sg"))swForm();else if($("#sp")&&$("#sp").dataset.autoProject!=="0")$("#sp").value=INFO&&INFO.project?INFO.project:($("#sp").value||LS.project||"");renderSwarmAccounts();pollSwarm();clearInterval(swTimer);if(!dashStreamReady)swTimer=setInterval(pollSwarm,5000)}
 const sgp=s=>`<span class="stp sg-${s}">${t("sg_"+s)}</span>`;
 async function pollSwarm(){if(page!=="swarm"){clearInterval(swTimer);return}try{swMeta=await api("swarm");$("#scap").textContent=`(${t("capacity")}: ${swMeta.capacity})`;if(!swSel&&swMeta.runs[0])swSel=swMeta.runs[0].id;SW=swSel&&swMeta.runs.find(r=>r.id===swSel)?await api("swarm_run?id="+swSel):null;renderRuns()}catch{}}
 function renderRuns(){const R=SW,box=$("#swr");let h=`<div class="runs">${swMeta.runs.map(r=>`<div class="rn ${r.id===swSel?"on":""}" data-r="${r.id}">${sgp(r.status)} <b>${esc(r.id)}</b> <span class="tip">${esc(r.goal.slice(0,34))}</span></div>`).join("")||`<div class="tip">${t("swNone")}</div>`}</div>`;
-if(R){if(swPrev[R.id]&&swPrev[R.id]!==R.status&&/^done/.test(R.status)){beep();toast("🐝 "+R.id+": "+t("sg_"+R.status))}swPrev[R.id]=R.status;const live=["planning","running","verifying"].includes(R.status),fin=/^done/.test(R.status);
-h+=`<div class="box"><div class="ch"><b>${esc(R.id)}</b>${sgp(R.status)}<span class="tip">${esc(R.project)} · ${esc(R.base_branch)}</span></div><div style="margin:6px 0">${esc(R.goal)}</div>${R.plan?`<div class="tip">📋 ${esc(R.plan)}</div>`:""}
-<div class="act" style="margin-top:10px"><span class="stepper"><button data-sa="-1">−</button><b>${R.max_agents}</b><button data-sa="1">＋</button><span class="tip">${t("swAgents")}</span></span>${R.review?`<span class="tip">🔎 ${t("swReview")}</span>`:""}
-${live?`<button class="btn sm dng" data-sw="stop">⏹ ${t("swStop")}</button>`:""}${fin&&!R.applied?`<button class="btn sm pri" data-sw="apply">✅ ${t("swApply")}</button>`:""}${R.applied?`<span class="tag live">${t("swApplied")}</span>`:""}${!R.cleaned&&!live?`<button class="btn sm" data-sw="cleanup">🧹 ${t("swCleanup")}</button>`:""}</div>
-${R.summary?`<div class="box" style="margin:10px 0 0;background:var(--p2)">${esc(R.summary)}</div>`:""}${R.final_verify&&R.final_verify.cmd?`<div class="tip" style="margin-top:6px">${R.final_verify.ok?"✔":"✖"} ${esc(R.final_verify.cmd)}</div>`:""}
-<div class="ags">${R.agents.map(a=>`<div class="ag" data-ag="${a.id}"><div class="ch"><b>${esc(a.id)}</b><span>${esc(a.title)}</span><span class="pill" style="border:0;padding:0">${sgp(a.status)}</span></div><div>${a.files.map(f=>`<span class="gp">${esc(f)}</span>`).join("")}</div>
-<div class="act2">${esc(a.activity||a.note||"")}</div><div class="tip">${a.changed.length?`📝 ${a.changed.length} · `:""}${a.verify_ok===true?"✔ check · ":a.verify_ok===false?"✖ check · ":""}${a.attempts>1?`↻ ${a.attempts} · `:""}${a.violations.length?`⚠ ${a.violations.length} out of scope`:""}</div></div>`).join("")}</div>
-${R.contracts?`<details data-o="c" ${swOpen.has("c")?"open":""}><summary class="tip" style="cursor:pointer;margin-top:10px">📜 ${t("swContracts")}</summary><pre class="mono" style="white-space:pre-wrap;color:var(--mut)">${esc(R.contracts)}</pre></details>`:""}
-<details data-o="e" ${swOpen.has("e")?"open":""}><summary class="tip" style="cursor:pointer;margin-top:6px">📜 ${t("events")}</summary><div class="ev">${R.events.map(e=>`<div><time>${new Date(e.t*1e3).toLocaleTimeString()}</time>${esc(e.msg)}</div>`).join("")}</div></details></div>`}
+if(R){if(swPrev[R.id]&&swPrev[R.id]!==R.status&&/^done/.test(R.status)){beep();toast("* "+R.id+": "+t("sg_"+R.status))}swPrev[R.id]=R.status;const live=["planning","running","verifying"].includes(R.status),fin=/^done/.test(R.status);
+h+=`<div class="box"><div class="ch"><b>${esc(R.id)}</b>${sgp(R.status)}<span class="tip">${esc(R.project)} · ${esc(R.base_branch)}</span></div><div style="margin:6px 0">${esc(R.goal)}</div>${R.plan?`<div class="tip">≡ ${esc(R.plan)}</div>`:""}
+<div class="act" style="margin-top:10px">${R.attachments&&R.attachments.length?`<span class="chip">＋ ${R.attachments.length} ${t("swAttached")}</span>`:""}<span class="stepper"><button data-sa="-1">−</button><b>${R.max_agents}</b><button data-sa="1">＋</button><span class="tip">${t("swAgents")}</span></span>${R.review?`<span class="tip">🔎 ${t("swReview")}</span>`:""}
+${live?`<button class="btn sm dng" data-sw="stop">⏹ ${t("swStop")}</button>`:""}${fin&&!R.applied?`<button class="btn sm pri" data-sw="apply">✓ ${t("swApply")}</button>`:""}${R.applied?`<span class="tag live">${t("swApplied")}</span>`:""}${!R.cleaned&&!live?`<button class="btn sm" data-sw="cleanup">× ${t("swCleanup")}</button>`:""}</div>
+${R.summary?`<div class="box" style="margin:10px 0 0;background:var(--p2)">${esc(R.summary)}</div>`:""}${R.final_verify&&R.final_verify.cmd?`<div class="tip" style="margin-top:6px">${R.final_verify.ok?"✓":"×"} ${esc(R.final_verify.cmd)}</div>`:""}
+<div class="ags">${R.agents.map(a=>`<div class="ag" data-ag="${a.id}"><div class="ch"><b>${esc(a.id)}</b><span>${esc(a.title)}</span><span class="pill" style="border:0;padding:0">${sgp(a.status)}</span><span class="tip">· ${esc((S?.accounts||[]).find(x=>x.id===a.account_id)?.name||a.account_id||"")}</span></div><div>${a.files.map(f=>`<span class="gp">${esc(f)}</span>`).join("")}</div>
+<div class="act2">${esc(a.activity||a.note||"")}</div><div class="tip">${a.changed.length?`· ${a.changed.length} · `:""}${a.verify_ok===true?"✓ check · ":a.verify_ok===false?"× check · ":""}${a.attempts>1?`↻ ${a.attempts} · `:""}${a.violations.length?`! ${a.violations.length} out of scope`:""}</div></div>`).join("")}</div>
+${R.contracts?`<details data-o="c" ${swOpen.has("c")?"open":""}><summary class="tip" style="cursor:pointer;margin-top:10px">≡ ${t("swContracts")}</summary><pre class="mono" style="white-space:pre-wrap;color:var(--mut)">${esc(R.contracts)}</pre></details>`:""}
+<details data-o="e" ${swOpen.has("e")?"open":""}><summary class="tip" style="cursor:pointer;margin-top:6px">≡ ${t("events")}</summary><div class="ev">${R.events.map(e=>`<div><time>${new Date(e.t*1e3).toLocaleTimeString()}</time>${esc(e.msg)}</div>`).join("")}</div></details></div>`}
 if(box.dataset.h!==h){box.dataset.h=h;box.innerHTML=h}}
 $("#swr").addEventListener("toggle",e=>{const d=e.target;if(d.dataset&&d.dataset.o){d.open?swOpen.add(d.dataset.o):swOpen.delete(d.dataset.o)}},true);
-$("#p-swarm").addEventListener("input",e=>{if(e.target.id==="sp")e.target.dataset.autoProject="0"});
+$("#sfiles").addEventListener("change",async e=>{await uploadSwarmFiles([...e.target.files]);e.target.value=""});
+$("#p-swarm").addEventListener("input",e=>{if(e.target.id==="sp"){e.target.dataset.autoProject="0";renderSwarmAccounts()}});
+$("#p-swarm").addEventListener("dragover",e=>e.preventDefault());$("#p-swarm").addEventListener("drop",e=>{if(e.dataTransfer&&e.dataTransfer.files.length){e.preventDefault();uploadSwarmFiles([...e.dataTransfer.files])}});
 $("#p-swarm").addEventListener("click",async e=>{const rn=e.target.closest("[data-r]");if(rn){swSel=rn.dataset.r;$("#swr").dataset.h="";pollSwarm();return}
-if(e.target.id==="sbrowse"){const p=await pickFolder($("#sp").value);if(p){$("#sp").value=p;$("#sp").dataset.autoProject="0"}return}
-if(e.target.id==="sgo"){const d={goal:$("#sg").value,project:$("#sp").value,agents:$("#sa").value||"auto",verify:$("#sv2").value,review:$("#sr").value,strict:$("#sst").checked,init_git:$("#sgi").checked,tasks:$("#stk").value};
-const r=await act("swarm_start",d);if(r){swSel=r.id;$("#swr").dataset.h="";toast("🐝 "+r.id);LS.project=d.project;pollSwarm()}return}
+if(e.target.id==="spImprove"){improveSwarmPrompt();return}
+if(e.target.id==="spUse"){swFinalPrompt=$("#sp2").value.trim();toast("✓ "+t("swFinalReady"));return}
+if(e.target.id==="spAgain"){improveSwarmPrompt();return}
+if(e.target.id==="spApplyCustom"){await refineSwarmPrompt();return}
+const rm=e.target.closest("[data-rm-att]");if(rm){swAttachments.splice(+rm.dataset.rmAtt,1);renderSwarmAttachments();return}
+if(e.target.id==="sattach"){$("#sfiles").click();return}
+if(e.target.id==="sbrowse"){const p=await pickFolder($("#sp").value);if(p){$("#sp").value=p;$("#sp").dataset.autoProject="0";await act("project_context",{project:p})}return}
+if(e.target.id==="sgo"){const finalPrompt=($("#spp")&&!$("#spp").hidden?($("#sp2").value.trim()||swFinalPrompt):$("#sg").value.trim()).trim();if(!finalPrompt){toast(t("swGoalPh"));return}const project=$("#sp").value.trim();if(!project){toast(t("lProj"));return}const account_ids=[...document.querySelectorAll("#swAccounts input[type=checkbox]:checked")].map(x=>x.value);if(!account_ids.length){toast("Select at least one AI account");return}const d={goal:finalPrompt,project,agents:$("#sa").value||"auto",verify:$("#sv2").value,review:$("#sr").value,strict:$("#sst").checked,init_git:$("#sgi").checked,tasks:$("#stk").value,attachments:swAttachments.map(a=>a.id),account_ids};const r=await act("swarm_start",d);if(r){swSel=r.id;$("#swr").dataset.h="";toast("* "+r.id);LS.project=d.project;localStorage.dsb_launch=JSON.stringify({...LS,project:d.project});await act("project_context",{project:d.project});pollSwarm()}return}
 const sa=e.target.closest("[data-sa]");if(sa&&SW){await act("swarm_agents",{run:SW.id,n:SW.max_agents+ +sa.dataset.sa});pollSwarm();return}
-const sw=e.target.closest("[data-sw]");if(sw&&SW){const k=sw.dataset.sw;if(k==="stop"){if(await ask(t("swStop")+"?"))await act("swarm_stop",{run:SW.id})}else if(k==="apply"){if(await ask(t("swApplyQ"))){const r=await act("swarm_apply",{run:SW.id});if(r)toast("✔ "+r.text)}}else if(k==="cleanup"){if(await ask(t("swCleanQ")))await act("swarm_cleanup",{run:SW.id})}pollSwarm();return}
+const sw=e.target.closest("[data-sw]");if(sw&&SW){const k=sw.dataset.sw;if(k==="stop"){if(await ask(t("swStop")+"?"))await act("swarm_stop",{run:SW.id})}else if(k==="apply"){if(await ask(t("swApplyQ"))){const r=await act("swarm_apply",{run:SW.id});if(r)toast("✓ "+r.text)}}else if(k==="cleanup"){if(await ask(t("swCleanQ"))){await act("swarm_cleanup",{run:SW.id})}}pollSwarm();return}
 const ag=e.target.closest("[data-ag]");if(ag&&SW)openAgent(SW,SW.agents.find(a=>a.id===ag.dataset.ag))});
 function openAgent(R,a){let last=0;const o=modal(`<h3>${esc(a.id)} · ${esc(a.title)} ${sgp(a.status)}</h3><div class="tip">${a.files.map(f=>`<span class="gp">${esc(f)}</span>`).join("")}</div><details open><summary class="tip">${t("swTask")}</summary><div class="pth" style="direction:auto;text-align:start;white-space:pre-wrap">${esc(a.prompt)}</div></details>
-${a.note?`<div class="err">${esc(a.note)}</div>`:""}${a.violations.length?`<div class="err">⚠ ${esc(a.violations.join(", "))}</div>`:""}${a.changed.length?`<div class="tip">📝 ${a.changed.map(esc).join(", ")}</div>`:""}${a.verify_out?`<details><summary class="tip">✔ check</summary><pre class="mono" style="white-space:pre-wrap;font-size:12px">${esc(a.verify_out)}</pre></details>`:""}
+${a.note?`<div class="err">${esc(a.note)}</div>`:""}${a.violations.length?`<div class="err">! ${esc(a.violations.join(", "))}</div>`:""}${a.changed.length?`<div class="tip">· ${a.changed.map(esc).join(", ")}</div>`:""}${a.verify_out?`<details><summary class="tip">✓ check</summary><pre class="mono" style="white-space:pre-wrap;font-size:12px">${esc(a.verify_out)}</pre></details>`:""}
 <div id="agl" class="mono" style="background:#05070e;color:#cfd6f3;border-radius:10px;padding:8px 10px;max-height:240px;overflow:auto;font-size:12px;margin-top:8px"></div><div class="rowb"><button class="btn" data-x>${t("close")}</button></div>`,"big",false);
 const tm=setInterval(async()=>{try{const r=await api(`swarm_log?run=${R.id}&agent=${a.id}&since=${last}`);r.lines.forEach(l=>{const d=document.createElement("div");d.textContent=l;$("#agl",o).append(d)});last=r.last;if(r.lines.length)$("#agl",o).scrollTop=1e9}catch{}},1000);
 o.onclick=e=>{if(e.target.closest("[data-x]")){clearInterval(tm);o.close()}}}
 /* ---------- boot ---------- */
+const toggleMobileNav=()=>{const app=$("#app"),shade=$("#navshade");if(!app)return;const on=app.classList.toggle("navopen");if(shade)shade.hidden=!on};
+$("#mobileNav").onclick=toggleMobileNav;$("#navshade").onclick=toggleMobileNav;
+document.addEventListener("keydown",e=>{if(e.key==="Escape"){$("#app")?.classList.remove("navopen");$("#navshade")?.setAttribute("hidden","")}});
 $("#bth").onclick=()=>{localStorage.dsb_theme=(localStorage.dsb_theme||"dark")==="dark"?"light":"dark";applyTheme()};$("#blang").onclick=()=>{L=L==="fa"?"en":"fa";localStorage.dsb_lang=L;applyLang()};
 $("#bpal").onclick=openPalette;$$(".nb[data-go]").forEach(b=>b.onclick=()=>go(b.dataset.go));
-applyTheme();{const r=(location.hash.match(/#\/(\w+)/)||location.hash.match(/[#&]p=(\w+)/)||[])[1];page=PAGES.includes(r)?r:"dash"}applyLang();loadInfo().catch(()=>{});if(localStorage.dsb_dock==="1")setDock(true);tick();
+applyTheme();applyUiPerformance();connectDashStream();renderClaudeMirror();{const r=(location.hash.match(/#\/(\w+)/)||location.hash.match(/[#&]p=(\w+)/)||[])[1];page=PAGES.includes(r)?r:"dash"}applyLang();loadInfo().catch(()=>{});if(localStorage.dsb_dock==="1")setDock(true);tick();
 </script></body></html>
 """
 
@@ -6689,6 +7697,11 @@ class APIHandler(BaseHTTPRequestHandler):
             supplied = self.headers.get("x-api-key", "").strip()
         if not supplied:
             supplied = self.headers.get("anthropic-api-key", "").strip()
+        if not supplied and self.path.startswith("/dash/api/stream"):
+            try:
+                supplied = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("key", [""])[0]
+            except Exception:
+                supplied = ""
         if not API_KEY:
             return False
         return secrets.compare_digest(supplied.encode("utf-8", "ignore"), API_KEY.encode("utf-8"))
@@ -6754,6 +7767,12 @@ class APIHandler(BaseHTTPRequestHandler):
         if path in ("/dash", "/dash/"):
             if self._dash_host_ok():
                 self._send_html(DASH_HTML)
+        elif path == "/dash/api/stream":
+            if self._dash_host_ok():
+                if not self._check_auth():
+                    self._err(401, "authentication_error", "invalid api key")
+                else:
+                    self._dash_stream()
         elif path.startswith("/dash/api/"):
             if self._dash_host_ok():
                 if not self._check_auth():
@@ -6789,6 +7808,31 @@ class APIHandler(BaseHTTPRequestHandler):
         except Exception as exc:                 # incl. truncated bodies: answer if the peer can still read
             self.close_connection = True
             self._err(400, "invalid_request_error", str(exc))
+            return
+        if path == "/dash/api/claude-hook":
+            if not self._dash_host_ok():
+                return
+            try:
+                data = json.loads(body) if body else {}
+                if not isinstance(data, dict):
+                    raise ValueError("hook body must be a JSON object")
+                self.send_response(204)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                ingest_claude_hook(BRIDGE, data)
+            except Exception as exc:
+                log(f"[claude-hook] ignored malformed hook event: {exc}", C.yellow)
+            return
+        if path == "/dash/api/swarm_attachment":
+            if not self._dash_host_ok():
+                return
+            name = urllib.parse.unquote(self.headers.get("X-Filename", "attachment"))
+            mime = self.headers.get("X-Mime", "application/octet-stream")
+            try:
+                meta = store_swarm_attachment(name, mime, body)
+                self._send_json(200, {"ok": True, "attachment": {k: meta[k] for k in ("id", "name", "mime", "size")}})
+            except ValueError as exc:
+                self._err(400, "invalid_request_error", str(exc))
             return
         if not body.strip():
             self._err(400, "invalid_request_error", "empty request body")
@@ -6829,17 +7873,21 @@ class APIHandler(BaseHTTPRequestHandler):
     # ---- dashboard helpers -----------------------------------------------------
 
     def _route_path(self) -> str:
-        """Path without the query string; /a/<account>/v1/... pins the request to one account."""
+        """Parse optional /a/<account> and /s/<agent-tag> prefixes in either order."""
         path = self.path.split("?", 1)[0]
         self._pin = self._tag = None
-        mt = re.match(r"^/s/([^/]+)(/.*)$", path)
-        if mt:
-            from urllib.parse import unquote
-            self._tag, path = unquote(mt.group(1)), mt.group(2)
-        m = re.match(r"^/a/([^/]+)(/.*)$", path)
-        if m:
-            from urllib.parse import unquote
-            self._pin, path = unquote(m.group(1)), m.group(2)
+        from urllib.parse import unquote
+        # Allow /a/<account>/s/<tag>/v1/... so Swarm can pin both dimensions at once.
+        for _ in range(2):
+            mt = re.match(r"^/a/([^/]+)(/.*)$", path)
+            if mt and self._pin is None:
+                self._pin, path = unquote(mt.group(1)), mt.group(2)
+                continue
+            mt = re.match(r"^/s/([^/]+)(/.*)$", path)
+            if mt and self._tag is None:
+                self._tag, path = unquote(mt.group(1)), mt.group(2)
+                continue
+            break
         return path
 
     def _dash_host_ok(self) -> bool:
@@ -6857,6 +7905,48 @@ class APIHandler(BaseHTTPRequestHandler):
         if bad:
             self._err(403, "permission_error", "dashboard is only available from localhost")
         return not bad
+
+    def _dash_stream(self) -> None:
+        """Low-overhead dashboard event stream; sends only deltas and never blocks the producer."""
+        q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=256)
+        add_dash_subscription(q)
+        try:
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            # Backlog is intentionally bounded so a reconnect is cheap.
+            for event in list(CLAUDE_MIRROR)[-120:]:
+                payload = json.dumps(event.get("data", {}), ensure_ascii=False, separators=(",", ":"))
+                self.wfile.write(f"id: {int(event.get('id', 0))}\nevent: {event.get('kind', 'event')}\ndata: {payload}\n\n".encode("utf-8"))
+            self.wfile.flush()
+            last_ping = time.time()
+            while True:
+                try:
+                    event = q.get(timeout=15)
+                    payload = json.dumps(event.get("data", {}), ensure_ascii=False, separators=(",", ":"))
+                    self.wfile.write(f"id: {int(event.get('id', 0))}\nevent: {event.get('kind', 'event')}\ndata: {payload}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    last_ping = time.time()
+                except (BrokenPipeError, ConnectionError, OSError):
+                    break
+                if self._client_gone():
+                    break
+                if time.time() - last_ping > 30:
+                    try:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        last_ping = time.time()
+                    except (BrokenPipeError, ConnectionError, OSError):
+                        break
+        finally:
+            remove_dash_subscription(q)
 
     def _send_html(self, html: str) -> None:
         body = html.encode("utf-8")
@@ -6920,6 +8010,9 @@ class APIHandler(BaseHTTPRequestHandler):
         log(f"[http] {req.fmt} model={req.model} stream={req.stream} msgs={len(req.messages)} "
             f"tools={len(req.tools)} tool_choice={req.tool_choice.get('type', 'auto')}"
             f"{' side' if req.side else ''}", C.dim)
+        emit_dash_event("request", {"tag": req.tag or "", "role": req.role or "", "model": req.model,
+                                     "stream": bool(req.stream), "messages": len(req.messages),
+                                     "tools": len(req.tools), "side": bool(req.side)})
 
         # Quota / connectivity probes never touch the browser.
         if req.max_tokens is not None and req.max_tokens <= 1 and not req.tools:
@@ -6968,7 +8061,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     break
                 if not fut.done():
                     if not BRIDGE.alive():
-                        raise BridgeError("the DeepSeek worker thread stopped unexpectedly", "upstream")
+                        raise BridgeError("the selected AI worker thread stopped unexpectedly", "upstream")
                     if time.time() > deadline:
                         raise BridgeError("the request exceeded the overall time limit", "timeout")
                 if self._client_gone():
@@ -7161,7 +8254,182 @@ def terminal_loop(cfg: Dict[str, Any], url: str) -> None:
 # Self-tests (no browser needed)
 # ============================================================================
 
+
+def _selftest_v63_new_features() -> None:
+    """V6.3: attachment storage, worktree exclusion, prompt improve, live events."""
+    import tempfile
+    global CONFIG_PATH
+    old_cfg = CONFIG_PATH
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        CONFIG_PATH = root / "cfg.json"
+        # Attachment round-trip, arbitrary bytes (including NULs), and safe filename handling.
+        global SWARM_ATTACH_DIR
+        old_attach = SWARM_ATTACH_DIR
+        SWARM_ATTACH_DIR = root / "attachments"
+        payload = bytes(range(256)) * 4
+        meta = store_swarm_attachment("photo<>name.zip", "application/zip", payload)
+        got = get_swarm_attachment(meta["id"])
+        assert got["size"] == len(payload)
+        assert (Path(got["path"]).read_bytes() == payload)
+
+        # Prompt improver action must preserve original/current/custom channels.
+        class _PromptPool:
+            def __init__(self): self.cfg = {"settings": {}}; self.calls = []
+            def ask(self, prompt, **kw): self.calls.append(prompt); return "IMPROVED: preserve intent"
+            def event(self, *args): pass
+            def snapshot(self): return {}
+            def get(self, *args): return None
+        pp = _PromptPool()
+        r = dash_action(pp, "swarm_prompt_improve", {"prompt": "Build an API", "current": "Build a REST API", "custom": "Add tests"})
+        assert r["improved"] == "IMPROVED: preserve intent" and "CURRENT AI-IMPROVED VERSION" in pp.calls[0] and "Add tests" in pp.calls[0]
+
+        # Real git worktree attachment test: attachment input must remain untracked.
+        if shutil.which("git"):
+            proj = root / "repo"
+            proj.mkdir()
+            git(["init", "-q"], proj)
+            (proj / "base.txt").write_text("base\n", encoding="utf-8")
+            git(["add", "base.txt"], proj)
+            git(["-c", "user.email=test@example.invalid", "-c", "user.name=Test", "commit", "-q", "-m", "base"], proj)
+            wt = root / "wt"
+            git(["worktree", "add", "-q", "-b", "v63-test", str(wt), "HEAD"], proj)
+            try:
+                class _A:
+                    def __init__(self): self.id="a1"; self.log=[]; self.activity=""
+                    def add_log(self, msg): self.log.append(msg)
+                class _R:
+                    def __init__(self): self.opts={"attachments":[meta["id"]]}; self.agents=[]
+                fake = object.__new__(Swarm)
+                fake.pool = None
+                paths = fake._materialize_attachments(_R(), _A(), wt)
+                assert len(paths) == 1 and Path(paths[0]).is_file()
+                status = git(["status", "--porcelain"], wt, check=False).stdout.strip()
+                assert ".dsb-agent-input" not in status, status
+            finally:
+                git(["worktree", "remove", "--force", str(wt)], proj, check=False)
+                git(["branch", "-D", "v63-test"], proj, check=False)
+        SWARM_ATTACH_DIR = old_attach
+    CONFIG_PATH = old_cfg
+
+def _selftest_multiauth() -> None:
+    """Offline regression tests for multi web providers, thinking setting, and project affinity."""
+    assert {x["id"] for x in PROVIDERS if x.get("kind")=="web"} >= {"deepseek_web","chatgpt_web","grok_web"}
+    assert WEB_RECIPES["chatgpt_web"]["login_url"].startswith("https://chatgpt.com/auth/login")
+    assert WEB_RECIPES["grok_web"]["url"].startswith("https://grok.com")
+    assert any(s[0]=="THINK_MODE" and s[1]=="bool" and s[7]=="live" for s in SETTINGS_SCHEMA)
+    assert 'account_ids' in DASH_HTML and 'add_web' in DASH_HTML and 'swAccounts' in DASH_HTML
+    class P:
+        def __init__(self):
+            self.project_accounts={}; self.accounts=[]; self.lock=threading.RLock(); self.cfg={"accounts":[]}
+            self.routing={"strategy":"balanced","smart_routing":False,"auto_failover":True,"rotate_requests":0,"rotate_minutes":0}
+        def _project_key(self,p): return Pool._project_key(p)
+        def project_accounts_for(self,p): return Pool.project_accounts_for(self,p)
+        def get(self,x): return next((a for a in self.accounts if a.id==x),None)
+        def get_by_id(self,x): return self.get(x)
+        def _save(self): pass
+        def event(self,*a): pass
+    with tempfile.TemporaryDirectory() as td:
+        p=P(); proj=str(Path(td).resolve())
+        a1=Account({"id":"deep","name":"Deep","enabled":True,"kind":"web","provider":"deepseek_web"}); a2=Account({"id":"gpt","name":"GPT","enabled":True,"kind":"web","provider":"chatgpt_web"})
+        class W:
+            ok=True
+            engine=None
+        for a in (a1,a2): a.worker=W(); a.status="ready"
+        p.accounts=[a1,a2]
+        Pool.set_project_accounts(p,proj,["gpt"])
+        assert p.project_accounts_for(proj)==["gpt"]
+        Pool.set_project_accounts(p,proj,["deep","gpt"])
+        assert p.project_accounts_for(proj)==["deep","gpt"]
+        class Req:
+            system_text=f"Primary working directory: {proj}"
+            headers={}
+        picked, why = Pool.pick(p, Req())
+        assert picked in (a1,a2) and why == "balanced", (picked, why)
+        # Swarm must distribute independent tasks round-robin across every selected account.
+        sw=Swarm(p)
+        run=SwarmRun("sw-test","parallel",Path(proj),"base","main",{"agents":2,"tasks_text":"task one\ntask two\ntask three","account_ids":["deep","gpt"]})
+        sw._plan(run)
+        assert [a.account_id for a in run.agents] == ["deep","gpt","deep"]
+    # Generic web prompt injection must never use clipboard/paste (ChatGPT turns >10k pastes into attachments).
+    class _Loc:
+        def __init__(self): self.value=None
+        def fill(self, text, timeout=0): self.value=text
+    class _Page:
+        def __init__(self): self.loc=_Loc(); self.eval_calls=[]
+        def evaluate(self, script, arg=None): self.eval_calls.append((script,arg)); return {"ok":False,"len":0}
+        def locator(self, sel):
+            class _L:
+                def __init__(self, loc): self.loc=loc
+                @property
+                def first(self): return self.loc
+            return _L(self.loc)
+    fp=_Page(); dt=DeepSeekWeb(profile_dir=Path(tempfile.gettempdir())/"dsb-test", provider="chatgpt_web")
+    long_text="X"*25000
+    assert dt._inject_generic(fp, "textarea", long_text)==25000 and fp.loc.value==long_text
+    assert "clipboard" not in str(fp.eval_calls[0][0]).lower() and "insert_text" not in str(fp.eval_calls[0][0]).lower()
+    d=dt
+    assert d.provider=="chatgpt_web" and d.recipe["name"]=="ChatGPT" and d.think_pref==bool(THINK_MODE)
+    # Native API reasoning fields are added only when the live setting is enabled.
+    old_think=globals()["THINK_MODE"]
+    try:
+        globals()["THINK_MODE"]=True
+        class A: provider="deepseek_api"; model="deepseek-chat"
+        body=apply_think_mode({"messages":[]},A())
+        assert body["thinking"]=={"type":"enabled"}
+        class B: provider="openai"; model="gpt-5.2"
+        body2=apply_think_mode({"messages":[]},B())
+        assert body2["reasoning_effort"]=="high"
+        globals()["THINK_MODE"]=False
+        body3=apply_think_mode({"messages":[]},A())
+        body4=apply_think_mode({"messages":[]},B())
+        assert body3["thinking"]=={"type":"disabled"}
+        assert body4["reasoning_effort"]=="low"
+        tool_body=apply_think_mode({"messages":[],"tools":[{"type":"function"}],"tool_choice":"required"},A())
+        assert tool_body["thinking"]=={"type":"disabled"} and tool_body["tool_choice"]=="required"
+        globals()["THINK_MODE"]=True
+        tool_body=apply_think_mode({"messages":[],"tools":[{"type":"function"}],"tool_choice":"required"},A())
+        assert tool_body["thinking"]=={"type":"enabled"} and tool_body["tool_choice"]=="auto"
+    finally:
+        globals()["THINK_MODE"]=old_think
+
+
+
+def _selftest_startup_menu() -> None:
+    items = _startup_provider_items({"accounts": []})
+    assert len(items) == 6 and items[0][0] == "ChatGPT" and items[1][0] == "DeepSeek" and items[2][0] == "Grok"
+    assert _startup_menu_index(0, "down", 6) == 1
+    assert _startup_menu_index(5, "down", 6) == 0
+    assert _startup_menu_index(0, "up", 6) == 5
+    assert _startup_menu_index(0, "enter:2", 6) == 2
+    assert _startup_menu_index(0, "enter:99", 6) == 5
+    assert {"chatgpt": "chatgpt_web", "deepseek": "deepseek_web", "grok": "grok_web"}["chatgpt"] == "chatgpt_web"
+    with tempfile.TemporaryDirectory() as td:
+        cfg = {"accounts": [{"id": "g1", "name": "GPT 1", "enabled": True, "kind": "web", "provider": "chatgpt_web"},
+                            {"id": "g2", "name": "GPT 2", "enabled": True, "kind": "web", "provider": "chatgpt_web"},
+                            {"id": "d1", "name": "DS 1", "enabled": True, "kind": "web", "provider": "deepseek_web"}],
+               "routing": {"pinned": "g2"}}
+        assert _startup_count_text(cfg, "chatgpt_web") == "2 accounts"
+        assert _startup_count_text(cfg, "grok_web") == "not configured"
+        class FakePool:
+            def __init__(self):
+                self.cfg = cfg
+                self.accounts = [Account(x) for x in cfg["accounts"]]
+                self.routing = cfg["routing"]
+            def get_by_id(self, aid): return next((a for a in self.accounts if a.id == aid), None)
+            def add_web_account(self, provider, name="", headed=True, start=False):
+                a = Account({"id": f"{provider}-new", "name": name, "enabled": True, "kind": "web", "provider": provider})
+                self.accounts.append(a); return a
+        f = FakePool()
+        ids = startup_prepare_accounts(f, {"mode": "multi", "full": False})
+        assert ids == ["g2", "d1", "grok_web-new"], ids
+        f2 = FakePool()
+        ids2 = startup_prepare_accounts(f2, {"mode": "multi", "full": True})
+        assert ids2 == ["g1", "g2", "d1", "grok_web-new"], ids2
+
+
 def self_test() -> None:
+    _selftest_startup_menu()
     # 1. Original failure: malformed <tool_call> JSON + DSML residue.
     malformed = (
         '<tool_call>{"name": "Write", "arguments": {'
@@ -7579,8 +8847,18 @@ def self_test() -> None:
                 raise AssertionError("bogus mode accepted")
             except argparse.ArgumentTypeError:
                 pass
-            # ask: nothing added
-            assert permission_args("ask", []) == []
+            # ask: mirror hooks are added through a generated settings file; URL must be concrete
+            # because Claude Code validates HTTP hook URLs before starting the session.
+            ask_args = permission_args("ask", [])
+            assert ask_args[:1] == ["--settings"] and Path(ask_args[1]).is_file()
+            ask_cfg = json.loads(Path(ask_args[1]).read_text())
+            assert "hooks" in ask_cfg
+            assert set(ask_cfg["hooks"]) == set(_CLAUDE_MIRROR_EVENTS)
+            hook = ask_cfg["hooks"]["UserPromptSubmit"][0]["hooks"][0]
+            assert re.match(r"^http://127\.0\.0\.1:\d+/dash/api/claude-hook$", hook["url"])
+            assert hook["headers"]["Authorization"] == "Bearer $DS_BRIDGE_HOOK_KEY"
+            assert hook["allowedEnvVars"] == ["DS_BRIDGE_HOOK_KEY"]
+            assert "MessageDisplay" not in ask_cfg["hooks"] and "PostModelSwitch" not in ask_cfg["hooks"]
             # auto: skip-permissions (+ warning pre-accepted) or, as root, a tool allow-list
             a_auto = permission_args("auto", [])
             if running_as_root():
@@ -7630,12 +8908,15 @@ def self_test() -> None:
             # Regression guard for the dashboard's Team Agent project selector:
             # the live bridge project must beat stale localStorage from an older launch.
             assert 'const project=I.project||LS.project||""' in DASH_HTML
-            assert 'async function enterSwarm(){try{await loadInfo(true)}' in DASH_HTML
+            assert 'window.CC_SESSION={cwd:"",model:"",tool:"",text:"",event:"",status:"idle"}' in DASH_HTML
+            assert 'async function enterSwarm(){try{await loadInfo(true);S=await api("state")}' in DASH_HTML
         finally:
             CONFIG_PATH = old_cfg_path
             if old_env_mode is not None:
                 os.environ["DS_BRIDGE_MODE"] = old_env_mode
 
+    _selftest_multiauth()
+    _selftest_v63_new_features()
     _selftest_multi()
     _selftest_v61()
     _selftest_api()
@@ -7736,6 +9017,83 @@ def _selftest_multi() -> None:
     assert e3.owns(normalize_anthropic({"model": "m", "messages": [um("other")]})) == -1
     e3.ds.epoch = 5
     assert e3.owns(normalize_anthropic({"model": "m", "messages": m2})) == -1   # browser restarted => chats gone
+
+    # ---- generic web regression: ChatGPT/Grok reuse ONE existing browser tab/chat even
+    # when Claude Code rewrites metadata enough to defeat the strict continuation matcher.
+    class _GenericPage:
+        def __init__(self): self.closed = False
+        def is_closed(self): return self.closed
+        def evaluate(self, js, *args):
+            if js == JS_GENERIC_NEW_CHAT:
+                return True
+            return None
+
+    class _GenericDS(_FDS):
+        def __init__(self):
+            self.provider = "chatgpt_web"
+            self.recipe = {"name": "ChatGPT", "url": "https://chatgpt.com/", "supports_think": True}
+            self.epoch = 0
+            self.headless = True
+            self.page = _GenericPage()
+            self.scratch = self.page
+            self.pages = [self.page]
+            self.new_pages = 0
+            self.opens = 0
+            self.prompts = []
+            self.script = ["first answer", "second answer", "agent one", "agent two", "side one", "side two"]
+        def ensure_alive(self):
+            self.scratch = self.page
+        def new_page(self):
+            self.new_pages += 1
+            p = _GenericPage()
+            self.pages.append(p)
+            return p
+        def open_chat(self, p):
+            self.opens += 1
+        def close_page(self, p):
+            p.closed = True
+        def session_of(self, page):
+            return "https://chatgpt.com/c/test-chat"
+        def _provider_name(self):
+            return "ChatGPT"
+        def exchange(self, page, prompt, cancel=None, on_partial=None, files=None):
+            self.prompts.append(prompt)
+            return Exchange(text=self.script.pop(0), session_id=self.session_of(page), seconds=0.0)
+    gds = _GenericDS()
+    ge = Engine(gds, None, None)
+    gm1 = [{"role": "user", "content": "first"}]
+    gm2 = gm1 + [{"role": "assistant", "content": "first answer"}, {"role": "user", "content": "second topic"}]
+    ge.process(rq(gm1), None, None)
+    ge.process(rq(gm2), None, None)
+    assert gds.new_pages == 0 and gds.opens == 0 and len(gds.prompts) == 2, (gds.new_pages, gds.opens, len(gds.prompts))
+    assert gds.prompts[0].startswith("You are the ASSISTANT")
+    assert gds.prompts[1].startswith("[NEW ITEMS SINCE YOUR LAST TURN]") and len(gds.prompts[1]) < len(gds.prompts[0])
+    assert ge.sticky_conv is not None and ge.sticky_conv.page is gds.scratch and ge.sticky_conv.turns == 2
+    assert ge._find_conv(normalize_anthropic({"model": "m", "messages": gm2 + [{"role": "assistant", "content": "unrelated"}, {"role": "user", "content": "third"}]})) is ge.sticky_conv
+    assert ge.owns(normalize_anthropic({"model": "m", "messages": [{"role": "user", "content": "rewritten metadata"}]})) == len(gm2)
+
+    # Explicit reset keeps the browser tab alive and requests a new web conversation.
+    assert ge.reset_all() == 1 and ge.sticky_conv is not None and gds.new_pages == 0 and ge.sticky_conv.n == 0
+
+    # Different logical lanes (for example Swarm agents) get their own persistent chat tab,
+    # but repeated requests within the same lane reuse that tab instead of creating a chat.
+    ra1 = normalize_anthropic({"model": "m", "messages": [{"role": "user", "content": "agent task"}]})
+    ra1.tag = "sw1.a1"
+    ra2 = normalize_anthropic({"model": "m", "messages": [{"role": "user", "content": "agent task"},
+                                                   {"role": "assistant", "content": "agent one"},
+                                                   {"role": "user", "content": "agent next"}]})
+    ra2.tag = "sw1.a1"
+    before_pages = gds.new_pages
+    ge.process(ra1, None, None); ge.process(ra2, None, None)
+    assert gds.new_pages == before_pages + 1
+    agent_page = ge.generic_lanes["tag:sw1.a1"].page
+    assert agent_page is not ge.sticky_conv.page
+
+    # Generic side work must not navigate the main ChatGPT tab; one dedicated side tab is reused.
+    rs = normalize_anthropic({"model": "haiku", "messages": [{"role": "user", "content": "side"}]})
+    before_pages = gds.new_pages
+    ge.process(rs, None, None); ge.process(rs, None, None)
+    assert gds.new_pages == before_pages + 1 and ge.generic_side_page is not ge.sticky_conv.page
 
     # ---- pool: routing with fake workers
     class _FE:
@@ -7939,8 +9297,8 @@ def _selftest_multi() -> None:
     real_web, seen = DeepSeekWeb, []
 
     class _FakeWeb:
-        def __init__(self, profile_dir=None, name="", headed=False, on_state=None, on_exchange=None):
-            self.name, self.on_state, self.abort, self.epoch = name, on_state, False, 0
+        def __init__(self, profile_dir=None, name="", headed=False, on_state=None, on_exchange=None, provider="deepseek_web"):
+            self.name, self.provider, self.on_state, self.abort, self.epoch = name, provider, on_state, False, 0
 
         def start(self, known_login=True):
             seen.append((self.name, known_login))
@@ -8557,7 +9915,7 @@ def _selftest_swarm() -> None:
             assert "api/a.py" in git(["ls-tree", "-r", "--name-only", a3.base], proj).stdout, "a dependent task must start from the merged work"
             assert all(not a.violations for a in run.agents) and "3/3 agents merged" in run.summary
             tags = {x["tag"] for x in ACTIVITY if x["tag"].startswith(run.id)}
-            assert {f"{run.id}.a1", f"{run.id}.a2", f"{run.id}.a3"} <= tags and all(x["role"] == "coder" for x in ACTIVITY if x["tag"].startswith(run.id + "."))
+            assert {f"{run.id}.a1", f"{run.id}.a2", f"{run.id}.a3"} <= tags and all(x["role"] == "coder" for x in ACTIVITY if x["tag"].startswith(run.id + ".a"))
             assert git(["status", "--porcelain"], proj).stdout.strip() == "", "the swarm must not dirty the user's folder"
             assert "Merged into main" in pool.swarm.apply(run) and (proj / "api" / "a.py").read_text().strip() == "A = 1"
             try:
@@ -8779,12 +10137,98 @@ _SAFE_BASH_DENY = (
 _SAFE_BASH_DENY_WILDCARD = ("git log*--output*", "git show*--output*")
 
 
+# Claude Code 2.1.112 (the version currently used by the launcher) rejects newer hook
+# event names such as MessageDisplay / PreModelSwitch and does not interpolate environment
+# variables inside the URL field. Keep the mirror conservative and put the secret only in
+# the HTTP header, where Claude Code explicitly supports allowedEnvVars.
+_CLAUDE_MIRROR_EVENTS = (
+    "PreToolUse", "PostToolUse", "PostToolUseFailure", "Notification", "UserPromptSubmit",
+    "SessionStart", "SessionEnd", "Stop", "StopFailure", "SubagentStart", "SubagentStop",
+    "PreCompact", "PostCompact", "PermissionRequest", "PermissionDenied", "Setup",
+    "TeammateIdle", "TaskCreated", "TaskCompleted", "Elicitation", "ElicitationResult",
+    "ConfigChange", "WorktreeCreate", "WorktreeRemove", "InstructionsLoaded", "CwdChanged",
+    "FileChanged",
+)
+
+
+def _claude_hook_url() -> str:
+    """Return a concrete localhost URL; Claude Code validates URL syntax before launch."""
+    port = DEFAULT_PORT
+    try:
+        cfg = load_config()
+        port = int(cfg.get("port") or DEFAULT_PORT)
+    except Exception:
+        pass
+    return f"http://127.0.0.1:{port}/dash/api/claude-hook"
+
+
+def claude_mirror_settings() -> Dict[str, Any]:
+    """Non-blocking semantic event bridge from Claude Code into the dashboard.
+
+    Only events known to work on the supported Claude Code baseline are emitted here.
+    The hook never returns a decision and therefore cannot block Claude.
+    """
+    url = _claude_hook_url()
+    groups: Dict[str, Any] = {}
+    for event in _CLAUDE_MIRROR_EVENTS:
+        groups[event] = [{"hooks": [{
+            "type": "http", "url": url, "timeout": 3,
+            "headers": {"Authorization": "Bearer $DS_BRIDGE_HOOK_KEY"},
+            "allowedEnvVars": ["DS_BRIDGE_HOOK_KEY"]
+        }]}]
+    return {"hooks": groups}
+
+
+def _merge_claude_hook_settings(base: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    hooks = dict(out.get("hooks") or {})
+    mirror = claude_mirror_settings().get("hooks", {})
+    for event, groups in mirror.items():
+        hooks[event] = list(hooks.get(event) or []) + groups
+    out["hooks"] = hooks
+    return out
+
+
+def _sanitize_claude_hook_event(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Turn Claude Code hook input into a compact, safe dashboard event payload."""
+    event = str(data.get("hook_event_name") or "unknown")[:64]
+    payload: Dict[str, Any] = {"event": event}
+    for key in ("session_id", "cwd", "tool_name", "model", "permission_mode", "source", "reason"):
+        if key in data and data.get(key) is not None:
+            value = str(data.get(key))
+            payload[key] = value[:260]
+    if event == "UserPromptSubmit":
+        payload["text"] = str(data.get("prompt") or "")[:1200]
+    elif event == "MessageDisplay":
+        payload["text"] = str(data.get("delta") or "")[:1200]
+        payload["final"] = bool(data.get("final"))
+        payload["index"] = int(data.get("index") or 0)
+    elif event in ("PreToolUse", "PostToolUse", "PostToolUseFailure"):
+        ti = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+        interesting = {k: ti[k] for k in ("command", "file_path", "path", "pattern", "query") if k in ti}
+        if interesting:
+            payload["input"] = {k: str(v)[:500] for k, v in interesting.items()}
+        if event != "PreToolUse":
+            payload["duration_ms"] = int(data.get("duration_ms") or 0)
+    elif event == "Notification":
+        payload["text"] = str(data.get("message") or data.get("notification") or "")[:600]
+    return payload
+
+
+def ingest_claude_hook(pool: Any, data: Dict[str, Any]) -> Dict[str, Any]:
+    payload = _sanitize_claude_hook_event(data)
+    payload["project"] = str((data.get("cwd") or pool.cfg.get("project_dir") or SCRIPT_DIR))
+    emit_dash_event("claude", payload)
+    return {"ok": True}
+
+
 def safe_settings() -> Dict[str, Any]:
-    return {"permissions": {
+    base = {"permissions": {
         "defaultMode": "acceptEdits",
         "allow": [f"Bash({c}:*)" for c in _SAFE_BASH_ALLOW] + [f"Bash({c})" for c in _SAFE_BASH_ALLOW_EXACT],
         "deny": [f"Bash({c}:*)" for c in _SAFE_BASH_DENY] + [f"Bash({c})" for c in _SAFE_BASH_DENY_WILDCARD],
     }}
+    return _merge_claude_hook_settings(base)
 
 
 def _write_json_once(path: Path, obj: Dict[str, Any]) -> Optional[str]:
@@ -8858,7 +10302,7 @@ def keep_going_settings() -> Dict[str, Any]:
         _warn_once("keepgoing", f"could not write the keep-going hook ({exc})")
         return {}
     cmd = f'"{Path(sys.executable).as_posix()}" "{script.as_posix()}"'
-    return {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": cmd, "timeout": 30}]}]}}
+    return _merge_claude_hook_settings({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": cmd, "timeout": 30}]}]}})
 
 
 def _settings_path(name: str) -> Path:
@@ -8879,7 +10323,8 @@ def permission_args(mode: str, extra: List[str]) -> List[str]:
         return []
     has_settings = any(a.split("=", 1)[0] == "--settings" for a in extra)
     if mode == "ask":
-        return []
+        sf = _write_json_once(_settings_path("mirror"), claude_mirror_settings())
+        return ["--settings", sf] if sf else []
     if mode == "safe":
         if has_settings:
             return []                # the user's own --settings decides; we never override it
@@ -8893,15 +10338,16 @@ def permission_args(mode: str, extra: List[str]) -> List[str]:
         _warn_once("root_auto", "running as root: Claude Code forbids --dangerously-skip-permissions, "
                                 "so all built-in tools are pre-approved instead")
         args = [f"--allowedTools={_ROOT_ALLOWED_TOOLS}", "--permission-mode", "acceptEdits"]
-        if KEEP_GOING and not has_settings:
-            sf = _write_json_once(_settings_path("auto"), keep_going_settings())
+        if not has_settings:
+            conf = keep_going_settings() if KEEP_GOING else claude_mirror_settings()
+            sf = _write_json_once(_settings_path("auto"), conf)
             if sf:
                 args += ["--settings", sf]
         return args
     args = ["--dangerously-skip-permissions"]
     if not has_settings:
         # Pre-accepts Claude Code's one-time "bypass permissions" warning screen.
-        conf: Dict[str, Any] = {"skipDangerousModePermissionPrompt": True}
+        conf: Dict[str, Any] = _merge_claude_hook_settings({"skipDangerousModePermissionPrompt": True})
         if KEEP_GOING:
             conf.update(keep_going_settings())
         sf = _write_json_once(_settings_path("auto"), conf)
@@ -8922,6 +10368,8 @@ def claude_env(cfg: Dict[str, Any], url: str) -> Dict[str, str]:
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-haiku-4-20250514",
         "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        "DS_BRIDGE_HOOK_URL": f"http://127.0.0.1:{cfg.get('port', DEFAULT_PORT)}/dash/api/claude-hook",
+        "DS_BRIDGE_HOOK_KEY": cfg["api_key"],
     })
     for k, v in (("API_TIMEOUT_MS", CLIENT_API_TIMEOUT_MS),
                  ("BASH_DEFAULT_TIMEOUT_MS", CLIENT_BASH_DEFAULT_TIMEOUT_MS),
@@ -9223,6 +10671,222 @@ def bridge_already_running(port: int) -> bool:
         return False
 
 
+
+# ============================================================================
+# Startup AI chooser: keep browser startup explicit and keyboard-driven.
+# ============================================================================
+
+STARTUP_WEB_PROVIDERS: Tuple[str, ...] = ("chatgpt_web", "deepseek_web", "grok_web")
+
+
+def _startup_provider_name(provider: str) -> str:
+    return str((_PROVIDER.get(provider) or WEB_RECIPES.get(provider) or {}).get("name") or provider)
+
+
+def _startup_accounts_from_cfg(cfg: Dict[str, Any], provider: str) -> List[Dict[str, Any]]:
+    raw = cfg.get("accounts")
+    items = [d for d in raw if isinstance(d, dict) and d.get("id")] if isinstance(raw, list) else []
+    if not items and provider == "deepseek_web":
+        try:
+            had = PROFILE_DIR.exists() and any(PROFILE_DIR.iterdir())
+        except Exception:
+            had = False
+        items = [{"id": "main", "name": "Account 1", "enabled": True, "logged_in": had,
+                  "kind": "web", "provider": "deepseek_web"}]
+    out: List[Dict[str, Any]] = []
+    for d in items:
+        pv = str(d.get("provider") or ("deepseek_web" if str(d.get("kind") or "web") == "web" else ""))
+        if pv != provider:
+            continue
+        out.append(d)
+    return out
+
+
+def _startup_count_text(cfg: Dict[str, Any], provider: str) -> str:
+    accts = _startup_accounts_from_cfg(cfg, provider)
+    enabled = sum(1 for a in accts if a.get("enabled", True))
+    if not accts:
+        return "not configured"
+    return f"{enabled} account{'s' if enabled != 1 else ''}"
+
+
+def _startup_clear() -> None:
+    if not sys.stdout.isatty():
+        return
+    try:
+        if os.name == "nt":
+            os.system("cls")
+        else:
+            print("\x1b[2J\x1b[H", end="")
+    except Exception:
+        pass
+
+
+def _startup_key() -> str:
+    """Read one lightweight terminal key; Windows is the primary target, line input is the CI fallback."""
+    if not sys.stdin.isatty():
+        value = input("Select [1-6]: ").strip().lower()
+        return {"1": "enter:0", "2": "enter:1", "3": "enter:2", "4": "enter:3", "5": "enter:4", "6": "enter:5"}.get(value, "esc")
+    if os.name == "nt":
+        import msvcrt
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            ch2 = msvcrt.getwch()
+            return {"H": "up", "P": "down", "K": "left", "M": "right"}.get(ch2, "")
+        return {"\r": "enter", "\n": "enter", "\x1b": "esc", "q": "esc", "Q": "esc", " ": "space"}.get(ch, "")
+    import termios
+    import tty
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            seq = sys.stdin.read(2)
+            if seq == "[A": return "up"
+            if seq == "[B": return "down"
+            if seq == "[C": return "right"
+            if seq == "[D": return "left"
+            return "esc"
+        if ch in ("\r", "\n"): return "enter"
+        if ch in ("q", "Q"): return "esc"
+        if ch == " ": return "space"
+        return ""
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _startup_menu_index(index: int, key: str, count: int) -> int:
+    if count <= 0:
+        return 0
+    if key == "up":
+        return (index - 1) % count
+    if key == "down":
+        return (index + 1) % count
+    if key.startswith("enter:"):
+        try:
+            n = int(key.split(":", 1)[1])
+            return max(0, min(count - 1, n))
+        except (TypeError, ValueError):
+            return index
+    return index
+
+
+def _startup_menu(title: str, items: List[Tuple[str, str]], selected: int = 0,
+                  allow_space: bool = False) -> Optional[int]:
+    if not items:
+        return None
+    idx = max(0, min(len(items) - 1, selected))
+    while True:
+        _startup_clear()
+        print(C.green("AI Bridge"))
+        print(C.dim(title))
+        print()
+        for i, (name, sub) in enumerate(items):
+            marker = ">" if i == idx else " "
+            print(f" {marker} {i + 1}. {name}")
+            if sub:
+                print(f"      {C.dim(sub)}")
+        print()
+        hint = "↑↓ انتخاب  •  Enter تأیید"
+        if allow_space:
+            hint += "  •  Space انتخاب/لغو"
+        print(C.dim(hint + "  •  Esc خروج"))
+        key = _startup_key()
+        if key in ("up", "down"):
+            idx = _startup_menu_index(idx, key, len(items))
+            continue
+        if key == "enter":
+            return idx
+        if key.startswith("enter:"):
+            return _startup_menu_index(idx, key, len(items))
+        if key == "esc":
+            return None
+        # Space is intentionally ignored by the single-select menu.
+
+
+def _startup_provider_items(cfg: Dict[str, Any]) -> List[Tuple[str, str]]:
+    return [("ChatGPT", _startup_count_text(cfg, "chatgpt_web")),
+            ("DeepSeek", _startup_count_text(cfg, "deepseek_web")),
+            ("Grok", _startup_count_text(cfg, "grok_web")),
+            ("Multi-AI / Parallel", "one account per AI (light); full parallel is available next"),
+            ("Dashboard only", "start Bridge without starting any AI browser"),
+            ("Exit", "close without starting Bridge")]
+
+
+def startup_ai_menu(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the user's explicit startup choice. No AI worker is started here."""
+    if not sys.stdin.isatty():
+        # Never silently start an AI in a non-interactive shell. Use an explicit --ai value instead.
+        return {"mode": "exit"}
+    items = _startup_provider_items(cfg)
+    picked = _startup_menu("What should start now?", items)
+    if picked is None or picked == 5:
+        return {"mode": "exit"}
+    if picked == 4:
+        return {"mode": "dashboard"}
+    if picked == 3:
+        sub = [("Light parallel", "ChatGPT + DeepSeek + Grok: one account from each AI"),
+               ("Full parallel", "start every enabled web account (uses more RAM/CPU)"),
+               ("Back", "return to the previous menu")]
+        mode = _startup_menu("Parallel mode", sub)
+        if mode is None or mode == 2:
+            return startup_ai_menu(cfg)
+        return {"mode": "multi", "full": bool(mode == 1)}
+    return {"mode": "provider", "provider": STARTUP_WEB_PROVIDERS[picked]}
+
+
+def startup_choose_account(cfg: Dict[str, Any], provider: str) -> Dict[str, Any]:
+    """Choose one account or all enabled accounts for a single provider."""
+    accounts = [d for d in _startup_accounts_from_cfg(cfg, provider) if d.get("enabled", True)]
+    if len(accounts) <= 1:
+        return {"mode": "one", "ids": [str(accounts[0]["id"])] if accounts else []}
+    items = [(str(d.get("name") or d.get("id")),
+              "logged in" if d.get("logged_in") else "login needed") for d in accounts]
+    items.append((f"All enabled {_startup_provider_name(provider)} accounts", f"start all {len(accounts)} accounts"))
+    picked = _startup_menu(f"Choose {_startup_provider_name(provider)} account", items)
+    if picked is None:
+        return {"mode": "cancel", "ids": []}
+    if picked == len(accounts):
+        return {"mode": "all", "ids": [str(d["id"]) for d in accounts]}
+    return {"mode": "one", "ids": [str(accounts[picked]["id"])]}
+
+
+def startup_prepare_accounts(pool: "Pool", choice: Dict[str, Any], headed: bool = False) -> List[str]:
+    """Ensure selected providers have accounts, then return the exact account IDs to start."""
+    mode = choice.get("mode")
+    if mode == "dashboard":
+        return []
+    if mode == "provider":
+        provider = str(choice.get("provider") or "")
+        if provider not in STARTUP_WEB_PROVIDERS:
+            return []
+        candidates = [a for a in pool.accounts if a.enabled and a.kind == "web" and a.provider == provider]
+        if not candidates:
+            a = pool.add_web_account(provider, name=f"{_startup_provider_name(provider)} 1", headed=headed, start=False)
+            return [a.id]
+        if len(candidates) == 1:
+            return [candidates[0].id]
+        # Re-use the keyboard chooser, but when the console is non-interactive start the first enabled one.
+        picked = startup_choose_account(pool.cfg, provider)
+        return [x for x in picked.get("ids", []) if pool.get_by_id(x)]
+    if mode == "multi":
+        providers = list(STARTUP_WEB_PROVIDERS)
+        selected: List[str] = []
+        for provider in providers:
+            candidates = [a for a in pool.accounts if a.enabled and a.kind == "web" and a.provider == provider]
+            if not candidates:
+                a = pool.add_web_account(provider, name=f"{_startup_provider_name(provider)} 1", headed=headed, start=False)
+                candidates = [a]
+            if choice.get("full"):
+                selected.extend(a.id for a in candidates)
+            else:
+                pinned = pool.get_by_id(pool.routing.get("pinned"))
+                primary = pinned if pinned and pinned.provider == provider and pinned.enabled else candidates[0]
+                selected.append(primary.id)
+        return list(dict.fromkeys(selected))
+    return []
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -9255,6 +10919,8 @@ def main() -> int:
     ap.add_argument("--verify-safe", action="store_true",
                     help="run the real Claude Code against a fake model and check that safe mode holds, then exit")
     ap.add_argument("--headed", action="store_true", help="always use a visible browser window")
+    ap.add_argument("--ai", choices=("chatgpt", "deepseek", "grok", "multi", "dashboard"),
+                    help="skip the startup chooser explicitly: chatgpt | deepseek | grok | multi | dashboard")
     ap.add_argument("--debug-dir", help="dump every prompt / raw reply into this directory")
     ap.add_argument("--add-account", action="append", metavar="NAME",
                     help="add another DeepSeek account (its login window opens); can be repeated")
@@ -9344,15 +11010,37 @@ def main() -> int:
 
     if project is not None and not bridge_reused:
         remember_project(cfg, project, persist=True)
+    # Explicit startup choice: never open DeepSeek (or any other web AI) implicitly.
+    if args.panel:
+        startup_choice = {"mode": "dashboard"}
+    elif args.ai:
+        startup_choice = {"mode": "dashboard" if args.ai == "dashboard" else
+                          "multi" if args.ai == "multi" else "provider",
+                          **({} if args.ai in ("dashboard", "multi") else {"provider": args.ai + "_web"}),
+                          **({"full": False} if args.ai == "multi" else {})}
+    else:
+        startup_choice = startup_ai_menu(cfg)
+    if startup_choice.get("mode") == "exit":
+        print(C.dim("[startup] cancelled."))
+        return 0
+
     BRIDGE = Pool(cfg)
     for nm in args.add_account or []:
         BRIDGE.add_account(nm, start=False)
-    log("[main] starting the DeepSeek accounts (a browser may open for login)...", C.dim)
-    BRIDGE.start_all()
-    if not BRIDGE.wait_any_ready(LOGIN_WAIT_SECONDS + 120):
-        log("[error] no DeepSeek account could be started / logged in.", C.red)
-        BRIDGE.stop()
-        return 1
+    selected_ids = startup_prepare_accounts(BRIDGE, startup_choice, headed=bool(args.headed))
+    if startup_choice.get("mode") == "dashboard":
+        # Dashboard-only means exactly that: no AI worker and no Claude Code process.
+        args.terminal, PANEL_ONLY = True, True
+        RUN_MODE = "panel"
+        log("[main] starting Bridge without starting an AI browser (Dashboard only).", C.dim)
+    else:
+        names = [BRIDGE.get_by_id(aid).name for aid in selected_ids if BRIDGE.get_by_id(aid)]
+        log(f"[main] starting selected AI account(s): {', '.join(names) or 'none'}", C.dim)
+        BRIDGE.start_selected(selected_ids)
+        if not BRIDGE.wait_selected_ready(selected_ids, LOGIN_WAIT_SECONDS + 120):
+            log("[error] no selected AI account could be started / logged in.", C.red)
+            BRIDGE.stop()
+            return 1
 
     try:
         server = start_server(cfg["port"])
