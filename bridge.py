@@ -2803,7 +2803,10 @@ class DeepSeekWeb:
         self._transition("STARTING", "start requested")
         self.pw = sync_playwright().start()
         self._minimize = bool(known_login and not self.headed_pref)
-        allow_headless = HEADLESS_MODE != "0" and not self.headed_pref
+        # Never hide an account that may still need interactive authentication.
+        # The persisted logged_in flag is only a hint; force_login and a missing
+        # session must always use a visible browser until authentication succeeds.
+        allow_headless = HEADLESS_MODE != "0" and not self.headed_pref and bool(known_login)
         tag = self.name or "account"
         ok = False
         if allow_headless and known_login:
@@ -5686,6 +5689,13 @@ class Pool:
     def _load_accounts(self) -> None:
         raw = self.cfg.get("accounts")
         items = [d for d in raw if isinstance(d, dict) and d.get("id")] if isinstance(raw, list) else []
+        # Accounts marked deleted by older bridge versions are no longer restorable:
+        # remove their records on startup and clean their trusted browser profiles.
+        legacy_deleted = [d for d in items if bool(d.get("deleted", False))]
+        items = [d for d in items if not bool(d.get("deleted", False))]
+        for d in legacy_deleted:
+            self._remove_account_profile_path(Path(d.get("profile") or ""))
+
         # Backward compatibility: only a truly missing `accounts` key means an older
         # pre-multi-account config. An explicit [] is an intentional empty account pool
         # and must stay empty (critical for explicit Multi-AI / Dashboard startup).
@@ -5706,6 +5716,38 @@ class Pool:
         else:
             self.routing["pinned"] = None
         self._save()
+
+    @staticmethod
+    def _remove_account_profile_path(profile: Path) -> None:
+        """Delete only browser profiles owned by this bridge; never arbitrary paths from config."""
+        try:
+            if not str(profile):
+                return
+            resolved = profile.expanduser().resolve(strict=False)
+            trusted_roots = [ACCOUNTS_DIR.resolve(strict=False), PROFILE_DIR.resolve(strict=False)]
+            trusted = any(resolved == root or root in resolved.parents for root in trusted_roots)
+            if trusted and resolved.exists():
+                shutil.rmtree(resolved, ignore_errors=False)
+        except Exception as exc:
+            _warn_once("profile_cleanup", f"could not remove account browser profile {profile!s}: {exc}")
+
+    def _remove_usage_account(self, account_id: str) -> None:
+        """Remove one account's persisted usage/stats entry immediately."""
+        try:
+            path = self._usage_path()
+            if not path.exists():
+                return
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return
+            accounts = data.get("accounts")
+            if isinstance(accounts, dict) and account_id in accounts:
+                accounts.pop(account_id, None)
+                tmp = path.with_suffix(path.suffix + ".tmp")
+                tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+                os.replace(tmp, path)
+        except Exception as exc:
+            self.event("warn", f"usage record for deleted account could not be removed: {exc}")
 
     def _save(self) -> None:
         with self.lock:
@@ -6020,42 +6062,105 @@ class Pool:
         return self.dispatch(req, None, None, None, PRIORITY_MAIN).result(timeout=timeout).text
 
     def remove_account(self, a: Account, purge: bool = False) -> None:
-        """Soft-delete by default; explicit purge may permanently remove a profile."""
-        if a is None: raise ValueError("account not found")
-        if purge:
-            with self.lock:
-                active=[x for x in self.accounts if not x.deleted]
-                if a.deleted: return
-                if len(active)<=1: raise ValueError("at least one active account must remain")
-                a.deleted=True; a.enabled=False; a.set_browser_state("CLOSED","hard purge requested")
-                self.project_accounts={k:[x for x in ids if x!=a.id] for k,ids in self.project_accounts.items()}
-                self._save()
-            try:
-                if a.worker is not None: threading.Thread(target=a.worker.stop,daemon=True,name=f"purge-stop-{a.id}").start()
-                if a.profile.exists(): shutil.rmtree(a.profile,ignore_errors=False)
-            except Exception as exc:
-                self.event("error", f"account '{a.name}' profile purge failed: {exc}")
-                raise
-            self.event("warn", f"account '{a.name}' permanently purged")
-            return
+        """Permanently remove an account and every bridge-owned reference to it.
+
+        `purge` is retained only for API compatibility with older dashboard clients;
+        deletion is now always permanent.
+        """
+        del purge
+        if a is None:
+            raise ValueError("account not found")
         with self.lock:
-            active=[x for x in self.accounts if not x.deleted]
-            if a.deleted: return
-            if len(active)<=1: raise ValueError("at least one active account must remain")
-            a.deleted=True; a.enabled=False; a.set_browser_state("CLOSED","soft-deleted; profile retained")
-            self.project_accounts={k:[x for x in ids if x!=a.id] for k,ids in self.project_accounts.items()}
+            if a not in self.accounts:
+                return
+            account_id = a.id
+            account_name = a.name
+
+            # Mark disabled/closed before stopping the worker so the watchdog cannot
+            # race and resurrect an account that is in the middle of deletion.
+            a.enabled = False
+            a.logged_in = False
+            a.status = "disabled"
+            a.status_since = time.time()
+            try:
+                a.set_browser_state("CLOSED", "permanently deleted")
+            except Exception:
+                a.browser_state = "CLOSED"
+
+            # Remove all persistent/in-memory routing references while the account is
+            # still addressable by object identity. This includes project routing.
+            self.project_accounts = {
+                project: [x for x in ids if x != account_id]
+                for project, ids in self.project_accounts.items()
+            }
+            self.project_accounts = {project: ids for project, ids in self.project_accounts.items() if ids}
+            if self.routing.get("pinned") == account_id:
+                remaining = [x for x in self.accounts if x is not a and x.enabled and not x.deleted]
+                self.routing["pinned"] = remaining[0].id if remaining else None
+            if self.current == account_id:
+                remaining = [x for x in self.accounts if x is not a and x.enabled and not x.deleted]
+                self.current = remaining[0].id if remaining else None
+            if self._last_route == account_id:
+                self._last_route = None
+
+            # Remove from the live account registry before releasing the lock. Any new
+            # request can therefore never pick or address the deleted account.
+            self.accounts.remove(a)
             self._save()
-        if a.worker is not None: threading.Thread(target=a.worker.stop,daemon=True,name=f"soft-stop-{a.id}").start()
-        self.event("warn", f"account '{a.name}' soft-deleted; profile retained and restorable")
+
+        # A running web/account worker owns the Playwright browser context. Stop it
+        # synchronously so the browser cannot survive the deletion operation.
+        if a.worker is not None:
+            try:
+                a.worker.stop()
+            except Exception as exc:
+                self.event("warn", f"account '{account_name}' worker shutdown reported: {exc}")
+
+        # A deleted account can also be the owner of live swarm processes. Stop those
+        # processes cleanly and remove the deleted ID from all run metadata so future
+        # scheduler operations never try to address a missing account.
+        try:
+            with self.swarm.lock:
+                for run in list(self.swarm.runs.values()):
+                    run.opts["account_ids"] = [x for x in (run.opts.get("account_ids") or []) if x != account_id]
+                    for ag in run.agents:
+                        if ag.account_id != account_id:
+                            continue
+                        proc = ag.proc
+                        if proc is not None and proc.poll() is None:
+                            try:
+                                proc.terminate()
+                            except Exception:
+                                pass
+                        replacement = next((x for x in self.accounts if x.enabled and x.status == "ready"), None)
+                        ag.account_id = replacement.id if replacement is not None else ""
+                        if ag.status in SW_ACTIVE or ag.status == "queued":
+                            ag.status = "stopped"
+                            ag.note = f"account '{account_name}' was deleted"
+                        ag.add_log(f"account '{account_name}' was permanently deleted")
+        except Exception as exc:
+            self.event("warn", f"swarm cleanup for deleted account reported: {exc}")
+
+        # Remove the persisted usage/stats entry and the browser profile on disk.
+        self._remove_usage_account(account_id)
+        try:
+            self._remove_account_profile_path(a.profile)
+        except Exception as exc:
+            self.event("warn", f"account '{account_name}' profile cleanup reported: {exc}")
+
+        # Persist once more after the live cleanup so no stale account ID can be written
+        # back by a concurrent save callback.
+        with self.lock:
+            self.cfg["accounts"] = [x.to_cfg() for x in self.accounts]
+            self.cfg["routing"] = self.routing
+            self.cfg["project_accounts"] = self.project_accounts
+            save_config(self.cfg)
+        self.event("warn", f"account '{account_name}' permanently deleted")
 
     def restore_account(self, a: Account, start: bool = False) -> None:
-        if a is None: raise ValueError("account not found")
-        with self.lock:
-            a.deleted=False; a.enabled=True; a.status="stopped"; a.status_since=time.time()
-            a.set_browser_state("CREATED","restored"); self._save()
-        self.event("info", f"account '{a.name}' restored; profile preserved")
-        if start:
-            self.start_account(a, force_login=False)
+        """Legacy API compatibility: deleted accounts are no longer restorable."""
+        del start
+        raise ValueError("deleted accounts are permanent and cannot be restored; add the account again")
 
     def rename(self, a: Account, name: str) -> None:
         name = (name or "").strip()[:40]
@@ -6696,7 +6801,8 @@ def dash_action(pool: Any, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
                                int(data.get("tier") or 0), bool(data.get("headed", True)), True)
         return {"ok": True, "id": a.id}
     if action == "remove":
-        # Destructive purge is opt-in; the default UI operation is a reversible soft-delete.
+        # Dashboard deletion is always permanent. Keep accepting the old `purge` field
+        # from older clients, but the server no longer has a reversible delete mode.
         pool.remove_account(acct(), bool(data.get("purge", False)))
     elif action == "restore":
         pool.restore_account(acct(), start=bool(data.get("start", False)))
@@ -7465,7 +7571,7 @@ inuse:["در حال استفاده","IN USE"],pin:["قفل‌شده","PINNED"],u
 reset_convs:["ریست چت‌ها","Reset chats"],purge:["حذف چت‌ها","Purge chats"],rename:["تغییر نام","Rename"],remove:["حذف","Remove"],restore:["بازگردانی","Restore"],chatw:["گفتگو","Chat"],conn:["اتصال","Connect"],chats:["چت باز","open chats"],ago:["پیش","ago"],never:["—","—"],
 s_ready:["آماده","Ready"],s_busy:["در حال پاسخ","Generating"],s_cooldown:["استراحت","Cooling"],s_starting:["در حال اجرا","Starting"],s_login:["منتظر ورود","Waiting for login"],s_login_needed:["نیاز به ورود","Login needed"],s_error:["خطا","Error"],s_disabled:["غیرفعال","Disabled"],s_stopped:["متوقف","Stopped"],
 addTitle:["افزودن اکانت جدید","Add a new account"],addTip:["یک پنجره کروم باز می‌شود؛ در آن وارد DeepSeek شوید.","A Chrome window opens - log in to DeepSeek there."],create:["ساخت و ورود","Create & log in"],
-confirmRm:["این اکانت غیرفعال و حذف منطقی شود؟ پروفایل ورود نگه داشته می‌شود و امکان بازگردانی دارد.","Soft-delete this account? Its login profile will be retained and the account can be restored."],confirmPurge:["همه چت‌های ساخته‌شده توسط bridge در سایت DeepSeek حذف شوند؟","Delete every chat the bridge created on DeepSeek?"],
+confirmRm:["این اکانت به‌صورت کامل حذف شود؟ اطلاعات ورود، پروفایل مرورگر، آمار، مسیرهای پروژه و ارجاعات آن برای همیشه حذف می‌شوند.","Permanently delete this account? Its login profile, browser data, usage stats, project routing and references will be removed permanently."],confirmPurge:["همه چت‌های ساخته‌شده توسط bridge در سایت DeepSeek حذف شوند؟","Delete every chat the bridge created on DeepSeek?"],
 testing:["در حال تست…","Testing…"],okTest:["سالم","OK"],newName:["نام جدید","New name"],offline:["ارتباط با bridge قطع است","Lost connection to the bridge"],keyPrompt:["API key را وارد کنید","Enter the API key"],
 newchat:["گفتگوی جدید","New chat"],export:["خروجی","Export"],autoAcct:["خودکار (متعادل)","Auto (balanced)"],cph:["پیام بنویسید…  ( / برای دستورها )","Message…  ( / for commands )"],
 chint:["Enter ارسال · Shift+Enter خط جدید · / دستورها · فایل را بکشید و رها کنید یا Ctrl+V · Esc توقف","Enter send · Shift+Enter newline · / commands · drop files or Ctrl+V · Esc stop"],
@@ -7613,7 +7719,7 @@ function cardTpl(a){return `<div class="card" data-id="${a.id}"><div class="ch">
 <div class="bar"><i data-f="bar"></i></div><div data-f="spark"></div><div class="err" data-f="err"></div><div class="tip" data-f="chats"></div>
 <div class="act"><button class="btn sm pri" data-a="use">${t("use")}</button><button class="btn sm" data-a="chat">» ${t("chatw")}</button><button class="btn sm" data-a="connect">⌁ ${t("conn")}</button><button class="btn sm" data-a="test">${t("test")}</button>
 <details class="more"><summary class="btn sm">⋯</summary><div class="menu"><button data-a="edit">${t("editAcc")}</button><button data-a="login" data-web>${t("login")}</button><button data-a="show" data-f="bshow">${t("show")}</button><button data-a="hide" data-f="bhide">${t("hide")}</button><button data-a="restart">${t("restart")}</button>
-<button data-a="enable" data-f="ben">${t("enable")}</button><button data-a="disable" data-f="bdis">${t("disable")}</button><button data-a="reset_convs" data-web>${t("reset_convs")}</button><button data-a="purge" data-web>${t("purge")}</button><button data-a="rename">${t("rename")}</button><button data-a="up">▲</button><button data-a="down">▼</button><button class="dng" data-a="remove" data-f="remove">${t("remove")}</button><button data-a="restore" data-f="restore">${t("restore")}</button></div></details></div></div>`}
+<button data-a="enable" data-f="ben">${t("enable")}</button><button data-a="disable" data-f="bdis">${t("disable")}</button><button data-a="reset_convs" data-web>${t("reset_convs")}</button><button data-a="purge" data-web>${t("purge")}</button><button data-a="rename">${t("rename")}</button><button data-a="up">▲</button><button data-a="down">▼</button><button class="dng" data-a="remove" data-f="remove">${t("remove")}</button></div></details></div></div>`}
 const F=(el,f)=>el.querySelector(`[data-f=${f}]`),setf=(el,f,v)=>{const n=F(el,f);if(n&&n.textContent!==String(v))n.textContent=v};
 const pvIcon=id=>{const p=((INFO&&INFO.providers)||[]).find(x=>x.id===id);return p?p.icon:"⌁"};
 function spark(v){const m=Math.max(1,...v),w=240,H=34;return `<svg class="sp" viewBox="0 0 ${w} ${H}" preserveAspectRatio="none"><polyline fill="none" stroke="var(--ac)" stroke-width="1.7" stroke-linejoin="round" points="${v.map((x,i)=>(i*w/59).toFixed(1)+","+(H-2-x/m*(H-6)).toFixed(1)).join(" ")}"/></svg>`}
@@ -7621,7 +7727,7 @@ function updCard(el,a,tt){const s=a.stats;el.classList.toggle("cur",a.current);e
 F(el,"live").hidden=!a.current;F(el,"pin").hidden=!(S.settings.strategy==="pinned"&&a.pinned);const p=F(el,"pill");p.className="pill st-"+a.state;p.textContent=t("s_"+a.state)+(a.state==="cooldown"?" "+dur(a.cooldown_left):"");
 const v={tin:tok(s.in_tok),tout:tok(s.out_tok),today:tok(s.today_in+s.today_out),msgs:s.req,errs:s.err+" / "+s.rate_limits,avg:s.avg_s+"s",active:dur(s.active_s),streak:dur(s.streak_s)+(s.streak_live?" •":""),last:s.last_used_ago==null?t("never"):dur(s.last_used_ago)+" "+t("ago")};
 for(const k in v)setf(el,"kv_"+k,v[k]);F(el,"bar").style.width=((s.in_tok+s.out_tok)/tt*100).toFixed(0)+"%";F(el,"spark").innerHTML=spark(s.spark);
-setf(el,"err",a.status_err||(s.last_error&&s.last_error_ago<1800?s.last_error:""));const web=a.kind==="web";setf(el,"sub",pvIcon(a.provider)+" "+(web?"DeepSeek":a.model)+" · T"+a.tier+" "+stars(a.tier));const rm=F(el,"remove"),rs=F(el,"restore");if(rm)rm.hidden=!!a.deleted;if(rs)rs.hidden=!a.deleted;
+setf(el,"err",a.status_err||(s.last_error&&s.last_error_ago<1800?s.last_error:""));const web=a.kind==="web";setf(el,"sub",pvIcon(a.provider)+" "+(web?"DeepSeek":a.model)+" · T"+a.tier+" "+stars(a.tier));const rm=F(el,"remove");if(rm)rm.hidden=!!a.deleted;
 setf(el,"chats",web?a.chats+" "+t("chats")+(a.headed?" · □":""):"⚡ ×"+a.max_parallel+(a.cost>0||a.budget>0?" · $"+a.cost.toFixed(4)+(a.budget>0?" / $"+a.budget:""):""));
 el.querySelectorAll("[data-web]").forEach(b=>b.hidden=!web);F(el,"bshow").hidden=!web||a.headed;F(el,"bhide").hidden=!web||!a.headed;F(el,"ben").hidden=a.enabled;F(el,"bdis").hidden=!a.enabled}
 function renderDash(){const T=S.totals,A=S.accounts,st=S.settings;
@@ -7635,7 +7741,7 @@ $("#ev").innerHTML=S.events.map(e=>`<div class="${e.level}"><time>${new Date(e.t
 function renderChips(){const a=S.accounts.find(x=>x.current);$("#chips").innerHTML=`<span class="chip"><i class="dot ${S.ready?"":"off"}"></i>${S.ready}/${S.accounts.length}</span> <span class="chip">${t(S.settings.strategy)}</span>${a?` <span class="chip">▶ ${esc(a.name)}</span>`:""}`}
 let timer;async function tick(){clearTimeout(timer);try{S=await api("state");$("#off").style.display="none";renderChips();if(page==="dash")renderDash();if(page==="chat")fillAcct()}catch(e){if(e.status!==401){$("#off").textContent=t("offline");$("#off").style.display="block"}}timer=setTimeout(tick,document.hidden?8000:(dashStreamReady?4500:2200))}
 $("#grid").addEventListener("click",async e=>{const b=e.target.closest("button[data-a]");if(!b)return;const id=b.closest(".card").dataset.id,a=b.dataset.a,acc=S.accounts.find(x=>x.id===id);const dt=b.closest("details");if(dt)dt.removeAttribute("open");
-if(a==="remove"){if(await ask(t("confirmRm")))await act("remove",{id})}else if(a==="purge"){if(await ask(t("confirmPurge")))await act("purge",{id})}
+if(a==="remove"){if(await ask(t("confirmRm"))){const removedId=id;const r=await act("remove",{id});if(r!==false){if(chatAcctPref===removedId)chatAcctPref="";let changed=false;for(const c of chats){if(c.acct===removedId){c.acct="";changed=true}}if(connAcct===removedId)connAcct="";if(changed)persist();}}}
 else if(a==="rename"){const n=await inputBox(t("newName"),acc.name);if(n)await act("rename",{id,name:n})}else if(a==="up"||a==="down")await act("move",{id,dir:a==="up"?-1:1});
 else if(a==="chat"){chatAcctPref=id;go("chat")}else if(a==="connect"){connAcct=id;go("connect")}
 else if(a==="test"){toast(t("testing"));const r=await act("test",{id});if(r)toast(r.ok?`✓ ${acc.name}: ${t("okTest")} (${r.seconds}s)`:"× "+r.error)}else await act(a,{id});tick()});
@@ -9703,10 +9809,39 @@ def _selftest_multi() -> None:
         assert na.id.startswith("work-2") and len(pool.accounts) == 4
         pool.move(na, -1)
         assert pool.accounts[2] is na
+        deleted_profile = na.profile
+        deleted_id = na.id
         pool.remove_account(na, purge=False)
-        assert len(pool.accounts) == 4 and na.deleted and not na.enabled and pool.get("Work") is na
-        pool.restore_account(na, start=False)
-        assert not na.deleted and na.enabled and pool.get("Work") is na
+        assert len(pool.accounts) == 3 and pool.get("Work") is None
+        assert not deleted_profile.exists()
+        saved_after_delete = json.loads(CONFIG_PATH.read_text())
+        assert all(d["id"] != deleted_id for d in saved_after_delete["accounts"])
+        try:
+            pool.restore_account(na, start=False)
+            raise AssertionError("deleted accounts must not be restorable")
+        except ValueError as exc:
+            assert "permanent" in str(exc).lower()
+
+        # ---- permanent deletion cleans config, usage, routing, project mappings, and profile
+        extra = pool.add_account("Delete Me", start=False)
+        extra_profile = extra.profile
+        extra_profile.mkdir(parents=True, exist_ok=True)
+        usage_path = pool._usage_path()
+        usage_path.write_text(json.dumps({"version": 1, "accounts": {extra.id: {"req": 7}, "a": {"req": 2}}}), encoding="utf-8")
+        pool.set_project_accounts(str(proj), [extra.id, "a"])
+        pool.routing["pinned"] = extra.id
+        pool.current = extra.id
+        pool._last_route = extra.id
+        pool.remove_account(extra)
+        assert pool.get_by_id(extra.id) is None
+        assert extra.id not in pool.routing.get("pinned", "")
+        assert pool.current != extra.id and pool._last_route is None
+        assert extra.id not in sum(pool.project_accounts.values(), [])
+        assert not extra_profile.exists()
+        saved = json.loads(CONFIG_PATH.read_text())
+        assert extra.id not in {d["id"] for d in saved.get("accounts", [])}
+        usage = json.loads(usage_path.read_text(encoding="utf-8"))
+        assert extra.id not in usage.get("accounts", {}) and usage.get("accounts", {}).get("a", {}).get("req") == 2
 
         # ---- dashboard over real HTTP (auth, host / origin guard, actions, /ds interception)
         old_b, old_k = BRIDGE, API_KEY
@@ -11546,6 +11681,20 @@ def main() -> int:
     for nm in args.add_account or []:
         BRIDGE.add_account(nm, start=False)
     selected_ids = startup_prepare_accounts(BRIDGE, startup_choice, headed=bool(args.headed))
+
+    # --headed is a per-run hard requirement, including for accounts that already
+    # exist in the saved configuration. Previously it was only forwarded while
+    # creating a brand-new account, so an existing account could still launch
+    # headless and hide the login window.
+    if args.headed:
+        for aid in selected_ids:
+            account = BRIDGE.get_by_id(aid)
+            if account is not None and account.kind == "web":
+                account.headed = True
+        try:
+            BRIDGE._save()
+        except Exception:
+            pass
 
     # Dependency installation is deliberately after account selection. Dashboard-only,
     # empty Multi-AI, and other no-op selections must not trigger browser downloads.
