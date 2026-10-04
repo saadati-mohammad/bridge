@@ -1,11 +1,53 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DeepSeek Local Bridge V6.2
+DeepSeek Local Bridge V6.4
 ==========================
 
 Anthropic/OpenAI-compatible local gateway for Claude Code, backed by a real
 chat.deepseek.com browser session (Playwright).
+
+MULTI-INSTANCE MODEL
+--------------------
+One bridge process owns exactly one instance home, one config, one browser-profile set,
+one log/attachment tree and one TCP port. The default instance home is the folder containing
+this script. Use --instance DIR to choose another home. Run copies side by side with different
+ports, for example: `python bridge.py --instance C:\bridge-B --port 8789 --ai deepseek --panel`.
+An agent can launch another copy from another folder without sharing config, browser profiles,
+logs or swarm attachments. A port is reused only when /health proves it is the exact same
+script + instance home + config; a different instance on that port is a hard error.
+
+PORT PRECEDENCE
+---------------
+CLI --port > DS_BRIDGE_PORT > saved config `port` > DEFAULT_PORT (8788). CLI --port is
+process-local and is written only with --save-port. The env var likewise affects only the current run.
+Mode precedence remains Claude Code's own permission flag > --mode/--safe/--ask/--auto >
+DS_BRIDGE_MODE > saved mode > safe. `--panel` means foreground service/dashboard mode; combined
+with --ai it starts that provider and keeps the process in panel mode. With no --ai in a non-TTY
+launch, an enabled saved web account (prefer pinned) is used; otherwise the process exits non-zero
+and explains how to start it explicitly.
+
+INSTANCE CLI
+------------
+--instance/--instance-home, --instance-name, --list-instances [start-end], --save-port,
+--print-paths, --force-claude-commands, --install-commands-into.
+
+CURRENTLY HONORED DS_BRIDGE_* ENVIRONMENT VARIABLES
+----------------------------------------------------
+DS_BRIDGE_ACCOUNT_WAIT, DS_BRIDGE_ACCOUNTS_DIR, DS_BRIDGE_API_TIMEOUT, DS_BRIDGE_CHANNEL,
+DS_BRIDGE_CHARS_PER_TOKEN, DS_BRIDGE_CHAT_URL, DS_BRIDGE_CLAUDE_HOOK_EVENTS, DS_BRIDGE_CONFIG,
+DS_BRIDGE_COOLDOWN_BASE, DS_BRIDGE_COOLDOWN_MAX, DS_BRIDGE_DEBUG_DIR, DS_BRIDGE_DELETE_OLD_CHATS,
+DS_BRIDGE_DELTA_BLOCK_LIMIT, DS_BRIDGE_HEADLESS, DS_BRIDGE_HISTORY_BUDGET_CHARS, DS_BRIDGE_HOOK_KEY,
+DS_BRIDGE_HOOK_URL, DS_BRIDGE_KEEP_GOING, DS_BRIDGE_KEEP_GOING_MAX, DS_BRIDGE_KEEP_RECENT_MESSAGES,
+DS_BRIDGE_LOGIN_WAIT, DS_BRIDGE_MAX_CONTINUES, DS_BRIDGE_MAX_FILES, DS_BRIDGE_MAX_FILE_BYTES,
+DS_BRIDGE_MAX_HTTP_BODY_BYTES, DS_BRIDGE_MAX_KEPT_CONVS, DS_BRIDGE_MAX_PROMPT_CHARS, DS_BRIDGE_MAX_REPAIRS,
+DS_BRIDGE_MAX_REPLY_SECONDS, DS_BRIDGE_MAX_RETRIES, DS_BRIDGE_MAX_TABS, DS_BRIDGE_MODE, DS_BRIDGE_OLD_BLOCK_LIMIT,
+DS_BRIDGE_OPEN_DASH, DS_BRIDGE_PARALLEL_MODE, DS_BRIDGE_PARAM_DESC_LIMIT, DS_BRIDGE_POLL_SECONDS,
+DS_BRIDGE_PORT, DS_BRIDGE_PROFILE_DIR, DS_BRIDGE_READY_TIMEOUT, DS_BRIDGE_REQUEST_GAP, DS_BRIDGE_RETRY_BACKOFF_MAX,
+DS_BRIDGE_ROTATE_CHARS, DS_BRIDGE_STALL_TIMEOUT, DS_BRIDGE_SUBMIT_TIMEOUT, DS_BRIDGE_SWARM_AGENTS,
+DS_BRIDGE_SWARM_AGENT_TIMEOUT, DS_BRIDGE_SWARM_ATTACH_DIR, DS_BRIDGE_SWARM_FIX_ROUNDS, DS_BRIDGE_SWARM_MAX_AGENTS,
+DS_BRIDGE_SWARM_REVIEW, DS_BRIDGE_THINK_MODE, DS_BRIDGE_TOOL_DESC_LIMIT, DS_BRIDGE_UI_MODE,
+DS_BRIDGE_UI_PERFORMANCE, DS_BRIDGE_UPLOAD_TIMEOUT. Explicit path env vars remain overrides; defaults are instance-local.
 
 What is new in V6.2 (ACCOUNT TYPES, QUALITY TIERS, LIVE VIEW, PARALLEL AGENTS)
 ------------------------------------------------------------------------------
@@ -201,6 +243,8 @@ from __future__ import annotations
 import argparse
 import base64
 import concurrent.futures
+import contextvars
+import contextlib
 import hashlib
 import itertools
 import json
@@ -242,136 +286,32 @@ if os.name == "nt":
 
 
 # ============================================================================
-# Configuration
+# Configuration / per-instance runtime
 # ============================================================================
-
-_WARNED: set = set()
-
-
-def _warn_once(key: str, msg: str) -> None:
-    if key in _WARNED:
-        return
-    _WARNED.add(key)
-    try:
-        print(f"[warning] {msg}", file=sys.stderr, flush=True)
-    except Exception:
-        pass
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except Exception:
-        _warn_once(name, f"{name}={raw!r} is not an integer; using {default}")
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except Exception:
-        _warn_once(name, f"{name}={raw!r} is not a number; using {default}")
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in ("1", "true", "yes", "on")
-
 
 VERSION = "6.4"
 SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_PATH = Path(__file__).resolve()
 CHAT_URL = os.getenv("DS_BRIDGE_CHAT_URL", "https://chat.deepseek.com/")
-# Absolute + anchored to the script so the login survives different cwd's.
-PROFILE_DIR = Path(os.getenv("DS_BRIDGE_PROFILE_DIR", str(SCRIPT_DIR / "ds_profile"))).expanduser().resolve()
-CONFIG_PATH = Path(os.getenv("DS_BRIDGE_CONFIG", str(Path.home() / ".deepseek_bridge.json")))
-DEBUG_DIR = os.getenv("DS_BRIDGE_DEBUG_DIR", "")
-BROWSER_CHANNEL = os.getenv("DS_BRIDGE_CHANNEL", "chrome")
-# auto = try real headless first, fall back to a visible window; 1 = force
-# headless; 0 = always visible window.
-HEADLESS_MODE = os.getenv("DS_BRIDGE_HEADLESS", "auto").strip().lower()
-DEFAULT_PORT = _env_int("DS_BRIDGE_PORT", 8788)
-LOGIN_WAIT_SECONDS = _env_int("DS_BRIDGE_LOGIN_WAIT", 600)
-HEADLESS_READY_TIMEOUT = _env_int("DS_BRIDGE_READY_TIMEOUT", 20)
-# Native provider thinking is opt-in and intentionally disabled by default.
-THINK_MODE = _env_bool("DS_BRIDGE_THINK_MODE", False)
-
-# Prompt budgets (characters).
-MAX_PROMPT_CHARS = _env_int("DS_BRIDGE_MAX_PROMPT_CHARS", 800_000)
-# Budget for the *history* part of a brand new chat. System prompt and tool
-# schemas are budgeted separately, so a huge tool schema never wipes history.
-HISTORY_BUDGET_CHARS = _env_int("DS_BRIDGE_HISTORY_BUDGET_CHARS", 300_000)
-# When one DeepSeek chat has received this many characters, rotate to a fresh
-# chat (with a compacted history) instead of growing forever.
-ROTATE_CHARS = _env_int("DS_BRIDGE_ROTATE_CHARS", 700_000)
-KEEP_RECENT_MESSAGES_FULL = _env_int("DS_BRIDGE_KEEP_RECENT_MESSAGES", 12)
-BASE_BLOCK_LIMIT = _env_int("DS_BRIDGE_OLD_BLOCK_LIMIT", 6000)
-TOOL_DESC_LIMIT = _env_int("DS_BRIDGE_TOOL_DESC_LIMIT", 1800)
-PARAM_DESC_LIMIT = _env_int("DS_BRIDGE_PARAM_DESC_LIMIT", 300)
-
-# A single tool result / message block inside a *follow-up* (delta) prompt is
-# head+tail trimmed above this size, so one giant file dump can never push a
-# whole chat over the site's context window.
-DELTA_BLOCK_LIMIT = _env_int("DS_BRIDGE_DELTA_BLOCK_LIMIT", 150_000)
-# Claude Code permission mode: safe (default) | ask | auto  (see the module docstring).
-MODES = ("safe", "ask", "auto")
-DEFAULT_MODE = "safe"
-
-MAX_HTTP_BODY_BYTES = _env_int("DS_BRIDGE_MAX_HTTP_BODY_BYTES", 32 * 1024 * 1024)
-ATTACH_MAX_FILES = _env_int("DS_BRIDGE_MAX_FILES", 6)                       # files uploaded per message
-ATTACH_MAX_BYTES = _env_int("DS_BRIDGE_MAX_FILE_BYTES", 25 * 1024 * 1024)   # per file
-UPLOAD_TIMEOUT = _env_int("DS_BRIDGE_UPLOAD_TIMEOUT", 240)                  # seconds to wait for uploads
-SWARM_AGENTS = _env_int("DS_BRIDGE_SWARM_AGENTS", 0)                        # 0 = automatic (what the accounts can serve)
-SWARM_MAX_AGENTS = _env_int("DS_BRIDGE_SWARM_MAX_AGENTS", 6)
-SWARM_AGENT_TIMEOUT = _env_int("DS_BRIDGE_SWARM_AGENT_TIMEOUT", 3600)
-SWARM_FIX_ROUNDS = _env_int("DS_BRIDGE_SWARM_FIX_ROUNDS", 2)
-SWARM_REVIEW = os.getenv("DS_BRIDGE_SWARM_REVIEW", "auto")                  # auto | on | off
-SWARM_DIR_NAME = ".dsb-swarm"
-
-# Reply handling.
-STALL_TIMEOUT = _env_int("DS_BRIDGE_STALL_TIMEOUT", 900)      # no progress at all (long thinking is fine)
-MAX_REPLY_SECONDS = _env_int("DS_BRIDGE_MAX_REPLY_SECONDS", 10800)
-SUBMIT_TIMEOUT = _env_int("DS_BRIDGE_SUBMIT_TIMEOUT", 25)
-POLL_SECONDS = _env_float("DS_BRIDGE_POLL_SECONDS", 0.1)
-MAX_CONTINUES = _env_int("DS_BRIDGE_MAX_CONTINUES", 8)
-MAX_REPAIRS = _env_int("DS_BRIDGE_MAX_REPAIRS", 4)
-REQUEST_GAP_SECONDS = _env_float("DS_BRIDGE_REQUEST_GAP", 0.05)
-
-MAX_TABS = _env_int("DS_BRIDGE_MAX_TABS", 8)            # live browser tabs; older ones hibernate
-MAX_KEPT_CONVS = _env_int("DS_BRIDGE_MAX_KEPT_CONVS", 40)  # hibernated (tab closed, chat kept) conversations
-# V5.9: chats are KEPT by default (DeepSeek is free, nothing is gained by deleting them, and a
-# deleted chat can never be resumed).  Use /purge in the terminal, or set this to 1, to delete.
-DELETE_OLD_CHATS = _env_bool("DS_BRIDGE_DELETE_OLD_CHATS", False)
-# Transient failures (server busy, stall, empty reply) are retried this many times with backoff.
-MAX_RETRIES = _env_int("DS_BRIDGE_MAX_RETRIES", 6)
-RETRY_BACKOFF_MAX = _env_int("DS_BRIDGE_RETRY_BACKOFF_MAX", 60)
-# Passed to Claude Code so that very long tasks are not aborted client-side.
+DEFAULT_PORT = 8788
+LOGIN_WAIT_DEFAULT = 600
+HEADLESS_READY_TIMEOUT_DEFAULT = 20
 CLIENT_API_TIMEOUT_MS = "7200000"
 CLIENT_BASH_DEFAULT_TIMEOUT_MS = "1800000"
 CLIENT_BASH_MAX_TIMEOUT_MS = "7200000"
-CHARS_PER_TOKEN = _env_float("DS_BRIDGE_CHARS_PER_TOKEN", 4.0)
 
+PARALLEL_MODES = ("serial", "light", "full", "auto")
 PRIORITY_MAIN = 0
 PRIORITY_SIDE = 5
-
+if os.getenv("DS_BRIDGE_PARALLEL_MODE", "auto").strip().lower() not in PARALLEL_MODES:
+    _warn_bad = os.getenv("DS_BRIDGE_PARALLEL_MODE")
+    if _warn_bad:
+        print(f"[warning] DS_BRIDGE_PARALLEL_MODE={_warn_bad!r} is invalid; using auto", file=sys.stderr, flush=True)
+MODES = ("safe", "ask", "auto")
+DEFAULT_MODE = "safe"
+SWARM_DIR_NAME = ".dsb-swarm"
 BROWSER_STATES = ("CREATED", "STARTING", "LOGIN_REQUIRED", "READY", "BUSY",
                   "WAITING_RESPONSE", "RECOVERING", "FAILED", "CLOSED")
-PARALLEL_MODES = ("serial", "light", "full", "auto")
-PARALLEL_MODE = os.getenv("DS_BRIDGE_PARALLEL_MODE", "auto").strip().lower()
-if PARALLEL_MODE not in PARALLEL_MODES:
-    PARALLEL_MODE = "auto"
-UI_MODE = os.getenv("DS_BRIDGE_UI_MODE", "beginner").strip().lower()
-if UI_MODE not in ("beginner", "pro"):
-    UI_MODE = "beginner"
-
 CLAUDE_HOOK_EVENT_UNION = (
     "PreToolUse", "PermissionRequest", "PermissionDenied", "PostToolUse", "PostToolUseFailure",
     "PostToolBatch", "Notification", "UserPromptSubmit", "UserPromptExpansion", "SessionStart",
@@ -382,21 +322,385 @@ CLAUDE_HOOK_EVENT_UNION = (
 )
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except Exception:
+        print(f"[warning] {name}={raw!r} is not an integer; using {default}", file=sys.stderr, flush=True)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except Exception:
+        print(f"[warning] {name}={raw!r} is not a number; using {default}", file=sys.stderr, flush=True)
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_env_path(name: str, default: Path) -> Path:
+    raw = os.getenv(name)
+    return Path(raw).expanduser().resolve() if raw else default.expanduser().resolve()
+
+
+@dataclass(frozen=True)
+class InstancePaths:
+    """Every persistent path owned by exactly one bridge instance."""
+    script: Path
+    home: Path
+    config: Path
+    usage: Path
+    profile: Path
+    accounts: Path
+    log: Path
+    swarm_attachments: Path
+
+    def claude_settings(self, name: str) -> Path:
+        return self.config.with_name(f".deepseek_bridge_claude_{name}.json")
+
+    def keep_going_hook(self) -> Path:
+        return self.claude_settings("keepgoing").with_suffix(".py")
+
+
+def instance_paths(instance_home: Optional[Path] = None) -> InstancePaths:
+    home = (Path(instance_home).expanduser() if instance_home is not None else SCRIPT_DIR).resolve()
+    config = _resolve_env_path("DS_BRIDGE_CONFIG", home / ".deepseek_bridge.json")
+    profile = _resolve_env_path("DS_BRIDGE_PROFILE_DIR", home / "ds_profile")
+    accounts = _resolve_env_path("DS_BRIDGE_ACCOUNTS_DIR", home / "ds_profiles")
+    swarm = _resolve_env_path("DS_BRIDGE_SWARM_ATTACH_DIR", home / ".deepseek_bridge" / "swarm_attachments")
+    log_path = home / "bridge.log"
+    return InstancePaths(SCRIPT_PATH, home, config, config.with_name(".deepseek_bridge_usage.json"),
+                         profile, accounts, log_path, swarm)
+
+
+@dataclass
+class RuntimeState:
+    """All mutable bridge state for one process/instance.
+
+    No request or worker is allowed to mutate module-level runtime state. The HTTP
+    handler, Pool, worker threads, dashboard and swarm all bind to this object.
+    """
+    paths: InstancePaths
+    instance_name: str
+    cfg: Dict[str, Any] = field(default_factory=dict)
+    CONFIG_PATH: Path = field(init=False)
+    PROFILE_DIR: Path = field(init=False)
+    ACCOUNTS_DIR: Path = field(init=False)
+    SWARM_ATTACH_DIR: Path = field(init=False)
+    LOG_FILE: Any = None
+    LOG_RING: Any = field(default_factory=lambda: deque(maxlen=3000))
+    ACTIVITY: Any = field(default_factory=lambda: deque(maxlen=500))
+    CLAUDE_MIRROR: Any = field(default_factory=lambda: deque(maxlen=1200))
+    DASH_EVENT_SUBS: List[Any] = field(default_factory=list)
+    _WARNED: set = field(default_factory=set, repr=False)
+    _LOG_SEQ: Any = field(default_factory=lambda: itertools.count(1), repr=False)
+    _ACT_SEQ: Any = field(default_factory=lambda: itertools.count(1), repr=False)
+    DASH_EVENT_SEQ: Any = field(default_factory=lambda: itertools.count(1), repr=False)
+    DASH_EVENT_LOCK: Any = field(default_factory=threading.RLock, repr=False)
+    _dump_counter: Any = field(default_factory=lambda: itertools.count(1), repr=False)
+    _TASKS: set = field(default_factory=set, repr=False)
+    BRIDGE: Any = None
+    SERVER: Any = None
+    API_KEY: Optional[str] = None
+    DEBUG_DIR: str = ""
+    BROWSER_CHANNEL: str = "chrome"
+    HEADLESS_MODE: str = "auto"
+    LOGIN_WAIT_SECONDS: int = LOGIN_WAIT_DEFAULT
+    HEADLESS_READY_TIMEOUT: int = HEADLESS_READY_TIMEOUT_DEFAULT
+    THINK_MODE: bool = False
+    MAX_PROMPT_CHARS: int = 800_000
+    HISTORY_BUDGET_CHARS: int = 300_000
+    ROTATE_CHARS: int = 700_000
+    KEEP_RECENT_MESSAGES_FULL: int = 12
+    BASE_BLOCK_LIMIT: int = 6000
+    TOOL_DESC_LIMIT: int = 1800
+    PARAM_DESC_LIMIT: int = 300
+    DELTA_BLOCK_LIMIT: int = 150_000
+    MAX_HTTP_BODY_BYTES: int = 32 * 1024 * 1024
+    ATTACH_MAX_FILES: int = 6
+    ATTACH_MAX_BYTES: int = 25 * 1024 * 1024
+    UPLOAD_TIMEOUT: int = 240
+    SWARM_AGENTS: int = 0
+    SWARM_MAX_AGENTS: int = 6
+    SWARM_AGENT_TIMEOUT: int = 3600
+    SWARM_FIX_ROUNDS: int = 2
+    SWARM_REVIEW: str = "auto"
+    STALL_TIMEOUT: int = 900
+    MAX_REPLY_SECONDS: int = 10800
+    SUBMIT_TIMEOUT: int = 25
+    POLL_SECONDS: float = 0.1
+    MAX_CONTINUES: int = 8
+    MAX_REPAIRS: int = 4
+    REQUEST_GAP_SECONDS: float = 0.05
+    MAX_TABS: int = 8
+    MAX_KEPT_CONVS: int = 40
+    DELETE_OLD_CHATS: bool = False
+    MAX_RETRIES: int = 6
+    RETRY_BACKOFF_MAX: int = 60
+    CHARS_PER_TOKEN: float = 4.0
+    PRIORITY_MAIN: int = 0
+    PRIORITY_SIDE: int = 5
+    COOLDOWN_BASE: int = 120
+    COOLDOWN_MAX: int = 1800
+    ACCOUNT_WAIT_SECONDS: int = 120
+    STREAK_GAP: int = 300
+    DASH_AUTOOPEN: bool = True
+    UI_PERFORMANCE_MODE: str = "auto"
+    UI_MODE: str = "beginner"
+    PARALLEL_MODE: str = "auto"
+    KEEP_GOING: bool = True
+    KEEP_GOING_MAX: int = 400
+    RUN_MODE: str = "claude"
+    PANEL_ONLY: bool = False
+    COLOR_ENABLED: bool = True
+    RESOLVED_PORT: int = DEFAULT_PORT
+    PORT_SOURCE: str = "config"
+    PORT_PERSIST_ALLOWED: bool = False
+    PERSISTED_PORT: int = DEFAULT_PORT
+    CLAUDE_COMMANDS_DIR: Optional[Path] = None
+    FORCE_CLAUDE_COMMANDS: bool = False
+    SETTING_DEFAULTS: Dict[str, Any] = field(default_factory=dict)
+    PID: int = field(default_factory=os.getpid, init=False)
+    START_TIME: float = field(default_factory=time.time, init=False)
+
+    def __post_init__(self) -> None:
+        self.CONFIG_PATH = self.paths.config
+        self.PROFILE_DIR = self.paths.profile
+        self.ACCOUNTS_DIR = self.paths.accounts
+        self.SWARM_ATTACH_DIR = self.paths.swarm_attachments
+        self.DEBUG_DIR = os.getenv("DS_BRIDGE_DEBUG_DIR", "")
+        self.BROWSER_CHANNEL = os.getenv("DS_BRIDGE_CHANNEL", "chrome")
+        self.HEADLESS_MODE = os.getenv("DS_BRIDGE_HEADLESS", "auto").strip().lower()
+        if self.HEADLESS_MODE not in {"auto", "0", "1"}:
+            self.HEADLESS_MODE = "auto"
+        self.LOGIN_WAIT_SECONDS = _env_int("DS_BRIDGE_LOGIN_WAIT", LOGIN_WAIT_DEFAULT)
+        self.HEADLESS_READY_TIMEOUT = _env_int("DS_BRIDGE_READY_TIMEOUT", HEADLESS_READY_TIMEOUT_DEFAULT)
+        self.THINK_MODE = _env_bool("DS_BRIDGE_THINK_MODE", False)
+        self.MAX_PROMPT_CHARS = _env_int("DS_BRIDGE_MAX_PROMPT_CHARS", 800_000)
+        self.HISTORY_BUDGET_CHARS = _env_int("DS_BRIDGE_HISTORY_BUDGET_CHARS", 300_000)
+        self.ROTATE_CHARS = _env_int("DS_BRIDGE_ROTATE_CHARS", 700_000)
+        self.KEEP_RECENT_MESSAGES_FULL = _env_int("DS_BRIDGE_KEEP_RECENT_MESSAGES", 12)
+        self.BASE_BLOCK_LIMIT = _env_int("DS_BRIDGE_OLD_BLOCK_LIMIT", 6000)
+        self.TOOL_DESC_LIMIT = _env_int("DS_BRIDGE_TOOL_DESC_LIMIT", 1800)
+        self.PARAM_DESC_LIMIT = _env_int("DS_BRIDGE_PARAM_DESC_LIMIT", 300)
+        self.DELTA_BLOCK_LIMIT = _env_int("DS_BRIDGE_DELTA_BLOCK_LIMIT", 150_000)
+        self.MAX_HTTP_BODY_BYTES = _env_int("DS_BRIDGE_MAX_HTTP_BODY_BYTES", 32 * 1024 * 1024)
+        self.ATTACH_MAX_FILES = _env_int("DS_BRIDGE_MAX_FILES", 6)
+        self.ATTACH_MAX_BYTES = _env_int("DS_BRIDGE_MAX_FILE_BYTES", 25 * 1024 * 1024)
+        self.UPLOAD_TIMEOUT = _env_int("DS_BRIDGE_UPLOAD_TIMEOUT", 240)
+        self.SWARM_AGENTS = _env_int("DS_BRIDGE_SWARM_AGENTS", 0)
+        self.SWARM_MAX_AGENTS = _env_int("DS_BRIDGE_SWARM_MAX_AGENTS", 6)
+        self.SWARM_AGENT_TIMEOUT = _env_int("DS_BRIDGE_SWARM_AGENT_TIMEOUT", 3600)
+        self.SWARM_FIX_ROUNDS = _env_int("DS_BRIDGE_SWARM_FIX_ROUNDS", 2)
+        self.SWARM_REVIEW = os.getenv("DS_BRIDGE_SWARM_REVIEW", "auto")
+        self.STALL_TIMEOUT = _env_int("DS_BRIDGE_STALL_TIMEOUT", 900)
+        self.MAX_REPLY_SECONDS = _env_int("DS_BRIDGE_MAX_REPLY_SECONDS", 10800)
+        self.SUBMIT_TIMEOUT = _env_int("DS_BRIDGE_SUBMIT_TIMEOUT", 25)
+        self.POLL_SECONDS = _env_float("DS_BRIDGE_POLL_SECONDS", 0.1)
+        self.MAX_CONTINUES = _env_int("DS_BRIDGE_MAX_CONTINUES", 8)
+        self.MAX_REPAIRS = _env_int("DS_BRIDGE_MAX_REPAIRS", 4)
+        self.REQUEST_GAP_SECONDS = _env_float("DS_BRIDGE_REQUEST_GAP", 0.05)
+        self.MAX_TABS = _env_int("DS_BRIDGE_MAX_TABS", 8)
+        self.MAX_KEPT_CONVS = _env_int("DS_BRIDGE_MAX_KEPT_CONVS", 40)
+        self.DELETE_OLD_CHATS = _env_bool("DS_BRIDGE_DELETE_OLD_CHATS", False)
+        self.MAX_RETRIES = _env_int("DS_BRIDGE_MAX_RETRIES", 6)
+        self.RETRY_BACKOFF_MAX = _env_int("DS_BRIDGE_RETRY_BACKOFF_MAX", 60)
+        self.CHARS_PER_TOKEN = _env_float("DS_BRIDGE_CHARS_PER_TOKEN", 4.0)
+        self.PRIORITY_MAIN = 0
+        self.PRIORITY_SIDE = 5
+        self.COOLDOWN_BASE = _env_int("DS_BRIDGE_COOLDOWN_BASE", 120)
+        self.COOLDOWN_MAX = _env_int("DS_BRIDGE_COOLDOWN_MAX", 1800)
+        self.ACCOUNT_WAIT_SECONDS = _env_int("DS_BRIDGE_ACCOUNT_WAIT", 120)
+        self.DASH_AUTOOPEN = _env_bool("DS_BRIDGE_OPEN_DASH", True)
+        self.UI_PERFORMANCE_MODE = os.getenv("DS_BRIDGE_UI_PERFORMANCE", "auto").strip().lower()
+        if self.UI_PERFORMANCE_MODE not in {"auto", "balanced", "light", "max"}:
+            self.UI_PERFORMANCE_MODE = "auto"
+        self.UI_MODE = os.getenv("DS_BRIDGE_UI_MODE", "beginner").strip().lower()
+        if self.UI_MODE not in {"beginner", "pro"}:
+            self.UI_MODE = "beginner"
+        self.PARALLEL_MODE = os.getenv("DS_BRIDGE_PARALLEL_MODE", "auto").strip().lower()
+        if self.PARALLEL_MODE not in PARALLEL_MODES:
+            self.PARALLEL_MODE = "auto"
+        self.KEEP_GOING = _env_bool("DS_BRIDGE_KEEP_GOING", True)
+        self.KEEP_GOING_MAX = _env_int("DS_BRIDGE_KEEP_GOING_MAX", 400)
+
+
+_CURRENT_STATE: contextvars.ContextVar[Optional[RuntimeState]] = contextvars.ContextVar("ds_bridge_runtime_state", default=None)
+
+
+def _state() -> RuntimeState:
+    state = _CURRENT_STATE.get()
+    if state is None:
+        raise RuntimeError("DeepSeek Bridge runtime state is not bound; call main() or bind_runtime() first")
+    return state
+
+
+@contextlib.contextmanager
+def bind_runtime(state: RuntimeState):
+    token = _CURRENT_STATE.set(state)
+    try:
+        yield state
+    finally:
+        _CURRENT_STATE.reset(token)
+
+
+def _warn_once(key: str, msg: str) -> None:
+    state = _CURRENT_STATE.get()
+    if state is not None:
+        if key in state._WARNED:
+            return
+        state._WARNED.add(key)
+    try:
+        print(f"[warning] {msg}", file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def _runtime_instance_name() -> str:
+    return _state().instance_name
+
+
+def _runtime_paths_for(home: Path) -> InstancePaths:
+    return instance_paths(home)
+
+
+def make_runtime_state(instance_home: Optional[Path] = None, instance_name: Optional[str] = None,
+                       cfg: Optional[Dict[str, Any]] = None) -> RuntimeState:
+    paths = instance_paths(instance_home)
+    name = str(instance_name or paths.home.name or "bridge")
+    return RuntimeState(paths, name, dict(cfg or {}))
+
+
+def state_thread(*args: Any, **kwargs: Any) -> threading.Thread:
+    """Create a thread that inherits the current RuntimeState context."""
+    target = kwargs.get("target")
+    if target is not None:
+        ctx = contextvars.copy_context()
+        def runner(*a: Any, **k: Any) -> Any:
+            return ctx.run(target, *a, **k)
+        kwargs["target"] = runner
+    return threading.Thread(*args, **kwargs)
+
+
+@contextlib.contextmanager
+def config_file_lock(path: Path, timeout: float = 15.0):
+    """Cross-platform advisory lock for config read/modify/write sequences."""
+    lock_path = Path(path).with_suffix(Path(path).suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(lock_path, "a+b")
+    started = time.monotonic()
+    warned = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+            while True:
+                try:
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() - started >= timeout:
+                        raise TimeoutError(f"timed out waiting for config lock: {lock_path}")
+                    if not warned and time.monotonic() - started >= 3.0:
+                        _warn_once("config_lock_slow", f"waiting for config lock {lock_path} (>3s)")
+                        warned = True
+                    time.sleep(0.1)
+        else:
+            import fcntl
+            while True:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() - started >= timeout:
+                        raise TimeoutError(f"timed out waiting for config lock: {lock_path}")
+                    if not warned and time.monotonic() - started >= 3.0:
+                        _warn_once("config_lock_slow", f"waiting for config lock {lock_path} (>3s)")
+                        warned = True
+                    time.sleep(0.1)
+        yield f
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        f.close()
+
+
+def _save_config_unlocked(cfg: Dict[str, Any]) -> None:
+    path = _state().CONFIG_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def _legacy_config_path() -> Path:
+    return Path.home() / ".deepseek_bridge.json"
+
+
+def maybe_migrate_legacy_config() -> bool:
+    state = _state()
+    local = state.CONFIG_PATH
+    legacy = _legacy_config_path()
+    if local.exists() or not legacy.exists():
+        return False
+    # Seamless one-time upgrade only for the historical ~/bridge/ installation.
+    if state.paths.home != SCRIPT_DIR or SCRIPT_DIR.name.lower() != "bridge" or SCRIPT_DIR.parent.resolve() != Path.home().resolve():
+        return False
+    try:
+        local.parent.mkdir(parents=True, exist_ok=True)
+        with config_file_lock(local):
+            if local.exists():
+                return False
+            shutil.copy2(legacy, local)
+        print(f"[migration] copied legacy config {legacy} -> {local}; original left untouched", file=sys.stderr, flush=True)
+        return True
+    except Exception as exc:
+        _warn_once("legacy_migration", f"could not migrate legacy config {legacy} -> {local}: {exc}")
+        return False
+
 # ============================================================================
 # ANSI colours + logging
 # ============================================================================
 
 class C:
-    _on = True
-
     @classmethod
     def enable(cls, value: bool) -> None:
-        cls._on = bool(value)
+        state = _CURRENT_STATE.get()
+        if state is not None:
+            state.COLOR_ENABLED = bool(value)
 
     @classmethod
     def _w(cls, code: str, text: Any) -> str:
         s = str(text)
-        return f"\033[{code}m{s}\033[0m" if cls._on else s
+        state = _CURRENT_STATE.get()
+        enabled = state.COLOR_ENABLED if state is not None else True
+        return f"\033[{code}m{s}\033[0m" if enabled else s
 
     @classmethod
     def cyan(cls, t): return cls._w("96", t)
@@ -417,11 +721,6 @@ class C:
     def dim(cls, t): return cls._w("2", t)
 
 
-LOG_FILE = None  # set in Claude mode so bridge logs never corrupt Claude's TUI
-
-
-LOG_RING: "deque" = deque(maxlen=3000)
-_LOG_SEQ = itertools.count(1)
 _LOG_SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"),
     re.compile(r"(?i)(x-ds-bridge-hook-key\s*[:=]\s*)[^\s,;]+"),
@@ -447,9 +746,9 @@ def log(msg: str, color: Optional[Callable[[Any], str]] = None, *,
                         ("project", project), ("request_id", request_id), ("event", event)):
         if value:
             context[name] = _redact_log_text(value)
-    seq = next(_LOG_SEQ)
+    seq = next(_state()._LOG_SEQ)
     now = time.time()
-    LOG_RING.append((seq, now, lvl, safe_msg))
+    _state().LOG_RING.append((seq, now, lvl, safe_msg))
     try:
         item = {"n": seq, "t": now, "level": lvl, "message": safe_msg}
         if context:
@@ -457,29 +756,27 @@ def log(msg: str, color: Optional[Callable[[Any], str]] = None, *,
         emit_dash_event("console", item)
     except Exception:
         pass
-    line = time.strftime("%H:%M:%S ") + safe_msg
+    line = time.strftime("%H:%M:%S ") + f"[{_state().instance_name}] " + safe_msg
     if context:
         line += " " + " ".join(f"{k}={v!r}" for k, v in context.items())
-    if LOG_FILE is not None:
+    if _state().LOG_FILE is not None:
         try:
-            LOG_FILE.write(line + "\n")
-            LOG_FILE.flush()
+            _state().LOG_FILE.write(line + "\n")
+            _state().LOG_FILE.flush()
         except Exception:
             pass
         return
     print(color(line) if color else line, flush=True)
 
 
-_dump_counter = itertools.count(1)
-
 
 def dump_debug(kind: str, text: str) -> None:
-    if not DEBUG_DIR:
+    if not _state().DEBUG_DIR:
         return
     try:
-        d = Path(DEBUG_DIR)
+        d = Path(_state().DEBUG_DIR)
         d.mkdir(parents=True, exist_ok=True)
-        name = f"{time.strftime('%H%M%S')}-{next(_dump_counter):04d}-{kind}.txt"
+        name = f"{time.strftime('%H%M%S')}-{next(_state()._dump_counter):04d}-{kind}.txt"
         (d / name).write_text(text, encoding="utf-8", errors="replace")
     except Exception:
         pass
@@ -609,38 +906,42 @@ def fmt_dur(s: float) -> str:
 # ============================================================================
 
 def save_config(cfg: Dict[str, Any]) -> None:
+    """Atomically persist config while keeping a process-local port override transient."""
+    state = _state()
+    persist_cfg = dict(cfg)
+    if state.RESOLVED_PORT != state.PERSISTED_PORT and not state.PORT_PERSIST_ALLOWED:
+        persist_cfg["port"] = state.PERSISTED_PORT
     try:
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = CONFIG_PATH.with_suffix(CONFIG_PATH.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, CONFIG_PATH)
-        try:
-            os.chmod(CONFIG_PATH, 0o600)          # it now holds API keys
-        except Exception:
-            pass
+        with config_file_lock(state.CONFIG_PATH):
+            _save_config_unlocked(persist_cfg)
     except Exception as exc:
-        _warn_once("save_config", f"could not write {CONFIG_PATH} ({exc}); "
-                                  "a new API key will be generated on every start")
+        _warn_once("save_config", f"could not write {state.CONFIG_PATH} ({exc}); a new API key will be generated on every start")
 
 
 def load_config() -> Dict[str, Any]:
+    state = _state()
     cfg: Dict[str, Any] = {"port": DEFAULT_PORT, "api_key": None, "hook_key": None}
-    if CONFIG_PATH.exists():
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict): cfg.update(loaded)
-        except Exception as exc:
-            _warn_once("load_config", f"could not read {CONFIG_PATH} ({exc}); using defaults where needed")
-    changed = False
-    if not cfg.get("api_key"):
-        cfg["api_key"] = "sk-ds-local-" + secrets.token_hex(24); changed = True
-    if not cfg.get("hook_key"):
-        cfg["hook_key"] = "dsb-hook-" + secrets.token_urlsafe(32); changed = True
-    try: cfg["port"] = int(cfg.get("port", DEFAULT_PORT))
-    except Exception: cfg["port"] = DEFAULT_PORT; changed = True
-    if changed: save_config(cfg)
+    maybe_migrate_legacy_config()
+    try:
+        with config_file_lock(state.CONFIG_PATH):
+            if state.CONFIG_PATH.exists():
+                try:
+                    with open(state.CONFIG_PATH, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict): cfg.update(loaded)
+                except Exception as exc:
+                    _warn_once("load_config", f"could not read {state.CONFIG_PATH} ({exc}); using defaults where needed")
+            changed = False
+            if not cfg.get("api_key"):
+                cfg["api_key"] = "sk-ds-local-" + secrets.token_hex(24); changed = True
+            if not cfg.get("hook_key"):
+                cfg["hook_key"] = "dsb-hook-" + secrets.token_urlsafe(32); changed = True
+            try: cfg["port"] = int(cfg.get("port", DEFAULT_PORT))
+            except Exception: cfg["port"] = DEFAULT_PORT; changed = True
+            if changed:
+                _save_config_unlocked(cfg)
+    except Exception as exc:
+        _warn_once("load_config_lock", f"could not safely lock/read {state.CONFIG_PATH} ({exc}); using defaults where needed")
     return cfg
 
 
@@ -677,7 +978,7 @@ def estimate_tokens(obj: Any) -> int:
         n = len(json.dumps(obj, ensure_ascii=False, default=str))
     except Exception:
         n = len(str(obj))
-    return max(1, int(n / CHARS_PER_TOKEN))
+    return max(1, int(n / _state().CHARS_PER_TOKEN))
 
 
 def make_id(prefix: str = "toolu_") -> str:
@@ -1563,7 +1864,9 @@ class SafeTextStream:
 # Tools -> prompt text
 # ============================================================================
 
-def minify_schema(node: Any, desc_limit: int = PARAM_DESC_LIMIT, _depth: int = 0) -> Any:
+def minify_schema(node: Any, desc_limit: Optional[int] = None, _depth: int = 0) -> Any:
+    if desc_limit is None:
+        desc_limit = _state().PARAM_DESC_LIMIT
     if isinstance(node, (list, dict)) and _depth > 32:
         return [] if isinstance(node, list) else {}      # pathological nesting: never recurse forever
     if isinstance(node, list):
@@ -1618,7 +1921,7 @@ def build_tools_text(tools: Dict[str, Dict[str, Any]], tool_choice: Optional[Dic
         return ""
     lines = list(TOOL_GRAMMAR)
     for name, tool in tools.items():
-        desc = trim_text_boundary(str(tool.get("description", "") or ""), TOOL_DESC_LIMIT)
+        desc = trim_text_boundary(str(tool.get("description", "") or ""), _state().TOOL_DESC_LIMIT)
         schema = minify_schema(tool.get("input_schema") or tool.get("parameters") or {})
         lines.append(f"- {name}: {desc}")
         lines.append(f"  input schema: {compact_json(schema)}")
@@ -1711,7 +2014,7 @@ def compact_history(messages: List[Dict[str, Any]], budget: int) -> str:
         return joined
 
     n = len(messages)
-    tail_start = max(1, n - KEEP_RECENT_MESSAGES_FULL)
+    tail_start = max(1, n - _state().KEEP_RECENT_MESSAGES_FULL)
 
     def build(scale: float, tail_scale: Optional[float], drop: int) -> str:
         parts: List[str] = []
@@ -1721,14 +2024,14 @@ def compact_history(messages: List[Dict[str, Any]], budget: int) -> str:
                 omitted += 1
                 continue
             if idx == 0:
-                parts.append(render_message(m, int(BASE_BLOCK_LIMIT * 3 * scale)) if scale < 1 else full[0])
+                parts.append(render_message(m, int(_state().BASE_BLOCK_LIMIT * 3 * scale)) if scale < 1 else full[0])
             elif idx >= tail_start:
                 if tail_scale is None:
                     parts.append(full[idx])
                 else:
-                    parts.append(render_message(m, max(400, int(BASE_BLOCK_LIMIT * tail_scale))))
+                    parts.append(render_message(m, max(400, int(_state().BASE_BLOCK_LIMIT * tail_scale))))
             else:
-                parts.append(render_message(m, max(300, int(BASE_BLOCK_LIMIT * scale))))
+                parts.append(render_message(m, max(300, int(_state().BASE_BLOCK_LIMIT * scale))))
         if omitted:
             parts.insert(1, f"[{omitted} older messages omitted by DeepSeek Local Bridge to save context]")
         return "\n\n".join(parts)
@@ -1781,14 +2084,14 @@ def build_full_prompt(req: "NormReq", history_budget: int) -> str:
     if tools_text:
         parts.append("[TOOLS]\n" + tools_text)
     overhead = sum(len(p) for p in parts) + 400
-    budget = max(20_000, min(history_budget, MAX_PROMPT_CHARS - overhead))
+    budget = max(20_000, min(history_budget, _state().MAX_PROMPT_CHARS - overhead))
     parts.append("[TRANSCRIPT]\n" + compact_history(req.messages, budget))
     parts.append(TAIL)
     return "\n\n".join(parts)
 
 
 def build_delta_prompt(req: "NormReq", delta: List[Dict[str, Any]], tools_changed: bool) -> str:
-    parts = ["[NEW ITEMS SINCE YOUR LAST TURN]\n" + render_messages(delta, limit=DELTA_BLOCK_LIMIT or None)]
+    parts = ["[NEW ITEMS SINCE YOUR LAST TURN]\n" + render_messages(delta, limit=_state().DELTA_BLOCK_LIMIT or None)]
     if tools_changed and req.tools_text:
         parts.append("[TOOLS UPDATE - the available tools changed; this list replaces the old one]\n" + req.tools_text)
     parts.append(TAIL)
@@ -2096,7 +2399,7 @@ class AnthropicSSE:
         self._close_text()
         self._ev("message_delta", {"type": "message_delta",
                                     "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                                    "usage": {"output_tokens": max(1, int(self.out_chars / CHARS_PER_TOKEN))}})
+                                    "usage": {"output_tokens": max(1, int(self.out_chars / _state().CHARS_PER_TOKEN))}})
         self._ev("message_stop", {"type": "message_stop"})
 
     def error(self, etype: str, msg: str) -> None:
@@ -2555,11 +2858,12 @@ class DeepSeekWeb:
                  on_state: Optional[Callable[[str], None]] = None,
                  on_exchange: Optional[Callable[[int, int, float], None]] = None,
                  provider: str = "deepseek_web") -> None:
-        self.profile_dir = Path(profile_dir) if profile_dir else PROFILE_DIR
+        self.runtime_state = _state()
+        self.profile_dir = Path(profile_dir) if profile_dir else _state().PROFILE_DIR
         self.name = name
         self.provider = str(provider or "deepseek_web")
         self.recipe = WEB_RECIPES.get(self.provider, WEB_RECIPES["deepseek_web"])
-        self._think_pref_initial = bool(THINK_MODE and self.recipe.get("supports_think"))
+        self._think_pref_initial = bool(_state().THINK_MODE and self.recipe.get("supports_think"))
         self.headed_pref = headed          # keep the window visible (hands-on mode)
         self.on_state = on_state
         self.on_exchange = on_exchange
@@ -2610,7 +2914,7 @@ class DeepSeekWeb:
 
     @property
     def think_pref(self) -> bool:
-        return bool(THINK_MODE and self.recipe.get("supports_think"))
+        return bool(_state().THINK_MODE and self.recipe.get("supports_think"))
 
     # ---- launch -----------------------------------------------------------
 
@@ -2626,11 +2930,11 @@ class DeepSeekWeb:
         kwargs = dict(user_data_dir=str(profile), headless=headless, args=args,
                       viewport={"width": 1280, "height": 900}, locale="en-US",
                       ignore_default_args=["--enable-automation"])
-        if BROWSER_CHANNEL:
+        if _state().BROWSER_CHANNEL:
             try:
-                return self.pw.chromium.launch_persistent_context(channel=BROWSER_CHANNEL, **kwargs)
+                return self.pw.chromium.launch_persistent_context(channel=_state().BROWSER_CHANNEL, **kwargs)
             except Exception as exc:
-                log(f"[browser] channel '{BROWSER_CHANNEL}' failed ({exc}); using bundled chromium", C.yellow)
+                log(f"[browser] channel '{_state().BROWSER_CHANNEL}' failed ({exc}); using bundled chromium", C.yellow)
         return self.pw.chromium.launch_persistent_context(**kwargs)
 
     def _setup_page(self, page) -> None:
@@ -2806,27 +3110,27 @@ class DeepSeekWeb:
         # Never hide an account that may still need interactive authentication.
         # The persisted logged_in flag is only a hint; force_login and a missing
         # session must always use a visible browser until authentication succeeds.
-        allow_headless = HEADLESS_MODE != "0" and not self.headed_pref and bool(known_login)
+        allow_headless = _state().HEADLESS_MODE != "0" and not self.headed_pref and bool(known_login)
         tag = self.name or "account"
         ok = False
         if allow_headless and known_login:
             log(f"[startup:{tag}] trying real headless...", C.dim)
-            ok = self._boot(True, HEADLESS_READY_TIMEOUT)
+            ok = self._boot(True, _state().HEADLESS_READY_TIMEOUT)
             if ok:
                 log(f"[startup:{tag}] headless session ready.", C.green)
         if not ok and not self.abort:
             self._close()
             log(f"[startup:{tag}] opening a visible browser window...", C.dim)
-            ok = self._boot(False, LOGIN_WAIT_SECONDS, announce=True)
+            ok = self._boot(False, _state().LOGIN_WAIT_SECONDS, announce=True)
             if ok and allow_headless and (self._did_login or not known_login):
                 log(f"[startup:{tag}] login saved; trying headless again...", C.dim)
                 self._close()
                 self._minimize = True
-                if self._boot(True, HEADLESS_READY_TIMEOUT):
+                if self._boot(True, _state().HEADLESS_READY_TIMEOUT):
                     log(f"[startup:{tag}] headless session ready.", C.green)
                 else:
                     self._close()
-                    ok = self._boot(False, LOGIN_WAIT_SECONDS)
+                    ok = self._boot(False, _state().LOGIN_WAIT_SECONDS)
                     log(f"[startup:{tag}] headless is not accepted by the site; keeping a visible window.", C.yellow)
             elif ok:
                 log(f"[startup:{tag}] session ready (visible window).", C.green)
@@ -2849,9 +3153,9 @@ class DeepSeekWeb:
         except Exception: pass
         self._close()
         self.epoch += 1
-        if not self._boot(self.headless, HEADLESS_READY_TIMEOUT):
+        if not self._boot(self.headless, _state().HEADLESS_READY_TIMEOUT):
             self._close()
-            if not self._boot(False, HEADLESS_READY_TIMEOUT):
+            if not self._boot(False, _state().LOGIN_WAIT_SECONDS):
                 raise BridgeError("browser could not be restarted / login lost", "login")
 
     def ensure_alive(self) -> None:
@@ -3000,7 +3304,7 @@ class DeepSeekWeb:
             if (cancel is not None and cancel.is_set()) or self.abort:
                 raise BridgeCancelled()
             el = time.time() - t0
-            if el > UPLOAD_TIMEOUT:
+            if el > _state().UPLOAD_TIMEOUT:
                 raise BridgeError("file upload timed out", "timeout")
             st = page.evaluate(JS_UP_STATE) or {}
             if st.get("err"):
@@ -3082,7 +3386,7 @@ class DeepSeekWeb:
         raise BridgeError(f"{self._provider_name()} did not accept the message", "upstream")
 
     def _collect_generic(self, page, cancel, on_partial, before_count: int) -> str:
-        end=time.time()+MAX_REPLY_SECONDS; started=False; last=""; stable=0; seen_count=before_count
+        end=time.time()+_state().MAX_REPLY_SECONDS; started=False; last=""; stable=0; seen_count=before_count
         while time.time() < end:
             if cancel is not None and cancel.is_set():
                 raise BridgeCancelled()
@@ -3104,7 +3408,7 @@ class DeepSeekWeb:
                 stable += 1
             if started and not generating and last and stable >= 8:
                 return last
-            time.sleep(POLL_SECONDS if not last else min(0.35,max(POLL_SECONDS,0.15)))
+            time.sleep(_state().POLL_SECONDS if not last else min(0.35,max(_state().POLL_SECONDS,0.15)))
         raise BridgeError(f"timeout waiting for the {self._provider_name()} reply", "timeout")
 
     def _exchange_generic(self, page, prompt: str, cancel=None, on_partial=None, files: Optional[List[str]]=None) -> Exchange:
@@ -3124,7 +3428,7 @@ class DeepSeekWeb:
         try: before_count=int((page.evaluate(JS_GENERIC_SNAPSHOT) or {}).get("count") or 0)
         except Exception: before_count=0
         self._inject_generic(page, sel, prompt)
-        self._generic_submit(page, sel, cancel, SUBMIT_TIMEOUT + (UPLOAD_TIMEOUT if files else 0), before_count)
+        self._generic_submit(page, sel, cancel, _state().SUBMIT_TIMEOUT + (_state().UPLOAD_TIMEOUT if files else 0), before_count)
         reply=self._collect_generic(page, cancel, on_partial, before_count)
         sid=self.session_of(page)
         total=time.perf_counter()-t0
@@ -3138,8 +3442,8 @@ class DeepSeekWeb:
         return Exchange(text=reply, session_id=sid, seconds=total)
 
     def _submit(self, page, sel: str, seq0: int, cancel, timeout: Optional[float] = None) -> None:
-        timeout = timeout or SUBMIT_TIMEOUT
-        long_wait = timeout > SUBMIT_TIMEOUT        # files: the send button stays disabled while they are parsed
+        timeout = timeout or _state().SUBMIT_TIMEOUT
+        long_wait = timeout > _state().SUBMIT_TIMEOUT        # files: the send button stays disabled while they are parsed
         page.keyboard.press("Enter")
         t0 = time.time()
         pressed, clicked = 1, False
@@ -3218,18 +3522,18 @@ class DeepSeekWeb:
                             "sessionId": st.get("sessionId"), "status": st.get("status")}
             elif now - t_start > need_start:
                 raise NotStarted("no generation started", "upstream")
-            if now - last_progress > STALL_TIMEOUT:
+            if now - last_progress > _state().STALL_TIMEOUT:
                 self._stop_generation(page)
-                raise BridgeError(f"DeepSeek stalled for {STALL_TIMEOUT}s", "timeout")
-            if now - t_start > MAX_REPLY_SECONDS:
+                raise BridgeError(f"DeepSeek stalled for {_state().STALL_TIMEOUT}s", "timeout")
+            if now - t_start > _state().MAX_REPLY_SECONDS:
                 self._stop_generation(page)
                 raise BridgeError("reply exceeded the maximum duration", "timeout")
             # While the model is silent (thinking) every poll is a wasted CDP round-trip.
-            time.sleep(POLL_SECONDS if now - last_progress < 3 else max(POLL_SECONDS, 0.3))
+            time.sleep(_state().POLL_SECONDS if now - last_progress < 3 else max(_state().POLL_SECONDS, 0.3))
 
     def _collect_dom(self, page, before: int, cancel, on_partial) -> str:
         """Fallback when the network hook is unavailable."""
-        end = time.time() + MAX_REPLY_SECONDS
+        end = time.time() + _state().MAX_REPLY_SECONDS
         last, stable, started = "", 0, False
         while time.time() < end:
             if cancel is not None and cancel.is_set():
@@ -3247,11 +3551,11 @@ class DeepSeekWeb:
                 stable += 1
             if started and last and stable >= 25:
                 return last
-            time.sleep(POLL_SECONDS)
+            time.sleep(_state().POLL_SECONDS)
         raise BridgeError("timeout waiting for the reply (DOM mode)", "timeout")
 
     def exchange(self, page, prompt: str, cancel=None, on_partial=None, files: Optional[List[str]] = None) -> Exchange:
-        if len(prompt) > MAX_PROMPT_CHARS + 20_000:
+        if len(prompt) > _state().MAX_PROMPT_CHARS + 20_000:
             raise BridgeError(f"prompt too large ({len(prompt):,} chars)", "bad_request")
         self.ensure_alive()
         self._transition("BUSY", "request accepted")
@@ -3272,7 +3576,7 @@ class DeepSeekWeb:
             raise BridgeError("the browser tab was closed", "upstream")
         if not self._has_token(page):
             raise BridgeError("DeepSeek login expired. Click Login for this account on the dashboard (or restart the bridge).", "login")
-        gap = REQUEST_GAP_SECONDS - (time.time() - self._last_finished)
+        gap = _state().REQUEST_GAP_SECONDS - (time.time() - self._last_finished)
         if gap > 0:
             time.sleep(gap)
         t0 = time.perf_counter()
@@ -3302,7 +3606,7 @@ class DeepSeekWeb:
         inj = time.perf_counter() - t_inj
         if hook:
             self._transition("WAITING_RESPONSE", "provider generation active")
-            self._submit(page, sel, seq0, cancel, UPLOAD_TIMEOUT if files else None)
+            self._submit(page, sel, seq0, cancel, _state().UPLOAD_TIMEOUT if files else None)
         else:
             page.keyboard.press("Enter")
         log(f"[send] {n:,} chars injected in {inj:.2f}s ({'hook' if hook else 'DOM fallback'})", C.dim)
@@ -3310,10 +3614,10 @@ class DeepSeekWeb:
         session_id: Optional[str] = None
         if hook:
             acc, seq_after = "", seq0
-            for i in range(MAX_CONTINUES + 1):
+            for i in range(_state().MAX_CONTINUES + 1):
                 try:
                     r = self._run_wait(page, seq_after, cancel, on_partial, acc,
-                                       need_start=SUBMIT_TIMEOUT if i == 0 else 15)
+                                       need_start=_state().SUBMIT_TIMEOUT if i == 0 else 15)
                 except NotStarted:
                     if i == 0:
                         raise BridgeError("the message was sent but no reply started", "upstream")
@@ -3321,7 +3625,7 @@ class DeepSeekWeb:
                 acc += r["text"]
                 session_id = r["sessionId"] or session_id
                 seq_after = r["seq"]
-                if not (r["incomplete"] and acc.strip()) or i == MAX_CONTINUES:
+                if not (r["incomplete"] and acc.strip()) or i == _state().MAX_CONTINUES:
                     break
                 log(f"[reply] stream ended as '{r.get('status')}'; pressing Continue ({i + 1})", C.yellow)
                 try:
@@ -3384,7 +3688,7 @@ def extract_attachments(messages: List[Dict[str, Any]], start: int, limit: Optio
         c = m.get("content")
         if m.get("role") == "user" and isinstance(c, list):
             walk(c)
-    return found[-(limit or ATTACH_MAX_FILES):]
+    return found[-(limit or _state().ATTACH_MAX_FILES):]
 
 
 def write_attachments(found: List[Tuple[str, str, str, str]], directory: str) -> List[str]:
@@ -3395,7 +3699,7 @@ def write_attachments(found: List[Tuple[str, str, str, str]], directory: str) ->
             raw = base64.b64decode(data)
         except Exception:
             continue
-        if not raw or len(raw) > ATTACH_MAX_BYTES:
+        if not raw or len(raw) > _state().ATTACH_MAX_BYTES:
             log(f"[files] skipped a file ({len(raw):,} bytes): empty or larger than the limit", C.yellow)
             continue
         ext = _MIME_EXT.get(mime.lower(), ".png" if kind == "image" else ".bin")
@@ -3503,7 +3807,7 @@ class Engine:
     def _schedule_delete(self, sid: Optional[str], force: bool = False) -> None:
         if getattr(self.ds, "provider", "deepseek_web") != "deepseek_web":
             return
-        if sid and (DELETE_OLD_CHATS or force) and sid in self.created_sessions:
+        if sid and (_state().DELETE_OLD_CHATS or force) and sid in self.created_sessions:
             self.pending_delete.append(sid)
 
     def idle(self) -> None:
@@ -3545,7 +3849,7 @@ class Engine:
         self.ds.close_page(conv.page)
         conv.page = None
         hib = [c for c in self.convs if c.page is None]
-        while len(hib) > MAX_KEPT_CONVS:
+        while len(hib) > _state().MAX_KEPT_CONVS:
             oldest = min(hib, key=lambda c: c.last_used)
             hib.remove(oldest)
             self._drop(oldest)
@@ -3553,7 +3857,7 @@ class Engine:
     def _make_room(self, exclude: Optional[Conversation] = None) -> None:
         while True:
             live = [c for c in self.convs if c.page is not None and c is not exclude]
-            if len(live) < MAX_TABS:
+            if len(live) < _state().MAX_TABS:
                 return
             oldest = min(live, key=lambda c: c.last_used)
             log(f"[conv] tab limit reached; hibernating conversation {oldest.cid} (chat is kept)", C.dim)
@@ -3755,7 +4059,7 @@ class Engine:
         clean, calls, problems = parse_tool_calls(raw, req.tools)
         self._tool_choice_problems(req, calls, problems)
         repairs = 0
-        while problems and repairs < MAX_REPAIRS:
+        while problems and repairs < _state().MAX_REPAIRS:
             repairs += 1
             log(f"[repair {repairs}] {problems[0][:150]}", C.yellow)
             rp = build_repair_prompt(problems, [c["name"] for c in calls])
@@ -3868,7 +4172,7 @@ class Engine:
         if req.side:
             return self._process_side(req, cancel, on_partial)
         conv = self._find_conv(req)
-        budget = HISTORY_BUDGET_CHARS
+        budget = _state().HISTORY_BUDGET_CHARS
         attempt = 0
         while True:
             if conv is not None and conv.page is None and not self._wake(conv):
@@ -3878,7 +4182,7 @@ class Engine:
             if cont:
                 delta = req.messages[conv.n + 1:]
                 prompt = build_delta_prompt(req, delta, tools_changed=(req.tools_sig != conv.tools_sig))
-                if conv.chars_sent + len(prompt) > ROTATE_CHARS:
+                if conv.chars_sent + len(prompt) > _state().ROTATE_CHARS:
                     log(f"[conv {conv.cid}] chat is getting long; rotating to a fresh chat", C.yellow)
                     if getattr(self.ds, "provider", "deepseek_web") != "deepseek_web":
                         if not self._fresh_generic_chat(conv, reason="size cap"):
@@ -3917,15 +4221,15 @@ class Engine:
                 conv = None
                 attempt += 1
                 self._note_err(exc.kind, str(exc))
-                if exc.kind in ("login", "bad_request") or attempt > MAX_RETRIES:
+                if exc.kind in ("login", "bad_request") or attempt > _state().MAX_RETRIES:
                     raise
                 if self._alt_available() and (exc.kind == "rate_limit" or attempt >= 2):
                     log("[failover] handing the request to another account", C.yellow)
                     raise
                 if not cont and attempt <= 2:
                     budget = max(40_000, budget // 2)
-                wait = 0.0 if exc.kind == "chat_full" else (min(RETRY_BACKOFF_MAX, 2 ** attempt * 2) if attempt > 1 else 0.5)
-                log(f"[retry {attempt}/{MAX_RETRIES}] waiting {wait:.0f}s before trying again", C.yellow)
+                wait = 0.0 if exc.kind == "chat_full" else (min(_state().RETRY_BACKOFF_MAX, 2 ** attempt * 2) if attempt > 1 else 0.5)
+                log(f"[retry {attempt}/{_state().MAX_RETRIES}] waiting {wait:.0f}s before trying again", C.yellow)
                 t_end = time.time() + wait
                 while time.time() < t_end:
                     if cancel is not None and cancel.is_set():
@@ -3977,7 +4281,7 @@ class Engine:
             page = self.ds.scratch
             self.ds.open_chat(page)
             lane_note = "scratch chat"
-        prompt = build_full_prompt(req, HISTORY_BUDGET_CHARS)
+        prompt = build_full_prompt(req, _state().HISTORY_BUDGET_CHARS)
         log(f"[side] {lane_note}, prompt {len(prompt):,} chars", C.cyan)
         ex = self.ds.exchange(page, prompt, cancel, on_partial)
         if ex.session_id:
@@ -4036,7 +4340,7 @@ class Bridge:
         self.acct, self.pool, self.force_login = acct, pool, force_login
         self.ds: Optional[DeepSeekWeb] = None
         self.engine: Optional[Engine] = None
-        self._thread = threading.Thread(target=self._run, daemon=True,
+        self._thread = state_thread(target=self._run, daemon=True,
                                         name=f"DeepSeekWorker-{getattr(acct, 'id', 'main')}")
         if autostart:
             self._thread.start()
@@ -4241,7 +4545,7 @@ def http_json(method: str, url: str, headers: Dict[str, str], body: Optional[Dic
             result["exc"] = exc
         finally:
             done.set()
-    threading.Thread(target=run, daemon=True, name="api-http").start()
+    state_thread(target=run, daemon=True, name="api-http").start()
     while not done.wait(0.3):
         if (cancel is not None and cancel.is_set()) or (abort is not None and abort.is_set()):
             raise BridgeCancelled()
@@ -4337,14 +4641,14 @@ def apply_think_mode(body: Dict[str, Any], account: Any) -> Dict[str, Any]:
     provider=str(getattr(account,"provider","") or "")
     model=str(getattr(account,"model","") or "").strip()
     if provider == "deepseek_api":
-        enabled = bool(THINK_MODE)
+        enabled = bool(_state().THINK_MODE)
         body["thinking"]={"type":"enabled" if enabled else "disabled"}
         # DeepSeek currently rejects `required` / named tool choices while thinking is enabled.
         # Preserve tool calling by relaxing only that incompatible selection to the provider-safe `auto`.
         if enabled and body.get("tools") and body.get("tool_choice") not in (None, "auto", "none"):
             body["tool_choice"]="auto"
     elif provider == "openai" and re.match(r"^(gpt-5(?:[.-].*)?|o[1-4](?:[.-].*)?)$", model, re.I):
-        body["reasoning_effort"]="high" if THINK_MODE else "low"
+        body["reasoning_effort"]="high" if _state().THINK_MODE else "low"
     return body
 
 
@@ -4457,9 +4761,9 @@ class ApiEngine:
                 raise
             except BridgeError as exc:
                 a.stats.note_err(exc.kind, str(exc))
-                if exc.kind in ("login", "bad_request") or attempt > MAX_RETRIES or self._alt():
+                if exc.kind in ("login", "bad_request") or attempt > _state().MAX_RETRIES or self._alt():
                     raise
-                end = time.time() + min(RETRY_BACKOFF_MAX, 2 ** attempt)
+                end = time.time() + min(_state().RETRY_BACKOFF_MAX, 2 ** attempt)
                 while time.time() < end:
                     if (cancel is not None and cancel.is_set()) or self.abort.is_set():
                         raise BridgeCancelled()
@@ -4478,7 +4782,7 @@ class ApiWorker:
         self._ready = threading.Event()
         self._ex = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(acct.max_parallel or 1)),
                                                          thread_name_prefix=f"api-{acct.id}")
-        self._thread = threading.Thread(target=self._run, daemon=True, name=f"ApiWorker-{acct.id}")
+        self._thread = state_thread(target=self._run, daemon=True, name=f"ApiWorker-{acct.id}")
         if autostart:
             self._thread.start()
 
@@ -4512,7 +4816,8 @@ class ApiWorker:
             if cancel is not None and cancel.is_set():
                 raise BridgeCancelled()
             return fn(self.engine)
-        return self._ex.submit(call)
+        ctx = contextvars.copy_context()
+        return self._ex.submit(lambda: ctx.run(call))
 
     def stop(self) -> None:
         self.stopping = True
@@ -4527,21 +4832,15 @@ class ApiWorker:
 # Live activity feed: a read-only mirror of what Claude Code (or any client) is doing
 # ============================================================================
 
-ACTIVITY: "deque" = deque(maxlen=500)
-_ACT_SEQ = itertools.count(1)
-DASH_EVENT_SEQ = itertools.count(1)
-DASH_EVENT_LOCK = threading.Lock()
-DASH_EVENT_SUBS: List["queue.Queue[Dict[str, Any]]"] = []
-CLAUDE_MIRROR: "deque" = deque(maxlen=1200)
 
 
 def emit_dash_event(kind: str, payload: Dict[str, Any]) -> None:
     """Broadcast a bounded real-time dashboard event without adding polling load."""
-    event = {"id": next(DASH_EVENT_SEQ), "t": time.time(), "kind": str(kind), "data": payload}
-    CLAUDE_MIRROR.append(event)
-    with DASH_EVENT_LOCK:
+    event = {"id": next(_state().DASH_EVENT_SEQ), "t": time.time(), "kind": str(kind), "data": payload}
+    _state().CLAUDE_MIRROR.append(event)
+    with _state().DASH_EVENT_LOCK:
         dead: List["queue.Queue[Dict[str, Any]]"] = []
-        for q in list(DASH_EVENT_SUBS):
+        for q in list(_state().DASH_EVENT_SUBS):
             try:
                 q.put_nowait(event)
             except queue.Full:
@@ -4551,19 +4850,19 @@ def emit_dash_event(kind: str, payload: Dict[str, Any]) -> None:
                 except Exception:
                     dead.append(q)
         for q in dead:
-            if q in DASH_EVENT_SUBS:
-                DASH_EVENT_SUBS.remove(q)
+            if q in _state().DASH_EVENT_SUBS:
+                _state().DASH_EVENT_SUBS.remove(q)
 
 
 def add_dash_subscription(q: "queue.Queue[Dict[str, Any]]") -> None:
-    with DASH_EVENT_LOCK:
-        DASH_EVENT_SUBS.append(q)
+    with _state().DASH_EVENT_LOCK:
+        _state().DASH_EVENT_SUBS.append(q)
 
 
 def remove_dash_subscription(q: "queue.Queue[Dict[str, Any]]") -> None:
-    with DASH_EVENT_LOCK:
-        if q in DASH_EVENT_SUBS:
-            DASH_EVENT_SUBS.remove(q)
+    with _state().DASH_EVENT_LOCK:
+        if q in _state().DASH_EVENT_SUBS:
+            _state().DASH_EVENT_SUBS.remove(q)
 
 
 _PRIMARY_ARG = ("command", "file_path", "path", "pattern", "url", "query", "description", "prompt", "text")
@@ -4613,14 +4912,14 @@ def record_activity(req: Any, outcome: Optional[Outcome], secs: float, in_tokens
         tin, tout = (outcome.usage if outcome is not None and outcome.usage else
                      (in_tokens, estimate_tokens([outcome.text, outcome.calls]) if outcome is not None else 0))
         item = {
-            "n": next(_ACT_SEQ), "t": time.time(), "tag": req.tag or "", "role": req.role or "",
+            "n": next(_state()._ACT_SEQ), "t": time.time(), "tag": req.tag or "", "role": req.role or "",
             "kind": "agent" if req.tag else ("side" if req.side else "main"), "model": req.model,
             "account": getattr(outcome, "account", "") if outcome is not None else "",
             "tier": getattr(outcome, "tier", 0) if outcome is not None else 0, "secs": round(secs, 1),
             "tin": int(tin), "tout": int(tout), "msgs": len(req.messages), "stream": req.stream,
             "user": summarize_last(req), "reply": (outcome.text[:1500] if outcome is not None else ""),
             "calls": [_brief_call(c) for c in (outcome.calls if outcome is not None else [])][:8], "err": err[:300]}
-        ACTIVITY.append(item)
+        _state().ACTIVITY.append(item)
         emit_dash_event("activity", item)
     except Exception:
         pass
@@ -4884,23 +5183,23 @@ class Swarm:
             self._n += 1
             rid = f"sw{self._n}-{secrets.token_hex(2)}"
         if str(agents) in ("auto", "", "0"):
-            n = SWARM_AGENTS if SWARM_AGENTS > 0 else self.pool.parallel_capacity(selected_accounts, PARALLEL_MODE)
+            n = _state().SWARM_AGENTS if _state().SWARM_AGENTS > 0 else self.pool.parallel_capacity(selected_accounts, _state().PARALLEL_MODE)
         else:
             n = int(agents)
-        n = max(1, min(SWARM_MAX_AGENTS, n or 1))
+        n = max(1, min(_state().SWARM_MAX_AGENTS, n or 1))
         run = SwarmRun(rid, goal, top, base, branch, {"agents": n, "mode": mode or _norm_mode(self.pool.cfg.get("permission_mode")) or DEFAULT_MODE,
                                                        "strict": bool(strict), "tasks_text": tasks_text,
-                                                       "attachments": list(attachments or [])[:ATTACH_MAX_FILES],
+                                                       "attachments": list(attachments or [])[:_state().ATTACH_MAX_FILES],
                                                        "account_ids": list(dict.fromkeys(selected_accounts))})
         run.verify = verify or "auto"
         self.pool.set_project_accounts(str(top), list(dict.fromkeys(selected_accounts)))
-        rv = (review or SWARM_REVIEW).lower()
+        rv = (review or _state().SWARM_REVIEW).lower()
         run.review_on = rv == "on" or (rv == "auto" and len({a.tier for a in self.pool.accounts if a.usable()}) > 1)
         with self.lock:
             self.runs[rid] = run
         run.ev(f"started on {branch} @ {base[:8]} with up to {n} agent(s)")
         self.pool.event("ok", f"swarm {rid} started: {goal[:80]}")
-        threading.Thread(target=self._drive, args=(run,), daemon=True, name=f"swarm-{rid}").start()
+        state_thread(target=self._drive, args=(run,), daemon=True, name=f"swarm-{rid}").start()
         return run
 
     # ---- driver ------------------------------------------------------------------
@@ -4970,7 +5269,7 @@ class Swarm:
                          and all(run.get(d) is None or run.get(d).status in ("merged", "done") for d in a.deps)]
                 for a in ready[:max(0, max(1, run.max_agents) - active)]:
                     a.status = "starting"
-                    threading.Thread(target=self._agent_main, args=(run, a), daemon=True, name=f"agent-{run.id}-{a.id}").start()
+                    state_thread(target=self._agent_main, args=(run, a), daemon=True, name=f"agent-{run.id}-{a.id}").start()
                 if all(a.status in SW_DONE for a in run.agents):
                     return
             time.sleep(0.4)
@@ -5012,7 +5311,7 @@ class Swarm:
         p = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", creationflags=flags)
         ag.proc = p
-        timer = threading.Timer(SWARM_AGENT_TIMEOUT, lambda: p.kill())
+        timer = threading.Timer(_state().SWARM_AGENT_TIMEOUT, lambda: p.kill())
         timer.daemon = True
         timer.start()
         try:
@@ -5168,7 +5467,7 @@ class Swarm:
                 ag.status = "verifying"
                 ok, cmd, out = self._verify(run, ag, wt)
                 ag.verify_ok, ag.verify_out = ok, out
-                if ok is not False or rounds >= SWARM_FIX_ROUNDS:
+                if ok is not False or rounds >= _state().SWARM_FIX_ROUNDS:
                     break
                 rounds += 1
                 ag.attempts = rounds + 1
@@ -5239,7 +5538,7 @@ class Swarm:
             while True:
                 ok, cmd, out = self._verify(run, None, run.merge_dir)
                 run.final_verify = {"ok": ok, "cmd": cmd, "out": out[-1500:]}
-                if ok is not False or rounds >= SWARM_FIX_ROUNDS or run.stop.is_set():
+                if ok is not False or rounds >= _state().SWARM_FIX_ROUNDS or run.stop.is_set():
                     break
                 rounds += 1
                 run.ev(f"integration check failed - integrator round {rounds}")
@@ -5265,7 +5564,7 @@ class Swarm:
     # ---- controls ----------------------------------------------------------------
 
     def set_agents(self, run: SwarmRun, n: int) -> None:
-        run.max_agents = max(1, min(SWARM_MAX_AGENTS * 2, int(n)))
+        run.max_agents = max(1, min(_state().SWARM_MAX_AGENTS * 2, int(n)))
         run.ev(f"parallel agents set to {run.max_agents}")
 
     def stop(self, run: SwarmRun) -> None:
@@ -5358,15 +5657,6 @@ class Swarm:
 # Multi-account pool (V6): accounts, statistics, routing, fail-over, commands
 # ============================================================================
 
-ACCOUNTS_DIR = Path(os.getenv("DS_BRIDGE_ACCOUNTS_DIR", str(SCRIPT_DIR / "ds_profiles"))).expanduser().resolve()
-COOLDOWN_BASE = _env_int("DS_BRIDGE_COOLDOWN_BASE", 120)        # first cooldown after a rate limit (s)
-COOLDOWN_MAX = _env_int("DS_BRIDGE_COOLDOWN_MAX", 1800)
-ACCOUNT_WAIT_SECONDS = _env_int("DS_BRIDGE_ACCOUNT_WAIT", 120)  # how long a request waits for ANY account
-STREAK_GAP = 300                                                # idle gap (s) that ends a "continuous use" streak
-DASH_AUTOOPEN = _env_bool("DS_BRIDGE_OPEN_DASH", True)
-UI_PERFORMANCE_MODE = os.getenv("DS_BRIDGE_UI_PERFORMANCE", "auto").strip().lower()
-if UI_PERFORMANCE_MODE not in {"auto", "balanced", "light", "max"}:
-    UI_PERFORMANCE_MODE = "auto"
 STRATEGIES = ("balanced", "round_robin", "failover", "pinned")
 ROUTING_DEFAULTS: Dict[str, Any] = {"strategy": "balanced", "pinned": "", "auto_failover": True,
                                     "rotate_requests": 30, "rotate_minutes": 30,
@@ -5400,12 +5690,12 @@ class AcctStats:
             self.last_error, self.last_error_at, self.dirty = "", 0.0, True
 
     def record_exchange(self, prompt_chars: int, reply_chars: int, seconds: float) -> None:
-        self.record_tokens(int(prompt_chars / CHARS_PER_TOKEN), int(reply_chars / CHARS_PER_TOKEN), seconds)
+        self.record_tokens(int(prompt_chars / _state().CHARS_PER_TOKEN), int(reply_chars / _state().CHARS_PER_TOKEN), seconds)
 
     def record_tokens(self, tin: int, tout: int, seconds: float) -> None:
         now = time.time()
         with self.lock:
-            if not self.last_used or (now - seconds) - self.last_used > STREAK_GAP:
+            if not self.last_used or (now - seconds) - self.last_used > _state().STREAK_GAP:
                 self.streak_start = now - seconds
             self.last_used = now
             self.req += 1
@@ -5449,7 +5739,7 @@ class AcctStats:
             mk = int(now // 60)
             spark = [self.minutes.get(mk - 59 + i, 0) for i in range(60)]
             today = self.days.get(time.strftime("%Y-%m-%d"), [0, 0, 0])
-            live = bool(self.last_used) and now - self.last_used <= STREAK_GAP
+            live = bool(self.last_used) and now - self.last_used <= _state().STREAK_GAP
             streak = (now - self.streak_start) if live else (self.last_used - self.streak_start if self.last_used else 0)
             return {"req": self.req, "ok": self.ok, "err": self.err, "rate_limits": self.rate_limits,
                     "in_tok": self.in_tok, "out_tok": self.out_tok,
@@ -5487,7 +5777,14 @@ class Account:
     def __init__(self, d: Dict[str, Any]) -> None:
         self.id = str(d["id"])
         self.name = str(d.get("name") or self.id)
-        self.profile = Path(d.get("profile") or (ACCOUNTS_DIR / self.id))
+        requested_profile = Path(d.get("profile") or (_state().ACCOUNTS_DIR / self.id)).expanduser().resolve()
+        instance_home = _state().paths.home.resolve()
+        try:
+            requested_profile.relative_to(instance_home)
+            self.profile = requested_profile
+        except ValueError:
+            self.profile = (_state().ACCOUNTS_DIR / self.id).resolve()
+            log(f"[profile] account {self.id!r} pointed outside this instance; using {self.profile}", C.yellow)
         self.deleted = bool(d.get("deleted", False))
         self.enabled = bool(d.get("enabled", True)) and not self.deleted
         self.headed = bool(d.get("headed", False))          # keep the browser window visible
@@ -5656,6 +5953,7 @@ class Pool:
     """Routes requests over several DeepSeek accounts. Exposes the interface the HTTP layer needs."""
 
     def __init__(self, cfg: Dict[str, Any], autostart: bool = True) -> None:
+        self.runtime_state = _state()
         self.cfg = cfg
         self.lock = threading.RLock()
         self.accounts: List[Account] = []
@@ -5682,7 +5980,7 @@ class Pool:
         self._load_accounts()
         self._load_usage()
         if autostart:
-            threading.Thread(target=self._watchdog, daemon=True, name="DeepSeekPool").start()
+            state_thread(target=self._watchdog, daemon=True, name="DeepSeekPool").start()
 
     # ---- persistence ------------------------------------------------------------
 
@@ -5701,10 +5999,10 @@ class Pool:
         # and must stay empty (critical for explicit Multi-AI / Dashboard startup).
         if raw is None:
             try:
-                had = PROFILE_DIR.exists() and any(PROFILE_DIR.iterdir())
+                had = _state().PROFILE_DIR.exists() and any(_state().PROFILE_DIR.iterdir())
             except Exception:
                 had = False
-            items = [{"id": "main", "name": "Account 1", "profile": str(PROFILE_DIR), "enabled": True,
+            items = [{"id": "main", "name": "Account 1", "profile": str(_state().PROFILE_DIR), "enabled": True,
                       "logged_in": had, "created": time.time()}]
         for d in items:
             a = Account(d)
@@ -5724,7 +6022,7 @@ class Pool:
             if not str(profile):
                 return
             resolved = profile.expanduser().resolve(strict=False)
-            trusted_roots = [ACCOUNTS_DIR.resolve(strict=False), PROFILE_DIR.resolve(strict=False)]
+            trusted_roots = [_state().ACCOUNTS_DIR.resolve(strict=False), _state().PROFILE_DIR.resolve(strict=False)]
             trusted = any(resolved == root or root in resolved.parents for root in trusted_roots)
             if trusted and resolved.exists():
                 shutil.rmtree(resolved, ignore_errors=False)
@@ -5757,7 +6055,7 @@ class Pool:
             save_config(self.cfg)
 
     def _usage_path(self) -> Path:
-        return CONFIG_PATH.with_name(".deepseek_bridge_usage.json")
+        return _state().CONFIG_PATH.with_name(".deepseek_bridge_usage.json")
 
     def _load_usage(self) -> None:
         try:
@@ -5875,7 +6173,7 @@ class Pool:
                     a.set_status("disabled")
                     return
                 self.start_account(a, force_login)
-        threading.Thread(target=run, daemon=True, name=f"restart-{a.id}").start()
+        state_thread(target=run, daemon=True, name=f"restart-{a.id}").start()
 
     def wait_any_ready(self, timeout: float) -> bool:
         end = time.time() + timeout
@@ -5901,7 +6199,7 @@ class Pool:
         for a in self.accounts:
             w = a.worker
             if w is not None:
-                t = threading.Thread(target=w.stop, daemon=True)
+                t = state_thread(target=w.stop, daemon=True)
                 t.start()
                 ths.append(t)
         for t in ths:
@@ -5949,7 +6247,7 @@ class Pool:
             name=(name or "").strip()[:40] or f"{pv['name']} {n}"
             if any(x.name.lower()==name.lower() for x in self.accounts): name=f"{name} {n}"
             aid=f"{re.sub(r'[^a-z0-9]+','-',provider.lower())[:12] or 'web'}-{secrets.token_hex(2)}"
-            a=Account({"id":aid,"name":name,"profile":str(ACCOUNTS_DIR/aid),"enabled":True,"headed":bool(headed),
+            a=Account({"id":aid,"name":name,"profile":str(_state().ACCOUNTS_DIR/aid),"enabled":True,"headed":bool(headed),
                        "logged_in":False,"created":time.time(),"kind":"web","provider":provider,
                        "tier":tier or int(pv.get("tier") or 3),"max_parallel":1})
             a.on_change=self._save; self.accounts.append(a); self._save()
@@ -5965,7 +6263,7 @@ class Pool:
                 name = f"{name} {n}"
             slug = re.sub(r"[^a-zA-Z0-9]+", "-", name).strip("-").lower()[:16] or "acct"
             aid = f"{slug}-{secrets.token_hex(2)}"
-            a = Account({"id": aid, "name": name, "profile": str(ACCOUNTS_DIR / aid), "enabled": True,
+            a = Account({"id": aid, "name": name, "profile": str(_state().ACCOUNTS_DIR / aid), "enabled": True,
                          "logged_in": False, "created": time.time()})
             a.on_change = self._save
             self.accounts.append(a)
@@ -6059,7 +6357,7 @@ class Pool:
             data["system"] = system
         req = normalize_anthropic(data)
         req.role, req.tag = role, tag
-        return self.dispatch(req, None, None, None, PRIORITY_MAIN).result(timeout=timeout).text
+        return self.dispatch(req, None, None, None, _state().PRIORITY_MAIN).result(timeout=timeout).text
 
     def remove_account(self, a: Account, purge: bool = False) -> None:
         """Permanently remove an account and every bridge-owned reference to it.
@@ -6354,7 +6652,7 @@ class Pool:
             self.event("error", f"'{a.name}': login expired - click Login on the dashboard")
         elif k == "rate_limit":
             a.rl_streak += 1
-            cool = min(COOLDOWN_MAX, COOLDOWN_BASE * 2 ** (a.rl_streak - 1))
+            cool = min(_state().COOLDOWN_MAX, _state().COOLDOWN_BASE * 2 ** (a.rl_streak - 1))
             a.cooldown_until, a.cooldown_reason, a.cool_notified = now + cool, "rate limit / server busy", False
             self.event("warn", f"'{a.name}' is busy / rate limited -> cooling down {fmt_dur(cool)}")
         elif k in ("upstream", "timeout", "empty"):
@@ -6383,7 +6681,7 @@ class Pool:
             tried: List[str] = []
             last: Optional[BaseException] = None
             attempts, max_attempts = 0, 2 * len(self.accounts) + 2
-            wait_end = time.time() + ACCOUNT_WAIT_SECONDS
+            wait_end = time.time() + _state().ACCOUNT_WAIT_SECONDS
             try:
                 while True:
                     if cancel is not None and cancel.is_set():
@@ -6437,7 +6735,7 @@ class Pool:
             except BaseException as exc:
                 out.set_exception(exc if isinstance(exc, Exception) else BridgeError(repr(exc), "upstream"))
 
-        threading.Thread(target=run, daemon=True, name="DeepSeekDispatch").start()
+        state_thread(target=run, daemon=True, name="DeepSeekDispatch").start()
         return out
 
     def submit(self, fn: Callable[[Engine], Any], priority: int = PRIORITY_MAIN,
@@ -6505,7 +6803,7 @@ class Pool:
         return {"version": VERSION, "now": now, "uptime": round(now - self.started, 1),
                 "settings": dict(self.routing), "totals": tot, "current": self.current, "ready": ready,
                 "accounts": accts, "capacity": self.capacity(), "resources": self.governor.snapshot(self),
-                "parallel_mode": PARALLEL_MODE, "events": list(self.events)[-60:][::-1]}
+                "parallel_mode": _state().PARALLEL_MODE, "events": list(self.events)[-60:][::-1]}
 
     def status_text(self) -> str:
         snap = self.snapshot()
@@ -6708,9 +7006,6 @@ def set_project_context(pool: Any, project: Any) -> Dict[str, Any]:
     return {"ok": True, "project": str(path)}
 
 
-SWARM_ATTACH_DIR = Path(os.getenv("DS_BRIDGE_SWARM_ATTACH_DIR",
-                                  str(Path.home() / ".deepseek_bridge" / "swarm_attachments"))).expanduser().resolve()
-
 
 def _safe_upload_name(name: str) -> str:
     name = Path(str(name or "attachment")).name
@@ -6719,18 +7014,18 @@ def _safe_upload_name(name: str) -> str:
 
 
 def store_swarm_attachment(name: str, mime: str, data: bytes) -> Dict[str, Any]:
-    if len(data) > ATTACH_MAX_BYTES:
-        raise ValueError(f"attachment exceeds {ATTACH_MAX_BYTES:,} bytes")
-    SWARM_ATTACH_DIR.mkdir(parents=True, exist_ok=True)
+    if len(data) > _state().ATTACH_MAX_BYTES:
+        raise ValueError(f"attachment exceeds {_state().ATTACH_MAX_BYTES:,} bytes")
+    _state().SWARM_ATTACH_DIR.mkdir(parents=True, exist_ok=True)
     aid = uuid.uuid4().hex[:16]
     safe = _safe_upload_name(name)
-    path = SWARM_ATTACH_DIR / f"{aid}-{safe}"
+    path = _state().SWARM_ATTACH_DIR / f"{aid}-{safe}"
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_bytes(data)
     os.replace(tmp, path)
     meta = {"id": aid, "name": safe, "mime": (mime or "application/octet-stream")[:120],
             "size": len(data), "path": str(path), "created": time.time()}
-    (SWARM_ATTACH_DIR / f"{aid}.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    (_state().SWARM_ATTACH_DIR / f"{aid}.json").write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
     emit_dash_event("attachment", {k: meta[k] for k in ("id", "name", "mime", "size")})
     return meta
 
@@ -6739,14 +7034,14 @@ def get_swarm_attachment(aid: str) -> Dict[str, Any]:
     safe = re.sub(r"[^0-9a-f]", "", str(aid).lower())[:32]
     if not safe:
         raise ValueError("invalid attachment id")
-    meta_path = SWARM_ATTACH_DIR / f"{safe}.json"
+    meta_path = _state().SWARM_ATTACH_DIR / f"{safe}.json"
     if not meta_path.is_file():
         raise ValueError("attachment not found or expired")
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     if not isinstance(meta, dict) or meta.get("id") != safe:
         raise ValueError("invalid attachment metadata")
     path = Path(str(meta.get("path") or ""))
-    if not path.is_file() or path.parent.resolve() != SWARM_ATTACH_DIR.resolve():
+    if not path.is_file() or path.parent.resolve() != _state().SWARM_ATTACH_DIR.resolve():
         raise ValueError("attachment storage is invalid")
     return meta
 
@@ -6755,13 +7050,13 @@ def cleanup_swarm_attachments(max_age_days: int = 7) -> int:
     cutoff = time.time() - max_age_days * 86400
     removed = 0
     try:
-        for meta_path in SWARM_ATTACH_DIR.glob("*.json"):
+        for meta_path in _state().SWARM_ATTACH_DIR.glob("*.json"):
             try:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
                 if float(meta.get("created", 0)) >= cutoff:
                     continue
                 data_path = Path(str(meta.get("path") or ""))
-                if data_path.is_file() and data_path.parent.resolve() == SWARM_ATTACH_DIR.resolve():
+                if data_path.is_file() and data_path.parent.resolve() == _state().SWARM_ATTACH_DIR.resolve():
                     data_path.unlink(missing_ok=True)
                 meta_path.unlink(missing_ok=True)
                 removed += 1
@@ -6792,7 +7087,7 @@ def dash_action(pool: Any, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
         a = acct()
         if a.worker is None or not a.worker.ok:
             raise ValueError("this account is not running")
-        return a.worker.submit(fn, PRIORITY_MAIN).result(timeout=timeout)
+        return a.worker.submit(fn, _state().PRIORITY_MAIN).result(timeout=timeout)
 
     if action == "add":
         return {"ok": True, "id": pool.add_account(str(data.get("name", ""))).id}
@@ -6900,7 +7195,7 @@ def dash_action(pool: Any, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
         return run_task(pool, str(data.get("name", "")))
     elif action == "swarm_start":
         swarm_project = str(data.get("project", ""))
-        attachment_ids = [str(x) for x in (data.get("attachments") or [])][:ATTACH_MAX_FILES]
+        attachment_ids = [str(x) for x in (data.get("attachments") or [])][:_state().ATTACH_MAX_FILES]
         for aid in attachment_ids:
             get_swarm_attachment(aid)
         account_ids=[str(x) for x in (data.get("account_ids") or [])][:32]
@@ -6949,10 +7244,6 @@ def dash_action(pool: Any, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
 # Settings exposed in the web panel (everything that used to need env variables / flags)
 # ============================================================================
 
-RUN_MODE = "claude"          # claude | terminal | panel  (set in main)
-PANEL_ONLY = False
-SERVER: Any = None
-_TASKS: set = set()
 
 # name, kind, group, English label, Persian label, min (or choices), max, when it takes effect
 SETTINGS_SCHEMA: Tuple[Tuple[Any, ...], ...] = (
@@ -7000,14 +7291,14 @@ def _setting_get(name: str, cfg: Dict[str, Any]) -> Any:
         return _norm_mode(cfg.get("permission_mode")) or DEFAULT_MODE
     if name == "port":
         return int(cfg.get("port", DEFAULT_PORT))
-    return globals()[name]
+    return getattr(_state(), name)
 
 
 def _setting_apply(name: str, value: Any, cfg: Dict[str, Any]) -> None:
     if name in ("permission_mode", "port"):
         cfg[name] = value
     else:
-        globals()[name] = value
+        setattr(_state(), name, value)
 
 
 def _coerce_setting(spec: Tuple[Any, ...], raw: Any) -> Any:
@@ -7032,8 +7323,8 @@ def _coerce_setting(spec: Tuple[Any, ...], raw: Any) -> Any:
 def init_settings(cfg: Dict[str, Any]) -> None:
     """Remember the defaults, then apply what the person saved in the panel."""
     for name, *_ in SETTINGS_SCHEMA:
-        SETTING_DEFAULTS.setdefault(name, DEFAULT_MODE if name == "permission_mode"
-                                    else DEFAULT_PORT if name == "port" else globals()[name])
+        _state().SETTING_DEFAULTS.setdefault(name, DEFAULT_MODE if name == "permission_mode"
+                                    else DEFAULT_PORT if name == "port" else getattr(_state(), name))
     saved = cfg.get("settings")
     if isinstance(saved, dict):
         for name, raw in saved.items():
@@ -7052,7 +7343,7 @@ def settings_view(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
         out.append({"name": name, "kind": kind, "group": group, "en": en, "fa": fa, "when": when,
                     "choices": lo if kind == "choice" else None, "min": lo if kind in ("int", "float") else None,
                     "max": hi if kind in ("int", "float") else None, "value": _setting_get(name, cfg),
-                    "default": SETTING_DEFAULTS.get(name)})
+                    "default": _state().SETTING_DEFAULTS.get(name)})
     return out
 
 
@@ -7067,8 +7358,13 @@ def settings_set(cfg: Dict[str, Any], values: Dict[str, Any], reset: List[str]) 
     for name in reset or []:
         if name not in _SCHEMA:
             raise ValueError(f"unknown setting '{name}'")
-        changes[name] = SETTING_DEFAULTS.get(name)
+        changes[name] = _state().SETTING_DEFAULTS.get(name)
     saved = cfg.setdefault("settings", {})
+    if "port" in changes:
+        # A dashboard settings edit is an explicit persistence action, even when the
+        # process was launched with a transient --port / DS_BRIDGE_PORT override.
+        _state().PORT_PERSIST_ALLOWED = True
+        _state().PERSISTED_PORT = int(changes["port"])
     for name, v in changes.items():
         _setting_apply(name, v, cfg)
         if name in (values or {}):
@@ -7197,9 +7493,9 @@ def run_task(pool: Any, name: str) -> Dict[str, Any]:
         args = [npm, "install", "-g", "@anthropic-ai/claude-code"]
     else:
         raise ValueError("unknown task")
-    if name in _TASKS:
+    if name in _state()._TASKS:
         raise ValueError("this task is already running (see the Console page)")
-    _TASKS.add(name)
+    _state()._TASKS.add(name)
 
     def run() -> None:
         try:
@@ -7213,50 +7509,64 @@ def run_task(pool: Any, name: str) -> Dict[str, Any]:
         except Exception as exc:
             log(f"[task:{name}] failed: {exc}", C.red)
         finally:
-            _TASKS.discard(name)
-    threading.Thread(target=run, daemon=True, name=f"task-{name}").start()
+            _state()._TASKS.discard(name)
+    state_thread(target=run, daemon=True, name=f"task-{name}").start()
     return {"ok": True}
 
 
 def bridge_control(pool: Any, action: str) -> Dict[str, Any]:
-    if RUN_MODE == "claude":
+    if _state().RUN_MODE == "claude":
         raise ValueError("The bridge runs inside your Claude Code window. Close Claude Code to stop it, or start "
                          "the bridge with  --panel  to control it from here.")
 
     def later() -> None:
         time.sleep(0.6)
+        # release the port BEFORE the child boots, otherwise the child cannot bind
         try:
             pool.stop()
-            stop_server(SERVER)
+            stop_server(_state().SERVER)
         except Exception:
             pass
         if action == "restart":
-            os.execv(sys.executable, [sys.executable] + sys.argv)
+            time.sleep(1.5)
+            try:
+                devnull = open(os.devnull, "wb")
+                args = [sys.executable] + sys.argv
+                if os.name == "nt":
+                    flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                    subprocess.Popen(args, cwd=str(SCRIPT_DIR), stdin=devnull, stdout=devnull,
+                                     stderr=devnull, creationflags=flags, close_fds=True)
+                else:
+                    subprocess.Popen(args, cwd=str(SCRIPT_DIR), stdin=devnull, stdout=devnull,
+                                     stderr=devnull, start_new_session=True, close_fds=True)
+            except Exception as exc:
+                log(f"restart failed: {exc}", C.red)
         os._exit(0)
-    threading.Thread(target=later, daemon=True).start()
+    state_thread(target=later, daemon=True).start()
     return {"ok": True}
 
 
 def panel_info(pool: Any) -> Dict[str, Any]:
     cfg = pool.cfg
-    port = int(cfg.get("port", DEFAULT_PORT))
+    port = int(_state().RESOLVED_PORT or cfg.get("port", DEFAULT_PORT))
     base = f"http://127.0.0.1:{port}"
     mode, src = resolve_mode(None, cfg)
-    return {"version": VERSION, "base": base, "key": cfg.get("api_key", ""), "models": MODELS,
+    return {"version": VERSION, "base": base, "key": cfg.get("api_key", ""),
+            "instance_name": _state().instance_name, "instance_home": str(_state().paths.home), "pid": _state().PID, "models": MODELS,
             "model": "claude-sonnet-4-20250514", "haiku": "claude-haiku-4-20250514", "opus": "claude-opus-4-20250514",
             "deepseek_model": "deepseek-v4-pro", "port": port, "platform": sys.platform,
             "claude": shutil.which("claude") or "", "project": cfg.get("project_dir") or str(SCRIPT_DIR),
-            "recent": cfg.get("recent_projects") or [], "mode": mode, "mode_src": src, "run_mode": RUN_MODE,
-            "ui_performance_mode": UI_PERFORMANCE_MODE, "ui_mode": UI_MODE, "parallel_mode": PARALLEL_MODE,
-            "script": str(Path(__file__).resolve()), "log": str(SCRIPT_DIR / "bridge.log"), "config": str(CONFIG_PATH),
-            "profiles": str(ACCOUNTS_DIR), "home": str(Path.home()), "settings": settings_view(cfg),
+            "recent": cfg.get("recent_projects") or [], "mode": mode, "mode_src": src, "run_mode": _state().RUN_MODE,
+            "ui_performance_mode": _state().UI_PERFORMANCE_MODE, "ui_mode": _state().UI_MODE, "parallel_mode": _state().PARALLEL_MODE,
+            "script": str(Path(__file__).resolve()), "log": str(_state().paths.log), "config": str(_state().CONFIG_PATH),
+            "profiles": str(_state().ACCOUNTS_DIR), "home": str(Path.home()), "settings": settings_view(cfg),
             "providers": PROVIDERS, "tiers": TIER_NAMES, "routing": dict(pool.routing),
             "project_accounts": dict(pool.project_accounts),
             "accounts": [{"id": a.id, "name": a.name, "url": f"{base}/a/{a.id}", "profile": str(a.profile),
                           "created": a.created, "logged_in": a.logged_in, "kind": a.kind, "provider": a.provider,
                           "status": a.state(time.time()), "enabled": a.enabled, "tier": a.tier,
                           "max_parallel": a.max_parallel, "key_hint": ((a.api_key[:3]+"…"+a.api_key[-3:]) if a.api_key else "")} for a in pool.accounts],
-            "limits": {"files": ATTACH_MAX_FILES, "file_bytes": ATTACH_MAX_BYTES, "body_bytes": MAX_HTTP_BODY_BYTES}}
+            "limits": {"files": _state().ATTACH_MAX_FILES, "file_bytes": _state().ATTACH_MAX_BYTES, "body_bytes": _state().MAX_HTTP_BODY_BYTES}}
 
 
 def dash_get(pool: Any, name: str, q: Dict[str, List[str]]) -> Dict[str, Any]:
@@ -7271,18 +7581,18 @@ def dash_get(pool: Any, name: str, q: Dict[str, List[str]]) -> Dict[str, Any]:
             since = int((q.get("since") or ["0"])[0] or 0)
         except ValueError:
             since = 0
-        lines = [{"n": n, "t": t, "l": lv, "m": m} for (n, t, lv, m) in list(LOG_RING) if n > since][-500:]
-        return {"last": LOG_RING[-1][0] if LOG_RING else 0, "lines": lines}
+        lines = [{"n": n, "t": t, "l": lv, "m": m} for (n, t, lv, m) in list(_state().LOG_RING) if n > since][-500:]
+        return {"last": _state().LOG_RING[-1][0] if _state().LOG_RING else 0, "lines": lines}
     if name == "activity":
         try:
             since = int((q.get("since") or ["0"])[0] or 0)
         except ValueError:
             since = 0
-        return {"last": ACTIVITY[-1]["n"] if ACTIVITY else 0, "items": [x for x in list(ACTIVITY) if x["n"] > since][-200:]}
+        return {"last": _state().ACTIVITY[-1]["n"] if _state().ACTIVITY else 0, "items": [x for x in list(_state().ACTIVITY) if x["n"] > since][-200:]}
     if name == "swarm":
         return {"runs": [r.view(False) for r in sorted(pool.swarm.runs.values(), key=lambda r: -r.created)],
-                "capacity": pool.capacity(), "max_agents": SWARM_MAX_AGENTS, "git": bool(shutil.which("git")),
-                "claude": bool(shutil.which("claude")), "default_agents": SWARM_AGENTS}
+                "capacity": pool.capacity(), "max_agents": _state().SWARM_MAX_AGENTS, "git": bool(shutil.which("git")),
+                "claude": bool(shutil.which("claude")), "default_agents": _state().SWARM_AGENTS}
     if name in ("swarm_run", "swarm_log"):
         run = pool.swarm.runs.get((q.get("run") or q.get("id") or [""])[0])
         if run is None:
@@ -7307,16 +7617,34 @@ CLAUDE_COMMANDS = {
 }
 
 
-def install_claude_commands() -> None:
-    """Creates /ds and /ds-next in Claude Code. The bridge answers them locally (instantly, no model call)."""
+def _command_header() -> str:
+    return f"# DeepSeek Bridge instance: {_state().instance_name} | config: {_state().CONFIG_PATH}\n"
+
+
+def install_claude_commands(target_dir: Optional[Path] = None, force: bool = False) -> None:
+    """Install slash commands without letting instances overwrite each other's generated files."""
     try:
-        base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")) / "commands"
-        for name, text in CLAUDE_COMMANDS.items():
+        base_cfg = Path(target_dir).expanduser().resolve() if target_dir else Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")).expanduser().resolve()
+        base = base_cfg / "commands"
+        marker = f"DeepSeek Bridge instance: {_state().instance_name} | config: {_state().CONFIG_PATH}"
+        header = _command_header()
+        for name, text_body in CLAUDE_COMMANDS.items():
+            text = text_body
+            if text.startswith("---"):
+                text = "---\n" + header.rstrip("\n") + "\n" + text[len("---\n"):]
+            else:
+                text = header + text
             f = base / name
             if f.exists():
                 old = f.read_text(encoding="utf-8", errors="replace")
-                if old == text or "DS-BRIDGE-CMD" not in old:
-                    continue                      # up to date, or the user's own command: never overwritten
+                if marker in old and old == text:
+                    continue
+                if "DS-BRIDGE-CMD" not in old:
+                    continue
+                if not force:
+                    _warn_once("claude_cmd_conflict:" + str(f),
+                                f"Claude command {f} was generated by a different bridge instance; skipping it. Use --force-claude-commands to overwrite.")
+                    continue
             base.mkdir(parents=True, exist_ok=True)
             f.write_text(text, encoding="utf-8")
     except Exception as exc:
@@ -7366,7 +7694,7 @@ def open_dashboard(url: str, key: str, page: str = "") -> None:
 
 DASH_HTML = r"""<!doctype html>
 <html lang="fa" dir="rtl" data-theme="dark" data-acc="violet"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0d1117"><link rel="icon" href="data:,"><title>DeepSeek Bridge</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0d1117"><link rel="icon" href="data:,"><title>DeepSeek Bridge — __INSTANCE_NAME__</title>
 <style>
 :root{--ac:#7c8cff;--ac2:#b37cff;--ok:#34d399;--warn:#fbbf24;--bad:#fb7185;--info:#60c8ff;--r:14px}
 [data-acc=emerald]{--ac:#34d399;--ac2:#22d3ee}[data-acc=amber]{--ac:#fbbf24;--ac2:#fb7185}[data-acc=sky]{--ac:#38bdf8;--ac2:#818cf8}
@@ -7396,6 +7724,7 @@ select.inp{width:auto}.page{display:none;padding:22px;max-width:1340px;margin:0 
 @keyframes in{from{opacity:0;transform:translateY(8px)}}
 .box{background:var(--p);border:1px solid var(--ln);border-radius:var(--r);padding:16px 18px;margin-bottom:16px;box-shadow:0 14px 40px -26px #000}
 .box h3{font-size:13px;color:var(--mut);font-weight:600;margin-bottom:12px;display:flex;gap:8px;align-items:center}.tip{color:var(--mut);font-size:12px}
+details.sgrp{padding:0}details.sgrp>summary{list-style:none;cursor:pointer;padding:14px 18px;display:flex;gap:10px;align-items:center;user-select:none}details.sgrp>summary::-webkit-details-marker{display:none}details.sgrp>summary:before{content:"▸";color:var(--mut);transition:.15s;display:inline-block}details.sgrp[open]>summary:before{transform:rotate(90deg)}details.sgrp>summary h3{margin:0;flex:1}details.sgrp>summary .dim{color:var(--mut);font-size:11px;background:var(--p2);border-radius:99px;padding:1px 9px}details.sgrp>summary:hover{background:var(--p2);border-radius:var(--r) var(--r) 0 0}details.sgrp:not([open])>summary:hover{border-radius:var(--r)}details.sgrp>*:not(summary){padding-inline:18px}details.sgrp>div:last-child{padding-bottom:14px}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:16px}
 .tile{background:var(--p);border:1px solid var(--ln);border-radius:var(--r);padding:14px 16px;position:relative;overflow:hidden}
 .tile:before{content:"";position:absolute;inset-inline-end:-30px;top:-30px;width:90px;height:90px;border-radius:50%;background:var(--ac);opacity:.14}
@@ -7427,11 +7756,11 @@ svg.sp{width:100%;height:38px;display:block}.err{color:var(--bad);font-size:12px
 .sw{position:relative;display:inline-block;width:42px;height:24px}.sw input{opacity:0;width:0;height:0}.sw i{position:absolute;inset:0;background:var(--ln);border-radius:24px;cursor:pointer;transition:.2s}
 .sw i:before{content:"";position:absolute;width:18px;height:18px;inset-inline-start:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}.sw input:checked+i{background:var(--ac)}.sw input:checked+i:before{transform:translateX(18px)}[dir=rtl] .sw input:checked+i:before{transform:translateX(-18px)}
 /* chat */
-#p-chat{padding:0;max-width:none;height:calc(100vh - 62px)}#p-chat.on{display:grid;grid-template-columns:250px 1fr}
-#cl{border-inline-end:1px solid var(--ln);padding:12px;overflow:auto;background:var(--glass)}#clist{margin-top:10px;display:grid;gap:4px}
+#p-chat{padding:0;max-width:none;height:calc(100vh - 62px);min-height:0;overflow:hidden}#p-chat.on{display:grid;grid-template-columns:250px 1fr;min-height:0}
+#cl{border-inline-end:1px solid var(--ln);padding:12px;overflow:auto;background:var(--glass);min-height:0}#clist{margin-top:10px;display:grid;gap:4px}
 .ci{padding:8px 10px;border-radius:10px;cursor:pointer;display:flex;gap:6px;align-items:center;color:var(--mut);font-size:13px}.ci span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ci:hover{background:var(--p2);color:var(--tx)}.ci.on{background:var(--p2);color:var(--tx);box-shadow:0 0 0 1px var(--ac) inset}.ci button{opacity:0}.ci:hover button{opacity:1}
-#cm{display:flex;flex-direction:column;min-width:0;height:100%}#chd{display:flex;gap:8px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--ln)}#chd b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#cscroll{flex:1;overflow:auto;padding:18px 22px}#ctx{max-width:900px;margin:0 auto;display:grid;gap:14px}
+#cm{display:flex;flex-direction:column;min-width:0;height:100%;min-height:0;overflow:hidden}#chd{display:flex;gap:8px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--ln);flex:0 0 auto}#chd b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#cscroll{flex:1 1 0;min-height:0;overflow:auto;padding:18px 22px}#ctx{max-width:900px;margin:0 auto;display:grid;gap:14px}
 .wel{border:1px solid var(--ac);border-radius:14px;padding:14px 18px;width:fit-content;max-width:100%;background:color-mix(in srgb,var(--ac) 8%,transparent)}.wel b{color:var(--ac)}.wel div{color:var(--mut)}
 .um{display:flex;gap:10px;background:var(--p2);border:1px solid var(--ln);border-radius:12px;padding:9px 13px}.um .pr{color:var(--ac);font-weight:700}.ub{min-width:0;overflow-wrap:anywhere;white-space:pre-wrap;direction:auto}
 .am{display:flex;gap:10px}.am .bl{color:var(--ac);line-height:1.6}.md{min-width:0;flex:1;overflow-wrap:anywhere;direction:auto}.md h2,.md h3,.md h4,.md h5{margin:10px 0 4px}.md ul,.md ol{padding-inline-start:22px}.md blockquote{border-inline-start:3px solid var(--ac);padding-inline-start:10px;color:var(--mut)}
@@ -7439,7 +7768,7 @@ svg.sp{width:100%;height:38px;display:block}.err{color:var(--bad);font-size:12px
 .code{border:1px solid var(--ln);border-radius:12px;overflow:hidden;margin:8px 0;direction:ltr;text-align:left}.cb{display:flex;justify-content:space-between;background:var(--p2);padding:4px 10px;color:var(--mut);font-size:11px}.cb button{background:none;border:0;cursor:pointer;color:var(--mut)}.code pre{padding:10px 12px;overflow:auto;font-size:12.5px}.code code{background:none;padding:0}
 .th{max-height:120px;border-radius:8px;display:block;margin:4px 0}.fc{display:inline-flex;gap:6px;align-items:center;background:var(--p);border:1px solid var(--ln);border-radius:9px;padding:2px 9px;margin:2px;font-size:12px}
 .stat{color:var(--ac);display:flex;gap:8px;align-items:center}.stat .dim{color:var(--mut)}.spin{display:inline-block;animation:sp 1.2s linear infinite}@keyframes sp{to{transform:rotate(360deg)}}
-#cbar{padding:10px 16px 14px;position:relative}#cbox{max-width:900px;margin:0 auto;display:flex;gap:8px;align-items:flex-end;border:1px solid var(--ln);border-radius:16px;padding:8px 10px;background:var(--p);transition:.15s}#cbox:focus-within{border-color:var(--ac);box-shadow:0 0 0 3px color-mix(in srgb,var(--ac) 20%,transparent)}
+#cbar{padding:10px 16px 14px;position:relative;flex:0 0 auto}#cbox{max-width:900px;margin:0 auto;display:flex;gap:8px;align-items:flex-end;border:1px solid var(--ln);border-radius:16px;padding:8px 10px;background:var(--p);transition:.15s}#cbox:focus-within{border-color:var(--ac);box-shadow:0 0 0 3px color-mix(in srgb,var(--ac) 20%,transparent)}
 #cbox .pr{color:var(--ac);font-weight:700;padding-bottom:6px}#cin{flex:1;background:none;border:0;outline:0;resize:none;max-height:200px;padding:5px 0;direction:auto}.snd{background:var(--ac);color:#fff!important;border-radius:11px}
 #chips2{max-width:900px;margin:0 auto 6px;display:flex;gap:6px;flex-wrap:wrap}.ach{display:flex;gap:6px;align-items:center;background:var(--p2);border:1px solid var(--ln);border-radius:10px;padding:3px 8px;font-size:12px}.ach img{height:30px;border-radius:5px}.ach button{background:none;border:0;cursor:pointer;color:var(--mut)}
 #pal{position:absolute;bottom:100%;inset-inline:16px;max-width:900px;margin:0 auto;background:var(--p);border:1px solid var(--ln);border-radius:12px;padding:5px;box-shadow:0 20px 50px -20px #000;z-index:5}.pi{padding:6px 10px;border-radius:8px;cursor:pointer;display:flex;gap:12px}.pi:hover,.pi.on{background:var(--p2)}.pi b{color:var(--ac)}.pi span{color:var(--mut)}
@@ -7480,7 +7809,23 @@ html[data-perf="light"] .btn,html[data-perf="light"] .card,html[data-perf="light
 html[data-perf="light"] .btn:hover,html[data-perf="light"] .card:hover,html[data-perf="light"] .pv:hover,html[data-perf="light"] .nb:hover i{transform:none!important}
 html[data-perf="light"] .page,html[data-perf="light"] .fcard{animation:none!important}
 html[data-perf="light"] .ov{backdrop-filter:none!important}
-#ccmirror{margin-bottom:12px}.ccm{background:var(--p);border:1px solid var(--ln);border-radius:14px;padding:11px 13px}.ccmhead{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.ccmstate{margin-inline-start:auto;color:var(--ok);font-size:11px}.ccmrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px;color:var(--mut);font-size:12px}.ccmrow .pth{color:var(--tx);overflow-wrap:anywhere}.ccmagents{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.ccma{padding:4px 8px;border-radius:9px;background:var(--p2);font-size:11px}.ccma span{color:var(--mut)}.swpreview{display:grid;gap:8px;margin-top:8px}.swpreview textarea{resize:vertical;min-height:120px}.swu{border:1px dashed var(--ln);border-radius:11px;padding:10px}.swu .lbl{display:flex;justify-content:space-between;gap:8px;align-items:center;color:var(--mut);font-size:11px}.sactions{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}.swattach{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:9px}.achip{display:inline-flex;align-items:center;gap:5px;max-width:100%;background:var(--p2);border:1px solid var(--ln);border-radius:9px;padding:4px 8px;font-size:11px}.achip span{max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.achip button{border:0;background:none;color:var(--mut);cursor:pointer;padding:0 2px}
+#ccmirror{margin-bottom:12px}.ccm{background:var(--p);border:1px solid var(--ln);border-radius:14px;padding:11px 13px}.ccmhead{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.ccmstate{margin-inline-start:auto;color:var(--ok);font-size:11px}
+#ccterm{margin-bottom:12px;background:#05070e;border:1px solid var(--ln);border-radius:14px;overflow:hidden;display:flex;flex-direction:column}
+[data-theme=light] #ccterm{background:#10162b}
+#ccterm .cthead{display:flex;align-items:center;gap:8px;padding:9px 12px;background:rgba(255,255,255,.03);border-bottom:1px solid var(--ln);color:#cfd6f3;font-size:12px}
+#ccterm .cthead b{font-weight:600}#ccterm .ctdot{width:9px;height:9px;border-radius:50%;background:#3ddc84;box-shadow:0 0 6px #3ddc84;flex:0 0 auto}
+#ccterm .cthead .sp{margin-inline-start:auto}#ccterm .cthead .ctb{cursor:pointer;padding:2px 8px;border-radius:7px;background:rgba(255,255,255,.06);color:#cfd6f3;font-size:11px}
+#ccterm .cthead .ctb:hover{background:rgba(255,255,255,.12)}
+#ctlog{flex:1 1 auto;overflow:auto;padding:8px 12px;font-family:ui-monospace,"Cascadia Mono",Consolas,Menlo,monospace;font-size:12.5px;line-height:1.55;color:#cfd6f3;max-height:calc(100vh - 430px);min-height:180px;white-space:pre-wrap;word-break:break-word}
+#ctlog .ctl{display:block;padding:1px 0}
+#ctlog .ctl .cts{color:#5b6489;margin-inline-end:8px;user-select:none}
+#ctlog .ct-prompt{color:#8ab4ff}#ctlog .ct-prompt .ctk{color:#ffd479}
+#ctlog .ct-asst{color:#cfd6f3}
+#ctlog .ct-tool{color:#7ee0c0}#ctlog .ct-tool .ctn{color:#ffd479;font-weight:600}
+#ctlog .ct-toolerr{color:#ff8f8f}
+#ctlog .ct-notice{color:#c79bff}
+#ctlog .ct-sys{color:#5b6489}#ctlog .ct-ok{color:#3ddc84}#ctlog .ct-err{color:#ff6b6b}
+#ctlog .ctc{cursor:pointer;opacity:.55}#ctlog .ctc:hover{opacity:1}.ccmrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px;color:var(--mut);font-size:12px}.ccmrow .pth{color:var(--tx);overflow-wrap:anywhere}.ccmagents{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.ccma{padding:4px 8px;border-radius:9px;background:var(--p2);font-size:11px}.ccma span{color:var(--mut)}.swpreview{display:grid;gap:8px;margin-top:8px}.swpreview textarea{resize:vertical;min-height:120px}.swu{border:1px dashed var(--ln);border-radius:11px;padding:10px}.swu .lbl{display:flex;justify-content:space-between;gap:8px;align-items:center;color:var(--mut);font-size:11px}.sactions{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}.swattach{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin-top:9px}.achip{display:inline-flex;align-items:center;gap:5px;max-width:100%;background:var(--p2);border:1px solid var(--ln);border-radius:9px;padding:4px 8px;font-size:11px}.achip span{max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.achip button{border:0;background:none;color:var(--mut);cursor:pointer;padding:0 2px}
 @media(max-width:980px){.grid{grid-template-columns:repeat(auto-fill,minmax(280px,1fr))}.fg2{grid-template-columns:1fr}.ags{grid-template-columns:1fr}#top{padding:10px 14px}.page{padding:14px}}
 @media(max-width:600px){.tiles{grid-template-columns:1fr 1fr}.tile b{font-size:21px}.kv{grid-template-columns:1fr 1fr}.grid{grid-template-columns:1fr}.btn{min-height:38px}.inp{min-height:40px}.ccma{max-width:100%}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation:none!important;transition:none!important}}
@@ -7548,7 +7893,7 @@ pre,code,.path,.url,.mono{direction:ltr!important;text-align:left!important;unic
 <section class="page" id="p-chat"><aside id="cl"><button class="btn pri wide" id="cnew">＋ <span data-t="newchat"></span></button><div id="clist"></div></aside>
 <div id="cm"><div id="chd"><b id="ctitle"></b><span class="sp"></span><select class="inp" id="cacct"></select><select class="inp" id="cpow"><option value="" data-t="powAuto"></option><option value="strong" data-t="powStrong"></option></select><button class="btn sm" id="cexp">⬇ <span data-t="export"></span></button><button class="btn sm dng" id="cdel">🗑</button></div>
 <div id="cscroll"><div id="ctx"></div></div><div id="cbar"><div id="pal" hidden></div><div id="chips2"></div><div id="cbox"><span class="pr">&gt;</span><textarea id="cin" rows="1"></textarea><button class="ib" id="catt" title="Attach">＋</button><button class="ib snd" id="csend">→</button></div><div class="tip" id="chint" style="text-align:center;margin-top:6px"></div></div></div></section>
-<section class="page" id="p-live"><div id="ccmirror"></div><div class="tb" id="livetb"></div><div class="feed" id="livefeed" style="max-height:calc(100vh - 180px)"></div></section><section class="page" id="p-swarm"><div id="swf"></div><div id="swr"></div></section><section class="page" id="p-launch"><div id="lw"></div></section><section class="page" id="p-console"><div id="cw"></div></section>
+<section class="page" id="p-live"><div id="ccmirror"></div><div id="ccterm"><div class="cthead"><span class="ctdot"></span><b id="ctttl">Claude Code</b><span id="ctmeta" class="mut"></span><span class="sp"></span><span class="ctb" id="ctpause">Ⅱ</span><span class="ctb" id="ctclear">×</span><span class="ctb" id="ctwrap">↵</span></div><div id="ctlog" class="mono"></div></div><div class="tb" id="livetb"></div><div class="feed" id="livefeed" style="max-height:calc(100vh - 180px)"></div></section><section class="page" id="p-swarm"><div id="swf"></div><div id="swr"></div></section><section class="page" id="p-launch"><div id="lw"></div></section><section class="page" id="p-console"><div id="cw"></div></section>
 <section class="page" id="p-connect"><div id="kw"></div></section><section class="page" id="p-settings"><div id="sw"></div></section></div><aside id="dockp"><div class="dh"><b>▣ <span data-t="n_live"></span></b><button class="ib" id="dockx">✕</button></div><div class="feed" id="dockfeed"></div></aside></div>
 <div id="navshade" hidden></div><div id="toast"></div><input type="file" id="cfile" multiple hidden><input type="file" id="sfiles" multiple hidden>
 <script>
@@ -7557,6 +7902,8 @@ pre,code,.path,.url,.mono{direction:ltr!important;text-align:left!important;unic
 const localStorage=(()=>{try{return window.localStorage}catch(_){const mem=Object.create(null);return new Proxy({getItem:k=>Object.prototype.hasOwnProperty.call(mem,k)?mem[k]:null,setItem:(k,v)=>{mem[k]=String(v)},removeItem:k=>{delete mem[k]},clear:()=>{for(const k of Object.keys(mem))delete mem[k]},key:i=>Object.keys(mem)[i]||null},{get:(t,k)=>k in t?t[k]:mem[k],set:(_t,k,v)=>{mem[k]=String(v);return true},deleteProperty:(_t,k)=>{delete mem[k];return true},ownKeys:()=>Reflect.ownKeys(mem),getOwnPropertyDescriptor:(_t,k)=>({enumerable:true,configurable:true,value:mem[k]})})}})();
 /* Define live-mirror state before any boot-time callback can touch it. */
 var CC_SESSION=window.CC_SESSION={cwd:"",model:"",tool:"",text:"",event:"",status:"idle"},CC_AGENTS={},CC_SWARM={},CC_LOGS=[];
+/* Terminal mirror of the real Claude Code console. */
+var CT_LINES=[],CT_SEQ=0,CT_PAUSE=false,CT_AUTOSCROLL=true,CT_STREAM=null,CT_STATUS="idle",CT_LASTT=0;
 const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const K={
@@ -7653,6 +8000,53 @@ function renderClaudeMirror(){
  const evt=sess.event?`<div class="ccmrow"><span>${t("ccEvent")}:</span><span>${esc(sess.event)}${sess.tool?` · ${esc(sess.tool)}`:""}</span></div>`:"";
  box.innerHTML=`<div class="ccm"><div class="ccmhead"><b>* ${t("ccMirror")}</b><span class="ccmstate">• ${dashStreamReady?t("ccConnected"):t("ccSnapshot")}</span></div><div class="ccmrow"><span>${t("ccProject")}:</span><span class="pth">${esc(project)}</span>${model}<span class="chip">${esc(rs)}</span><span class="chip">${t("ccAgents")}: ${active.length}</span></div>${evt}<div class="ccmagents">${chips}</div>${liveText}${logs}</div>`;
 }
+/* ---------- Claude Code console (terminal mirror) ---------- */
+const ctNow=()=>{const d=new Date();return d.toTimeString().slice(0,8)};
+function ctPush(kind,text,meta){
+ const line={n:++CT_SEQ,k:kind,t:ctNow(),m:text||"",x:meta||""};
+ CT_LINES.push(line);if(CT_LINES.length>800)CT_LINES.splice(0,CT_LINES.length-800);
+ ctRenderOne(line);
+}
+function ctRenderOne(l){
+ const box=$("#ctlog");if(!box)return;
+ const near=CT_AUTOSCROLL&&(box.scrollHeight-box.scrollTop-box.clientHeight<60);
+ const el=document.createElement("span");el.className="ctl ct-"+l.k;el.dataset.n=l.n;
+ el.innerHTML=`<span class="cts">${esc(l.t)}</span><span class="ctc">${esc(l.m)}</span>${l.x?` <span class="ctn">${esc(l.x)}</span>`:""}`;
+ box.appendChild(el);while(box.childElementCount>800)box.firstChild.remove();
+ if(near&&!CT_PAUSE)box.scrollTop=box.scrollHeight;
+}
+function ctRenderAll(){
+ const box=$("#ctlog");if(!box)return;box.innerHTML="";
+ const near=CT_AUTOSCROLL;
+ CT_LINES.forEach(l=>{const el=document.createElement("span");el.className="ctl ct-"+l.k;el.dataset.n=l.n;
+  el.innerHTML=`<span class="cts">${esc(l.t)}</span><span class="ctc">${esc(l.m)}</span>${l.x?` <span class="ctn">${esc(l.x)}</span>`:""}`;
+  box.appendChild(el)});
+ if(near&&!CT_PAUSE)box.scrollTop=box.scrollHeight;
+}
+function ctStatus(txt){CT_STATUS=txt;const m=$("#ctmeta");if(m)m.textContent=txt?("· "+txt):""}
+function ctFromClaude(d){
+ const ev=d.event||"";
+ if(ev==="UserPromptSubmit"){ctPush("prompt","› "+String(d.text||"").trim());ctStatus("prompt");}
+ else if(ev==="MessageDisplay"){const txt=String(d.text||"");if(!txt)return;
+  const last=CT_LINES[CT_LINES.length-1];
+  if(d.final){if(last&&last.k==="asst"&&last.__stream){last.m+=txt;const n=last.n;const b=$(`#ctlog .ctl[data-n="${n}"] .ctc`);if(b){b.textContent=last.m;const box=$("#ctlog");if(box&&CT_AUTOSCROLL&&!CT_PAUSE)box.scrollTop=box.scrollHeight}delete last.__stream}else{ctPush("asst",txt)}ctStatus("idle")}
+  else{if(last&&last.k==="asst"&&last.__stream){last.m+=txt;const n=last.n;const b=$(`#ctlog .ctl[data-n="${n}"] .ctc`);if(b){b.textContent=last.m;const box=$("#ctlog");if(box&&CT_AUTOSCROLL&&!CT_PAUSE)box.scrollTop=box.scrollHeight}}else{CT_LINES.push({n:++CT_SEQ,k:"asst",t:ctNow(),m:txt,x:"",__stream:true});ctRenderOne(CT_LINES[CT_LINES.length-1])}ctStatus("working…")}}
+ else if(ev==="PreToolUse"){const i=d.input||{};const arg=i.command||i.file_path||i.path||i.pattern||i.query||"";ctPush("tool","→ "+String(d.tool_name||"tool"),arg?`${arg}`:"");ctStatus(String(d.tool_name||"tool"));}
+ else if(ev==="PostToolUse"){ctPush("ok","✓ "+String(d.tool_name||"tool"),d.duration_ms?d.duration_ms+"ms":"");ctStatus("idle");}
+ else if(ev==="PostToolUseFailure"){ctPush("toolerr","✗ "+String(d.tool_name||"tool"),(d.duration_ms?d.duration_ms+"ms ":"")+String(d.reason||""));ctStatus("tool failed");}
+ else if(ev==="Notification"){ctPush("notice","! "+String(d.text||"").trim());}
+ else if(ev==="SessionStart"){ctPush("sys","session · "+String(d.model||""),String(d.source||""));ctStatus("ready");}
+ else{ctPush("sys",ev,function(){const i=d.input||{};return i.command||i.file_path||i.path||""}());}
+}
+function ctBind(){
+ const log=$("#ctlog");if(log&&!log.__bound){log.__bound=true;
+  log.addEventListener("scroll",()=>{const b=$("#ctlog");CT_AUTOSCROLL=b.scrollHeight-b.scrollTop-b.clientHeight<60});}
+ const p=$("#ctpause");if(p&&!p.__b){p.__b=true;p.onclick=()=>{CT_PAUSE=!CT_PAUSE;p.classList.toggle("on",CT_PAUSE)};}
+ const c=$("#ctclear");if(c&&!c.__b){c.__b=true;c.onclick=()=>{CT_LINES=[];ctRenderAll()};}
+ const w=$("#ctwrap");if(w&&!w.__b){w.__b=true;w.onclick=()=>{const b=$("#ctlog");if(b)b.style.whiteSpace=b.style.whiteSpace==="pre"?"pre-wrap":"pre"};}
+}
+function renderClaudeTerm(){ctBind();ctRenderAll();}
+
 function applyDashEvent(kind,data){
  if(kind==="settings"){
   if(INFO&&Array.isArray(data.settings))INFO.settings=data.settings;
@@ -7697,6 +8091,7 @@ function applyDashEvent(kind,data){
    CC_LOGS.push({level:"info",message:`Claude · ${data.event||"event"}${data.tool_name?` · ${data.tool_name}`:""}`});
    if(CC_LOGS.length>60)CC_LOGS.splice(0,CC_LOGS.length-60);
   }
+  ctFromClaude(data);
   renderClaudeMirror();
  }else if(kind==="prompt_improved"){
   renderClaudeMirror();
@@ -7892,19 +8287,21 @@ $("#cscope").onchange=e=>{connAcct=e.target.value;renderConnect()};$("#kshow").o
 $("#kw").addEventListener("click",e=>{const c=e.target.closest("[data-copy]");if(c)copyText(c.dataset.copy);const s=e.target.closest("[data-cs]");if(s)copyText(SN[+s.dataset.cs][1])});
 /* ---------- settings ---------- */
 let pend={};
+let openGroups=JSON.parse(localStorage.dsb_sgrp||'{}');
 async function renderSettings(){const I=await loadInfo(true);pend={};const lab=s=>L==="fa"?s.fa:s.en;
 const ctl=s=>{const n=esc(s.name);if(s.kind==="bool")return `<label class="sw"><input type="checkbox" data-n="${n}" ${s.value?"checked":""}><i></i></label>`;
 if(s.kind==="choice")return `<select class="inp" data-n="${n}" style="width:100%">${s.choices.map(c=>`<option ${c===s.value?"selected":""}>${c}</option>`).join("")}</select>`;
 if(s.kind==="str")return `<input class="inp" data-n="${n}" value="${esc(s.value)}">`;return `<input class="inp" type="number" data-n="${n}" value="${s.value}" min="${s.min}" max="${s.max}" step="${s.kind==="int"?1:.1}">`};
-const grp=g=>`<div class="box"><h3>${t("g_"+g)}</h3>${I.settings.filter(s=>s.group===g).map(s=>`<div class="srow" data-r="${esc(s.name)}"><div><b>${esc(lab(s))}</b><small>${esc(s.name)} · ${t("w_"+s.when)}</small></div><div class="ctl">${ctl(s)}</div><button class="ib" data-reset="${esc(s.name)}" title="↺">↺</button></div>`).join("")}</div>`;
+const grp=g=>`<details class="box sgrp" data-g="${g}" ${openGroups[g]!==false?"open":""}><summary><h3>${t("g_"+g)}</h3><span class="dim">${I.settings.filter(s=>s.group===g).length}</span></summary>${I.settings.filter(s=>s.group===g).map(s=>`<div class="srow" data-r="${esc(s.name)}"><div><b>${esc(lab(s))}</b><small>${esc(s.name)} · ${t("w_"+s.when)}</small></div><div class="ctl">${ctl(s)}</div><button class="ib" data-reset="${esc(s.name)}" title="↺">↺</button></div>`).join("")}</details>`;
 const th=localStorage.dsb_theme||"dark",ac=localStorage.dsb_acc||"violet";
 $("#sw").innerHTML=`<div class="box"><h3>🎨 ${t("look")}</h3><div class="tb"><button class="btn ${th==="dark"?"pri":""}" data-th="dark">◐ Dark</button><button class="btn ${th==="light"?"pri":""}" data-th="light">○ Light</button><button class="btn" id="slang">🌐 ${t("lang")}</button>
 <span class="tip">${t("accent")}:</span>${["violet","emerald","amber","sky"].map(c=>`<button class="btn sm ${ac===c?"pri":""}" data-ac="${c}">${c}</button>`).join("")}</div></div>
 ${["claude","rel","ctx","browser","swarm","panel"].map(grp).join("")}<div class="box"><h3>＋ ${t("maint")}</h3><div class="tb"><button class="btn" data-m="restart">↻ ${t("restartB")}</button><button class="btn dng" data-m="stop">⏹ ${t("stopB")}</button><button class="btn" data-m="usage">× ${t("resetU")}</button><button class="btn" data-task="selftest">🧪 ${t("selftest")}</button><button class="btn" data-task="verify">[] ${t("verify")}</button></div>
-<div class="tip mono">${esc(I.config)}<br>${esc(I.log)}<br>${esc(I.profiles)}</div></div><div id="savebar" hidden><span id="sbn"></span><button class="btn pri" id="sbsave">${t("saveChg")}</button></div>`}
+<div class="tip mono"><b>${esc(I.instance_name||"Bridge")}</b><br>home: ${esc(I.instance_home||"")}<br>config: ${esc(I.config||"")}<br>pid: ${esc(I.pid||"")} · port: ${esc(I.port||"")}<br>log: ${esc(I.log||"")}<br>profiles: ${esc(I.profiles||"")}<br><br><b>Running multiple instances</b><br>Each instance owns its home, config, profiles, logs and swarm attachments. Run a copied bridge with a different <code>--instance</code> and <code>--port</code>; never reuse another instance's port.</div></div><div id="savebar" hidden><span id="sbn"></span><button class="btn pri" id="sbsave">${t("saveChg")}</button></div>`}
 function setPend(el){const n=el.dataset.n,s=INFO.settings.find(x=>x.name===n);let v=el.type==="checkbox"?el.checked:el.value;if(s.kind==="int"||s.kind==="float")v=el.value===""?s.value:+el.value;
 if(v===s.value)delete pend[n];else pend[n]=v;el.closest(".srow").classList.toggle("chg",n in pend);const c=Object.keys(pend).length;$("#savebar").hidden=!c;$("#sbn").textContent=c+" "+t("unsaved")}
 $("#sw").addEventListener("input",e=>{if(e.target.dataset.n)setPend(e.target)});$("#sw").addEventListener("change",e=>{if(e.target.dataset.n)setPend(e.target)});
+$("#sw").addEventListener("toggle",e=>{const d=e.target;if(d.dataset&&d.dataset.g&&d.classList.contains("sgrp")){openGroups[d.dataset.g]=d.open;localStorage.dsb_sgrp=JSON.stringify(openGroups)}},true);
 $("#sw").addEventListener("click",async e=>{const el=e.target.closest("button");if(!el)return;
 if(el.dataset.reset){const s=INFO.settings.find(x=>x.name===el.dataset.reset),i=$(`[data-n="${s.name}"]`);if(i.type==="checkbox")i.checked=!!s.default;else i.value=s.default;setPend(i)}
 else if(el.dataset.th){localStorage.dsb_theme=el.dataset.th;applyTheme();renderSettings()}else if(el.dataset.ac){localStorage.dsb_acc=el.dataset.ac;applyTheme();renderSettings()}else if(el.id==="slang")$("#blang").click();
@@ -7913,11 +8310,11 @@ else if(el.dataset.m==="usage"){if(await ask(t("resetU")+"?")){await act("reset_
 else if(el.dataset.m){if(await ask(t(el.dataset.m==="restart"?"restartB":"stopB")+"?")){const r=await act("bridge",{action:el.dataset.m});if(r)toast("…")}}
 else if(el.dataset.task){const r=await act("task",{name:el.dataset.task});if(r){toast(t("started"));go("console")}}});
 /* ---------- command palette ---------- */
-function openPalette(){const items=[...PAGES.map(p=>({n:"→ "+t("n_"+p),r:()=>go(p)})),{n:"› "+t("nextAcct"),r:()=>act("command",{text:"next"})},{n:"⚖ "+t("balanced"),r:()=>act("settings",{strategy:"balanced"})},{n:"＋ "+t("newchat"),r:()=>{go("chat");newChat()}},{n:"＋ "+t("add"),r:addWizard},
-{n:"🌓 "+t("theme"),r:()=>$("#bth").click()},{n:"🌐 "+t("lang"),r:()=>$("#blang").click()},{n:"→ "+t("openCC"),r:async()=>{const r=await act("launch",{project:LS.project,mode:LS.mode});if(r)toast(`→ ${t("opened")} ${r.where}`)}},
-...(S?S.accounts.map(a=>({n:"▶ "+t("use")+": "+a.name,r:()=>act("use",{id:a.id})})):[])];
+function openPalette(){const both=k=>{const e=K[k]||[k,k];return e[0]+" "+e[1]};const items=[...PAGES.map(p=>({n:"→ "+t("n_"+p),s:"→ "+both("n_"+p),r:()=>go(p)})),{n:"› "+t("nextAcct"),s:"› "+both("nextAcct"),r:()=>act("command",{text:"next"})},{n:"⚖ "+t("balanced"),s:"⚖ "+both("balanced"),r:()=>act("settings",{strategy:"balanced"})},{n:"＋ "+t("newchat"),s:"＋ "+both("newchat"),r:()=>{go("chat");newChat()}},{n:"＋ "+t("add"),s:"＋ "+both("add"),r:addWizard},
+{n:"🌓 "+t("theme"),s:"🌓 "+both("theme"),r:()=>$("#bth").click()},{n:"🌐 "+t("lang"),s:"🌐 "+both("lang"),r:()=>$("#blang").click()},{n:"→ "+t("openCC"),s:"→ "+both("openCC"),r:async()=>{const r=await act("launch",{project:LS.project,mode:LS.mode});if(r)toast(`→ ${t("opened")} ${r.where}`)}},
+...(S?S.accounts.map(a=>({n:"▶ "+t("use")+": "+a.name,s:"▶ "+both("use")+": "+a.name,r:()=>act("use",{id:a.id})})):[])];
 const o=modal(`<input class="inp" id="pq" placeholder="${t("palPh")}"><div class="fl" id="pl"></div>`);let q="",ix=0,list=items;const draw=()=>{$("#pl",o).innerHTML=list.map((x,i)=>`<div data-i="${i}" ${i===ix?'style="background:var(--p2)"':""}>${esc(x.n)}</div>`).join("")};
-const pick=i=>{const x=list[i];o.close();if(x)x.r()};$("#pq",o).focus();draw();$("#pq",o).oninput=e=>{q=e.target.value.toLowerCase();list=items.filter(x=>x.n.toLowerCase().includes(q));ix=0;draw()};
+const pick=i=>{const x=list[i];o.close();if(x)x.r()};$("#pq",o).focus();draw();$("#pq",o).oninput=e=>{q=e.target.value.toLowerCase();list=items.filter(x=>(x.s||x.n).toLowerCase().includes(q));ix=0;draw()};
 $("#pq",o).onkeydown=e=>{if(e.key==="ArrowDown"){ix=Math.min(list.length-1,ix+1);draw()}else if(e.key==="ArrowUp"){ix=Math.max(0,ix-1);draw()}else if(e.key==="Enter")pick(ix);else if(e.key==="Escape")o.close()};$("#pl",o).onclick=e=>{const d=e.target.closest("[data-i]");if(d)pick(+d.dataset.i)}}
 document.addEventListener("keydown",e=>{if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="k"){e.preventDefault();openPalette()}});
 </script>
@@ -7955,7 +8352,7 @@ function addFeed(it){for(const [box,f] of [[$("#livefeed"),feedF],[$("#dockfeed"
 function refeed(){for(const [box,f] of [[$("#livefeed"),feedF],[$("#dockfeed"),"all"]]){box.innerHTML="";FEED.filter(it=>feedOk(it,f)).slice(-200).forEach(it=>box.append(fcardEl(it)));box.scrollTop=box.scrollHeight}if(!FEED.length){$("#livefeed").innerHTML=`<div class="tip" style="padding:20px;text-align:center">${t("lvEmpty")}</div>`;$("#dockfeed").innerHTML=`<div class="tip" style="padding:20px;text-align:center">${t("lvEmpty")}</div>`}}
 async function pollFeed(){if(dashStreamReady)return;try{const r=await api("activity?since="+feedLast);if(r.last<feedLast){feedLast=0;FEED=[];refeed()}if(r.items.length&&!FEED.length){$("#livefeed").innerHTML="";$("#dockfeed").innerHTML=""}r.items.forEach(it=>{FEED.push(it);feedLast=Math.max(feedLast,it.n);addFeed(it)});if(FEED.length>400)FEED.splice(0,FEED.length-400)}catch{}}
 function syncFeed(){clearInterval(feedTimer);if(page==="live"||$("#app").classList.contains("dock")){pollFeed();if(!dashStreamReady)feedTimer=setInterval(pollFeed,5000)}}
-function enterLive(){connectDashStream();renderClaudeMirror();$("#livetb").innerHTML=["all","main","agent","side"].map(k=>`<span class="fchip ${feedF===k?"on":""}" data-lf="${k}">${t("lv_"+k)}</span>`).join("")+`<span class="fchip ${feedPause?"on":""}" id="lvp">Ⅱ ${t("pause")}</span><span class="fchip" id="lvc">× ${t("clearv")}</span>`;refeed();syncFeed()}
+function enterLive(){connectDashStream();renderClaudeMirror();renderClaudeTerm();$("#livetb").innerHTML=["all","main","agent","side"].map(k=>`<span class="fchip ${feedF===k?"on":""}" data-lf="${k}">${t("lv_"+k)}</span>`).join("")+`<span class="fchip ${feedPause?"on":""}" id="lvp">Ⅱ ${t("pause")}</span><span class="fchip" id="lvc">× ${t("clearv")}</span>`;refeed();syncFeed()}
 $("#p-live").addEventListener("click",e=>{const f=e.target.closest("[data-lf]");if(f){feedF=f.dataset.lf;enterLive()}if(e.target.id==="lvp"){feedPause=!feedPause;enterLive()}if(e.target.id==="lvc"){FEED=[];refeed()}});
 function setDock(on){$("#app").classList.toggle("dock",on);localStorage.dsb_dock=on?"1":"";refeed();syncFeed()}$("#hdock").onclick=()=>setDock(!$("#app").classList.contains("dock"));$("#dockx").onclick=()=>setDock(false);
 /* ---------- swarm (parallel agents) ---------- */
@@ -8009,6 +8406,9 @@ $("#mobileNav").onclick=toggleMobileNav;$("#navshade").onclick=toggleMobileNav;
 document.addEventListener("keydown",e=>{if(e.key==="Escape"){$("#app")?.classList.remove("navopen");$("#navshade")?.setAttribute("hidden","")}});
 $("#bth").onclick=()=>{localStorage.dsb_theme=(localStorage.dsb_theme||"dark")==="dark"?"light":"dark";applyTheme()};$("#blang").onclick=()=>{L=L==="fa"?"en":"fa";localStorage.dsb_lang=L;applyLang()};
 $("#bpal").onclick=openPalette;$$(".nb[data-go]").forEach(b=>b.onclick=()=>go(b.dataset.go));
+function hashPage(){const h=location.hash;const r=(h.match(/#\/(\w+)/)||h.match(/[#&]p=(\w+)/)||[])[1];return PAGES.includes(r)?r:null}
+window.addEventListener("hashchange",()=>{const r=hashPage();if(r&&r!==page)go(r)});
+window.addEventListener("popstate",()=>{const r=hashPage();if(r&&r!==page)go(r)});
 applyTheme();applyUiPerformance();connectDashStream();renderClaudeMirror();{const r=(location.hash.match(/#\/(\w+)/)||location.hash.match(/[#&]p=(\w+)/)||[])[1];page=PAGES.includes(r)?r:"dash"}applyLang();loadInfo().catch(()=>{});if(localStorage.dsb_dock==="1")setDock(true);tick();
 </script></body></html>
 """
@@ -8018,9 +8418,6 @@ applyTheme();applyUiPerformance();connectDashStream();renderClaudeMirror();{cons
 # ============================================================================
 # HTTP API
 # ============================================================================
-
-BRIDGE: Any = None
-API_KEY: Optional[str] = None
 
 
 class ClientGone(Exception):
@@ -8038,6 +8435,23 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args) -> None:
         pass
+
+    def setup(self) -> None:
+        super().setup()
+        state = getattr(self.server, "runtime_state", None)
+        self._runtime_token = _CURRENT_STATE.set(state) if state is not None else None
+
+    def finish(self) -> None:
+        try:
+            super().finish()
+        finally:
+            token = getattr(self, "_runtime_token", None)
+            if token is not None:
+                try:
+                    _CURRENT_STATE.reset(token)
+                except Exception:
+                    pass
+                self._runtime_token = None
 
     def handle(self) -> None:
         try:
@@ -8092,7 +8506,7 @@ class APIHandler(BaseHTTPRequestHandler):
         supplied=self.headers.get("Authorization","").strip()
         supplied=supplied[7:].strip() if supplied.lower().startswith("bearer ") else supplied
         if not supplied: supplied=self.headers.get("x-ds-bridge-hook-key","").strip()
-        expected=str((getattr(BRIDGE,"cfg",{}) or {}).get("hook_key") or "")
+        expected=str((getattr(_state().BRIDGE,"cfg",{}) or {}).get("hook_key") or "")
         if not expected or not supplied: return False
         return secrets.compare_digest(supplied.encode("utf-8","ignore"),expected.encode("utf-8"))
 
@@ -8108,9 +8522,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 supplied = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("key", [""])[0]
             except Exception:
                 supplied = ""
-        if not API_KEY:
+        if not _state().API_KEY:
             return False
-        return secrets.compare_digest(supplied.encode("utf-8", "ignore"), API_KEY.encode("utf-8"))
+        return secrets.compare_digest(supplied.encode("utf-8", "ignore"), _state().API_KEY.encode("utf-8"))
 
     def _read_body(self) -> bytes:
         te = self.headers.get("Transfer-Encoding", "").lower()
@@ -8132,8 +8546,8 @@ class APIHandler(BaseHTTPRequestHandler):
                             break
                     break
                 total += size
-                if total > MAX_HTTP_BODY_BYTES:
-                    raise ValueError(f"request body too large (> {MAX_HTTP_BODY_BYTES:,} bytes)")
+                if total > _state().MAX_HTTP_BODY_BYTES:
+                    raise ValueError(f"request body too large (> {_state().MAX_HTTP_BODY_BYTES:,} bytes)")
                 data = self.rfile.read(size)
                 if len(data) != size:
                     raise ConnectionError("truncated chunk in request body")
@@ -8146,7 +8560,7 @@ class APIHandler(BaseHTTPRequestHandler):
             raise ValueError("invalid Content-Length header")
         if n < 0:
             raise ValueError("invalid Content-Length header")
-        if n > MAX_HTTP_BODY_BYTES:
+        if n > _state().MAX_HTTP_BODY_BYTES:
             raise ValueError(f"request body too large ({n:,} bytes)")
         if n == 0:
             return b""
@@ -8192,13 +8606,28 @@ class APIHandler(BaseHTTPRequestHandler):
                 else:
                     try:
                         from urllib.parse import parse_qs, urlsplit
-                        self._send_json(200, dash_get(BRIDGE, path[len("/dash/api/"):],
+                        self._send_json(200, dash_get(_state().BRIDGE, path[len("/dash/api/"):],
                                                       parse_qs(urlsplit(self.path).query)))
                     except ValueError as exc:
                         self._err(400, "invalid_request_error", str(exc))
-        elif path in ("/", "/health"):
+        elif path == "/":
+            state = _state()
             self._send_json(200, {"ok": True, "service": "deepseek-local-bridge", "version": VERSION,
-                                  "accounts": len(getattr(BRIDGE, "accounts", []) or [])})
+                                  "accounts": len(getattr(state.BRIDGE, "accounts", []) or [])})
+        elif path == "/health":
+            state = _state()
+            bound_port = int(getattr(self.server, "server_address", ("127.0.0.1", state.RESOLVED_PORT))[1])
+            self._send_json(200, {
+                "ok": True, "service": "deepseek-local-bridge", "version": VERSION,
+                "accounts": len(getattr(state.BRIDGE, "accounts", []) or []),
+                "script": str(state.paths.script),
+                "instance_name": state.instance_name,
+                "instance_home": str(state.paths.home),
+                "config": str(state.CONFIG_PATH),
+                "pid": state.PID,
+                "start_time": state.START_TIME,
+                "port": bound_port,
+            })
         elif path == "/v1/models":
             self._send_json(200, {"object": "list", "data": [
                 {"id": m, "object": "model", "type": "model", "display_name": m, "owned_by": "local"} for m in MODELS]})
@@ -8237,7 +8666,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_response(204)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
-                ingest_claude_hook(BRIDGE, data)
+                ingest_claude_hook(_state().BRIDGE, data)
             except Exception as exc:
                 log(f"[claude-hook] ignored malformed hook event: {exc}", C.yellow)
             return
@@ -8271,7 +8700,7 @@ class APIHandler(BaseHTTPRequestHandler):
             elif path.startswith("/dash/api/"):
                 if self._dash_host_ok():
                     try:
-                        self._send_json(200, dash_action(BRIDGE, path[len("/dash/api/"):], data))
+                        self._send_json(200, dash_action(_state().BRIDGE, path[len("/dash/api/"):], data))
                     except ValueError as exc:
                         self._err(400, "invalid_request_error", str(exc))
             elif path == "/v1/messages/count_tokens":
@@ -8337,7 +8766,7 @@ class APIHandler(BaseHTTPRequestHandler):
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             # Backlog is intentionally bounded so a reconnect is cheap.
-            for event in list(CLAUDE_MIRROR)[-120:]:
+            for event in list(_state().CLAUDE_MIRROR)[-120:]:
                 payload = json.dumps(event.get("data", {}), ensure_ascii=False, separators=(",", ":"))
                 self.wfile.write(f"id: {int(event.get('id', 0))}\nevent: {event.get('kind', 'event')}\ndata: {payload}\n\n".encode("utf-8"))
             self.wfile.flush()
@@ -8367,6 +8796,7 @@ class APIHandler(BaseHTTPRequestHandler):
             remove_dash_subscription(q)
 
     def _send_html(self, html: str) -> None:
+        html = html.replace("__INSTANCE_NAME__", _state().instance_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
         body = html.encode("utf-8")
         try:
             self.send_response(200)
@@ -8421,11 +8851,11 @@ class APIHandler(BaseHTTPRequestHandler):
     def _chat(self, req: NormReq) -> None:
         req.pin = getattr(self, "_pin", None)
         req.tag = getattr(self, "_tag", None)
-        sw = getattr(BRIDGE, "swarm", None)
+        sw = getattr(_state().BRIDGE, "swarm", None)
         if req.tag and sw is not None:
             req.role = sw.role_of(req.tag)
         t_req = time.time()
-        if req.pin and hasattr(BRIDGE, "get") and BRIDGE.get(req.pin) is None:
+        if req.pin and hasattr(_state().BRIDGE, "get") and _state().BRIDGE.get(req.pin) is None:
             self._err(404, "not_found_error", f"unknown account '{req.pin}'")
             return
         in_tokens = estimate_tokens([req.system_text, req.messages, list(req.tools)])
@@ -8442,28 +8872,28 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         # /ds slash command typed in Claude Code: answered here, instantly, without any model call.
-        if not req.side and hasattr(BRIDGE, "run_command"):
+        if not req.side and hasattr(_state().BRIDGE, "run_command"):
             cmd = extract_bridge_command(req)
             if cmd is not None:
-                self._reply_local(req, BRIDGE.run_command(cmd, ctx={"cwd": claude_cwd(req)}), in_tokens)
+                self._reply_local(req, _state().BRIDGE.run_command(cmd, ctx={"cwd": claude_cwd(req)}), in_tokens)
                 return
 
-        if BRIDGE is None or not BRIDGE.ok:
+        if _state().BRIDGE is None or not _state().BRIDGE.ok:
             self._err(529, "overloaded_error", "bridge is not ready")
             return
 
         cancel = threading.Event()
         evq: "queue.Queue[str]" = queue.Queue()
         streamer = SafeTextStream(evq.put)
-        prio = PRIORITY_SIDE if req.side else PRIORITY_MAIN
+        prio = _state().PRIORITY_SIDE if req.side else _state().PRIORITY_MAIN
         on_part = streamer.update if req.stream else None
-        if hasattr(BRIDGE, "dispatch"):
-            fut = BRIDGE.dispatch(req, cancel, on_part, lambda: bool(streamer.sent_text), prio)
+        if hasattr(_state().BRIDGE, "dispatch"):
+            fut = _state().BRIDGE.dispatch(req, cancel, on_part, lambda: bool(streamer.sent_text), prio)
         else:
-            fut = BRIDGE.submit(lambda eng: eng.process(req, cancel, on_part), priority=prio, cancel=cancel)
+            fut = _state().BRIDGE.submit(lambda eng: eng.process(req, cancel, on_part), priority=prio, cancel=cancel)
         emitter = None
         # Generous: a request may legitimately wait behind other long jobs.
-        deadline = time.time() + MAX_REPLY_SECONDS * 3 + 300
+        deadline = time.time() + _state().MAX_REPLY_SECONDS * 3 + 300
         try:
             if req.stream:
                 self._open_sse()
@@ -8482,7 +8912,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if fut.done() and evq.empty():
                     break
                 if not fut.done():
-                    if not BRIDGE.alive():
+                    if not _state().BRIDGE.alive():
                         raise BridgeError("the selected AI worker thread stopped unexpectedly", "upstream")
                     if time.time() > deadline:
                         raise BridgeError("the request exceeded the overall time limit", "timeout")
@@ -8517,10 +8947,12 @@ class APIHandler(BaseHTTPRequestHandler):
 # Server
 # ============================================================================
 
-def start_server(port: int) -> ThreadingHTTPServer:
+def start_server(port: int, state: Optional[RuntimeState] = None) -> ThreadingHTTPServer:
+    state = state or _state()
     server = ThreadingHTTPServer(("127.0.0.1", int(port)), APIHandler)
+    server.runtime_state = state
     server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True, name="DeepSeekHTTP").start()
+    state_thread(target=server.serve_forever, daemon=True, name="DeepSeekHTTP").start()
     return server
 
 
@@ -8587,16 +9019,16 @@ def print_banner(cfg: Dict[str, Any], url: str, mode: str = DEFAULT_MODE, mode_s
         print("    " + line)
     print()
     print(C.green("  Tuning:"))
-    print(f"    history budget / new chat : {HISTORY_BUDGET_CHARS:,} chars  (~{int(HISTORY_BUDGET_CHARS / CHARS_PER_TOKEN):,} tokens)")
-    print(f"    hard prompt ceiling       : {MAX_PROMPT_CHARS:,} chars  (DS_BRIDGE_MAX_PROMPT_CHARS)")
-    print(f"    max block in follow-ups   : {DELTA_BLOCK_LIMIT:,} chars  (DS_BRIDGE_DELTA_BLOCK_LIMIT)")
-    print(f"    chat rotation             : {ROTATE_CHARS:,} chars")
-    print(f"    max live tabs             : {MAX_TABS}  (older conversations hibernate, chats are kept; up to {MAX_KEPT_CONVS})")
-    print(f"    stall / max reply         : {STALL_TIMEOUT}s / {MAX_REPLY_SECONDS}s   retries: {MAX_RETRIES} (backoff up to {RETRY_BACKOFF_MAX}s)")
-    print(f"    delete old bridge chats   : {DELETE_OLD_CHATS}")
+    print(f"    history budget / new chat : {_state().HISTORY_BUDGET_CHARS:,} chars  (~{int(_state().HISTORY_BUDGET_CHARS / _state().CHARS_PER_TOKEN):,} tokens)")
+    print(f"    hard prompt ceiling       : {_state().MAX_PROMPT_CHARS:,} chars  (DS_BRIDGE_MAX_PROMPT_CHARS)")
+    print(f"    max block in follow-ups   : {_state().DELTA_BLOCK_LIMIT:,} chars  (DS_BRIDGE_DELTA_BLOCK_LIMIT)")
+    print(f"    chat rotation             : {_state().ROTATE_CHARS:,} chars")
+    print(f"    max live tabs             : {_state().MAX_TABS}  (older conversations hibernate, chats are kept; up to {_state().MAX_KEPT_CONVS})")
+    print(f"    stall / max reply         : {_state().STALL_TIMEOUT}s / {_state().MAX_REPLY_SECONDS}s   retries: {_state().MAX_RETRIES} (backoff up to {_state().RETRY_BACKOFF_MAX}s)")
+    print(f"    delete old bridge chats   : {_state().DELETE_OLD_CHATS}")
     print(f"    Claude Code mode          : {mode}  [{mode_src}]  (--mode safe|ask|auto, --set-mode to save)")
-    print(f"    debug dir                 : {DEBUG_DIR or '(off)'}")
-    print(f"    config file               : {CONFIG_PATH}")
+    print(f"    debug dir                 : {_state().DEBUG_DIR or '(off)'}")
+    print(f"    config file               : {_state().CONFIG_PATH}")
     print()
     print(C.dim("  Type /help for terminal commands."))
     print()
@@ -8616,7 +9048,7 @@ def print_help() -> None:
 
 def terminal_loop(cfg: Dict[str, Any], url: str) -> None:
     def run(fn):
-        return BRIDGE.submit(fn, PRIORITY_MAIN).result(timeout=300)
+        return _state().BRIDGE.submit(fn, _state().PRIORITY_MAIN).result(timeout=300)
 
     while True:
         try:
@@ -8646,13 +9078,13 @@ def terminal_loop(cfg: Dict[str, Any], url: str) -> None:
                     print(url)
                 elif cmd == "/status":
                     print(f"  server : {url}")
-                    print(BRIDGE.status_text())
-                    convs = BRIDGE.describe_all()
+                    print(_state().BRIDGE.status_text())
+                    convs = _state().BRIDGE.describe_all()
                     print("  conversations:" if convs else "  conversations: (none)")
                     for c in convs:
                         print("    " + c)
                 elif cmd in ("/acc", "/accounts"):
-                    print(BRIDGE.run_command(line[len(cmd):].strip() or "status"))
+                    print(_state().BRIDGE.run_command(line[len(cmd):].strip() or "status"))
                 elif cmd == "/new":
                     run(lambda e: e.terminal_reset())
                     print(C.green("[new terminal chat]"))
@@ -8680,15 +9112,13 @@ def terminal_loop(cfg: Dict[str, Any], url: str) -> None:
 def _selftest_v63_new_features() -> None:
     """V6.3: attachment storage, worktree exclusion, prompt improve, live events."""
     import tempfile
-    global CONFIG_PATH
-    old_cfg = CONFIG_PATH
+    old_cfg = _state().CONFIG_PATH
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        CONFIG_PATH = root / "cfg.json"
+        _state().CONFIG_PATH = root / "cfg.json"
         # Attachment round-trip, arbitrary bytes (including NULs), and safe filename handling.
-        global SWARM_ATTACH_DIR
-        old_attach = SWARM_ATTACH_DIR
-        SWARM_ATTACH_DIR = root / "attachments"
+        old_attach = _state().SWARM_ATTACH_DIR
+        _state().SWARM_ATTACH_DIR = root / "attachments"
         payload = bytes(range(256)) * 4
         meta = store_swarm_attachment("photo<>name.zip", "application/zip", payload)
         got = get_swarm_attachment(meta["id"])
@@ -8731,8 +9161,8 @@ def _selftest_v63_new_features() -> None:
             finally:
                 git(["worktree", "remove", "--force", str(wt)], proj, check=False)
                 git(["branch", "-D", "v63-test"], proj, check=False)
-        SWARM_ATTACH_DIR = old_attach
-    CONFIG_PATH = old_cfg
+        _state().SWARM_ATTACH_DIR = old_attach
+    _state().CONFIG_PATH = old_cfg
 
 def _selftest_multiauth() -> None:
     """Offline regression tests for multi web providers, thinking setting, and project affinity."""
@@ -8793,29 +9223,29 @@ def _selftest_multiauth() -> None:
     assert dt._inject_generic(fp, "textarea", long_text)==25000 and fp.loc.value==long_text
     assert "clipboard" not in str(fp.eval_calls[0][0]).lower() and "insert_text" not in str(fp.eval_calls[0][0]).lower()
     d=dt
-    assert d.provider=="chatgpt_web" and d.recipe["name"]=="ChatGPT" and d.think_pref==bool(THINK_MODE)
+    assert d.provider=="chatgpt_web" and d.recipe["name"]=="ChatGPT" and d.think_pref==bool(_state().THINK_MODE)
     # Native API reasoning fields are added only when the live setting is enabled.
-    old_think=globals()["THINK_MODE"]
+    old_think=_state().THINK_MODE
     try:
-        globals()["THINK_MODE"]=True
+        _state().THINK_MODE=True
         class A: provider="deepseek_api"; model="deepseek-chat"
         body=apply_think_mode({"messages":[]},A())
         assert body["thinking"]=={"type":"enabled"}
         class B: provider="openai"; model="gpt-5.2"
         body2=apply_think_mode({"messages":[]},B())
         assert body2["reasoning_effort"]=="high"
-        globals()["THINK_MODE"]=False
+        _state().THINK_MODE=False
         body3=apply_think_mode({"messages":[]},A())
         body4=apply_think_mode({"messages":[]},B())
         assert body3["thinking"]=={"type":"disabled"}
         assert body4["reasoning_effort"]=="low"
         tool_body=apply_think_mode({"messages":[],"tools":[{"type":"function"}],"tool_choice":"required"},A())
         assert tool_body["thinking"]=={"type":"disabled"} and tool_body["tool_choice"]=="required"
-        globals()["THINK_MODE"]=True
+        _state().THINK_MODE=True
         tool_body=apply_think_mode({"messages":[],"tools":[{"type":"function"}],"tool_choice":"required"},A())
         assert tool_body["thinking"]=={"type":"enabled"} and tool_body["tool_choice"]=="auto"
     finally:
-        globals()["THINK_MODE"]=old_think
+        _state().THINK_MODE=old_think
 
 
 
@@ -8861,16 +9291,16 @@ def _selftest_master_hardening() -> None:
     # The hook endpoint uses the dedicated hook key.
     class _HookHandler:
         headers = {"Authorization": "Bearer hook-secret"}
-    old_bridge = globals().get("BRIDGE")
+    old_bridge = _state().BRIDGE
     try:
         class _HookPool:
             cfg = {"hook_key": "hook-secret"}
-        globals()["BRIDGE"] = _HookPool()
+        _state().BRIDGE = _HookPool()
         assert APIHandler._check_hook_auth(_HookHandler()) is True
         _HookHandler.headers = {"Authorization": "Bearer wrong"}
         assert APIHandler._check_hook_auth(_HookHandler()) is False
     finally:
-        globals()["BRIDGE"] = old_bridge
+        _state().BRIDGE = old_bridge
 
     # An explicit empty account list must remain empty; it must not resurrect the legacy
     # DeepSeek profile or crash while assigning the pinned account.
@@ -8879,36 +9309,16 @@ def _selftest_master_hardening() -> None:
     assert empty_pool.accounts == [] and empty_pool.routing.get("pinned") is None
     assert startup_prepare_accounts(empty_pool, {"mode": "multi", "full": False}) == []
 
-    # Restoring an account with start=True must leave the newly started worker alive.
-    with tempfile.TemporaryDirectory() as td:
-        old_config_path = globals()["CONFIG_PATH"]
-        try:
-            globals()["CONFIG_PATH"] = Path(td) / "restore-config.json"
-            restore_pool = Pool({
-                "api_key": "k", "hook_key": "h",
-                "accounts": [{"id": "r1", "name": "Restored", "enabled": False,
-                              "deleted": True, "kind": "api", "provider": "custom_openai",
-                              "api_key": "x", "base_url": "http://127.0.0.1", "model": "m"}],
-                "routing": {}
-            }, autostart=False)
-            restored = restore_pool.get_by_id("r1")
-            assert restored is not None and restored.deleted is True
-            calls: List[Tuple[str, bool]] = []
-            class _RestoreWorker:
-                ok = True
-                def __init__(self): self.stopped = False
-                def stop(self): self.stopped = True
-            def fake_restore_start(account: Account, force_login: bool = False) -> None:
-                calls.append((account.id, force_login))
-                account.worker = _RestoreWorker()
-                account.status = "starting"
-            restore_pool.start_account = fake_restore_start  # type: ignore[method-assign]
-            restore_pool.restore_account(restored, start=True)
-            assert calls == [("r1", False)]
-            assert restored.worker is not None and not restored.worker.stopped
-            restore_pool.stop()
-        finally:
-            globals()["CONFIG_PATH"] = old_config_path
+    # Deleted accounts remain permanent deletions; the compatibility API must fail clearly.
+    restore_pool = Pool({"api_key": "k", "hook_key": "h", "accounts": [], "routing": {}}, autostart=False)
+    deleted = Account({"id": "r1", "name": "Deleted", "enabled": False, "deleted": True,
+                       "kind": "api", "provider": "custom_openai", "api_key": "x",
+                       "base_url": "http://127.0.0.1", "model": "m"})
+    try:
+        restore_pool.restore_account(deleted, start=True)
+        raise AssertionError("deleted account unexpectedly restorable")
+    except ValueError as exc:
+        assert "cannot be restored" in str(exc)
 
     # Deterministic lane ownership is stable and independent of request IDs.
     eg = Engine.__new__(Engine)
@@ -8923,7 +9333,7 @@ def _selftest_master_hardening() -> None:
 
     # Dashboard-only / selection-driven startup must not auto-start saved browser accounts.
     with tempfile.TemporaryDirectory() as td:
-        old_accounts_dir = globals().get("ACCOUNTS_DIR")
+        old_accounts_dir = _state().ACCOUNTS_DIR
         try:
             cfg_path = Path(td) / "cfg.json"
             cfg_local = {"api_key":"k", "hook_key":"h", "accounts":[{"id":"saved","name":"Saved",
@@ -8934,7 +9344,7 @@ def _selftest_master_hardening() -> None:
             pp.stop()
         finally:
             if old_accounts_dir is not None:
-                ACCOUNTS_DIR = old_accounts_dir
+                _state().ACCOUNTS_DIR = old_accounts_dir
 
     # Scheduler modes are deterministic and resource-aware.
     class _Gov:
@@ -8961,7 +9371,7 @@ def _selftest_master_hardening() -> None:
 
     log("Authorization: Bearer super-secret", C.dim, provider="chatgpt_web", account="g1",
         lane="lane-test", project="C:/Project", request_id="req-test", event="test.redaction")
-    assert "super-secret" not in LOG_RING[-1][3] and "[REDACTED]" in LOG_RING[-1][3]
+    assert "super-secret" not in _state().LOG_RING[-1][3] and "[REDACTED]" in _state().LOG_RING[-1][3]
 
     # UI invariants guarding the initialization race and lightweight mobile behavior.
     assert 'var CC_SESSION=window.CC_SESSION={cwd:"",model:"",tool:"",text:"",event:"",status:"idle"}' in DASH_HTML
@@ -9204,8 +9614,7 @@ def self_test() -> None:
     assert reconcile_stream("abc", "xyz") == ("", True)
 
     # 16. Real HTTP server against a fake worker: truncated chunked body, dead worker, clean streaming.
-    global BRIDGE, API_KEY
-    old_bridge, old_key = BRIDGE, API_KEY
+    old_bridge, old_key = _state().BRIDGE, _state().API_KEY
 
     class _FakeEngine:
         def process(self, req, cancel, on_partial):
@@ -9238,7 +9647,7 @@ def self_test() -> None:
                         fut.set_result(fn(_FakeEngine()))
                     except BaseException as exc:
                         fut.set_exception(exc)
-                threading.Thread(target=run, daemon=True).start()
+                state_thread(target=run, daemon=True).start()
             return fut
 
     def http(port: int, payload: bytes, half_close: bool = False, timeout: float = 8.0) -> bytes:
@@ -9260,7 +9669,7 @@ def self_test() -> None:
         finally:
             s.close()
 
-    API_KEY = "testkey"
+    _state().API_KEY = "testkey"
     server = start_server(0)
     port = server.server_address[1]
     try:
@@ -9275,7 +9684,7 @@ def self_test() -> None:
         r = http(port, head + b"Content-Length: -5\r\n\r\n")
         assert r.startswith(b"HTTP/1.1 400"), r[:80]
         # 16c. worker dead => 529 within seconds instead of hanging
-        BRIDGE = _FakeBridge(dead=True)
+        _state().BRIDGE = _FakeBridge(dead=True)
         body = json.dumps({"model": "m", "max_tokens": 50,
                            "messages": [{"role": "user", "content": "hi"}]}).encode()
         t0 = time.time()
@@ -9283,7 +9692,7 @@ def self_test() -> None:
         assert r.startswith(b"HTTP/1.1 529"), r[:80]
         assert time.time() - t0 < 5, "dead worker request hung"
         # 16d. streaming: no citation leak, text reconstructs exactly, tool call delivered
-        BRIDGE = _FakeBridge()
+        _state().BRIDGE = _FakeBridge()
         body = json.dumps({"model": "m", "max_tokens": 50, "stream": True,
                            "messages": [{"role": "user", "content": "hi"}]}).encode()
         r = http(port, head + b"Content-Length: %d\r\n\r\n" % len(body) + body, timeout=10).decode("utf-8", "replace")
@@ -9308,7 +9717,7 @@ def self_test() -> None:
             APIHandler.timeout = old_to
     finally:
         stop_server(server)
-        BRIDGE, API_KEY = old_bridge, old_key
+        _state().BRIDGE, _state().API_KEY = old_bridge, old_key
 
     # 17. Worker resilience: a job that dies with BaseException still resolves its future.
     bw = Bridge.__new__(Bridge)
@@ -9369,15 +9778,14 @@ def self_test() -> None:
 
     # 20. Follow-up prompts cap a single giant block; submit() cannot strand a job.
     big = [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "x", "content": "a" * 500_000}]}]
-    global DELTA_BLOCK_LIMIT
-    old_dbl = DELTA_BLOCK_LIMIT
+    old_dbl = _state().DELTA_BLOCK_LIMIT
     try:
-        DELTA_BLOCK_LIMIT = 150_000                 # independent of the user's environment
+        _state().DELTA_BLOCK_LIMIT = 150_000                 # independent of the user's environment
         assert len(build_delta_prompt(rq, big, False)) < 150_000 + 5_000
-        DELTA_BLOCK_LIMIT = 0                       # 0 = "no cap" must really mean no cap
+        _state().DELTA_BLOCK_LIMIT = 0                       # 0 = "no cap" must really mean no cap
         assert len(build_delta_prompt(rq, big, False)) > 400_000
     finally:
-        DELTA_BLOCK_LIMIT = old_dbl
+        _state().DELTA_BLOCK_LIMIT = old_dbl
     bq = Bridge.__new__(Bridge)
 
     class _DyingQueue(queue.PriorityQueue):
@@ -9389,12 +9797,11 @@ def self_test() -> None:
     assert isinstance(bq.submit(lambda e: 1).exception(timeout=1), BridgeError)
 
     # 21. Launcher: modes, permission-flag detection, settings files, project folder choice.
-    global CONFIG_PATH
     import tempfile
-    old_cfg_path = CONFIG_PATH
+    old_cfg_path = _state().CONFIG_PATH
     old_env_mode = os.environ.pop("DS_BRIDGE_MODE", None)
     with tempfile.TemporaryDirectory() as td:
-        CONFIG_PATH = Path(td) / "cfg.json"
+        _state().CONFIG_PATH = Path(td) / "cfg.json"
         try:
             # mode resolution: --mode > env > saved > default; junk is ignored, aliases work
             assert resolve_mode(None, {}) == ("safe", "default")
@@ -9494,7 +9901,7 @@ def self_test() -> None:
             assert 'window.CC_SESSION={cwd:"",model:"",tool:"",text:"",event:"",status:"idle"}' in DASH_HTML
             assert 'async function enterSwarm(){try{await loadInfo(true);S=await api("state")}' in DASH_HTML
         finally:
-            CONFIG_PATH = old_cfg_path
+            _state().CONFIG_PATH = old_cfg_path
             if old_env_mode is not None:
                 os.environ["DS_BRIDGE_MODE"] = old_env_mode
 
@@ -9513,7 +9920,6 @@ def _selftest_multi() -> None:
     import http.client
     import tempfile
     import types
-    global CONFIG_PATH, BRIDGE, API_KEY, ACCOUNT_WAIT_SECONDS
 
     # ---- classification
     assert classify_error("DeepSeek: HTTP 401: x") == "login"
@@ -9704,10 +10110,10 @@ def _selftest_multi() -> None:
 
         def stop(self): pass
 
-    old_cfg, old_wait = CONFIG_PATH, ACCOUNT_WAIT_SECONDS
-    ACCOUNT_WAIT_SECONDS = 0
+    old_cfg, old_wait = _state().CONFIG_PATH, _state().ACCOUNT_WAIT_SECONDS
+    _state().ACCOUNT_WAIT_SECONDS = 0
     with tempfile.TemporaryDirectory() as td:
-        CONFIG_PATH = Path(td) / "cfg.json"
+        _state().CONFIG_PATH = Path(td) / "cfg.json"
         cfg = {"port": 0, "api_key": "k", "accounts": [{"id": i, "name": n, "enabled": True, "logged_in": True,
                                                         "profile": str(Path(td) / i)} for i, n in (("a", "A"), ("b", "B"), ("c", "C"))]}
         pool = Pool(cfg, autostart=False)
@@ -9800,10 +10206,10 @@ def _selftest_multi() -> None:
         assert len(snap["accounts"]) == 3 and snap["accounts"][0]["state"] in ("ready", "cooldown") and snap["events"]
 
         # persistence
-        saved = json.loads(CONFIG_PATH.read_text())
+        saved = json.loads(_state().CONFIG_PATH.read_text())
         assert [d["id"] for d in saved["accounts"]] == ["a", "b", "c"] and saved["routing"]["strategy"] == "balanced"
         pool.save_usage()
-        pool2 = Pool(json.loads(CONFIG_PATH.read_text()), autostart=False)
+        pool2 = Pool(json.loads(_state().CONFIG_PATH.read_text()), autostart=False)
         assert pool2.get("a").stats.in_tok == 100_000 and pool2.get("2").id == "b"
         na = pool.add_account("Work #2!", start=False)
         assert na.id.startswith("work-2") and len(pool.accounts) == 4
@@ -9814,7 +10220,7 @@ def _selftest_multi() -> None:
         pool.remove_account(na, purge=False)
         assert len(pool.accounts) == 3 and pool.get("Work") is None
         assert not deleted_profile.exists()
-        saved_after_delete = json.loads(CONFIG_PATH.read_text())
+        saved_after_delete = json.loads(_state().CONFIG_PATH.read_text())
         assert all(d["id"] != deleted_id for d in saved_after_delete["accounts"])
         try:
             pool.restore_account(na, start=False)
@@ -9828,7 +10234,8 @@ def _selftest_multi() -> None:
         extra_profile.mkdir(parents=True, exist_ok=True)
         usage_path = pool._usage_path()
         usage_path.write_text(json.dumps({"version": 1, "accounts": {extra.id: {"req": 7}, "a": {"req": 2}}}), encoding="utf-8")
-        pool.set_project_accounts(str(proj), [extra.id, "a"])
+        project_mapping = str(Path(usage_path).parent / "project-test")
+        pool.set_project_accounts(project_mapping, [extra.id, "a"])
         pool.routing["pinned"] = extra.id
         pool.current = extra.id
         pool._last_route = extra.id
@@ -9838,14 +10245,14 @@ def _selftest_multi() -> None:
         assert pool.current != extra.id and pool._last_route is None
         assert extra.id not in sum(pool.project_accounts.values(), [])
         assert not extra_profile.exists()
-        saved = json.loads(CONFIG_PATH.read_text())
+        saved = json.loads(_state().CONFIG_PATH.read_text())
         assert extra.id not in {d["id"] for d in saved.get("accounts", [])}
         usage = json.loads(usage_path.read_text(encoding="utf-8"))
         assert extra.id not in usage.get("accounts", {}) and usage.get("accounts", {}).get("a", {}).get("req") == 2
 
         # ---- dashboard over real HTTP (auth, host / origin guard, actions, /ds interception)
-        old_b, old_k = BRIDGE, API_KEY
-        BRIDGE, API_KEY = pool, "k"
+        old_b, old_k = _state().BRIDGE, _state().API_KEY
+        _state().BRIDGE, _state().API_KEY = pool, "k"
         server = start_server(0)
         port = server.server_address[1]
 
@@ -9863,7 +10270,7 @@ def _selftest_multi() -> None:
             assert s == 200 and b"DeepSeek Bridge" in d and b"/dash/api/" in d and b'api("state")' in d
             assert call("GET", "/dash/api/state", headers={"Authorization": "Bearer nope"})[0] == 401
             s, d = call("GET", "/dash/api/state")
-            assert s == 200 and len(json.loads(d)["accounts"]) == 4
+            assert s == 200 and len(json.loads(d)["accounts"]) == 3
             assert call("GET", "/dash/api/state", headers={"Host": "evil.example"})[0] == 403
             assert call("POST", "/dash/api/use", {"id": "c"}, {"Origin": "http://evil.example"})[0] == 403
             assert call("POST", "/dash/api/use", {"id": "c"})[0] == 200 and pool.routing["pinned"] == "c"
@@ -9887,8 +10294,8 @@ def _selftest_multi() -> None:
             assert s == 200 and b"from " in d                          # a normal chat is routed through the pool
         finally:
             stop_server(server)
-            BRIDGE, API_KEY = old_b, old_k
-    CONFIG_PATH, ACCOUNT_WAIT_SECONDS = old_cfg, old_wait
+            _state().BRIDGE, _state().API_KEY = old_b, old_k
+    _state().CONFIG_PATH, _state().ACCOUNT_WAIT_SECONDS = old_cfg, old_wait
 
     # ---- slash command files are installed once and never overwrite a user's own command
     with tempfile.TemporaryDirectory() as td:
@@ -9927,8 +10334,8 @@ def _selftest_multi() -> None:
         def stop(self): pass
     DeepSeekWeb = _FakeWeb                                   # type: ignore[misc,assignment]
     with tempfile.TemporaryDirectory() as td:
-        old_cfg = CONFIG_PATH
-        CONFIG_PATH = Path(td) / "c.json"
+        old_cfg = _state().CONFIG_PATH
+        _state().CONFIG_PATH = Path(td) / "c.json"
         try:
             lp = Pool({"port": 0, "api_key": "k", "accounts": [
                 {"id": "a", "name": "A", "logged_in": True, "profile": td + "/a"},
@@ -9944,7 +10351,7 @@ def _selftest_multi() -> None:
             def _finish_interactive_login():
                 time.sleep(0.25)
                 la.set_status("ready")
-            threading.Thread(target=_finish_interactive_login, daemon=True).start()
+            state_thread(target=_finish_interactive_login, daemon=True).start()
             assert lp.wait_selected_ready([la.id], 1.5) is True
             lb.set_status("login")
             time.sleep(1.2)
@@ -9963,7 +10370,7 @@ def _selftest_multi() -> None:
             assert lb.status == "ready"
             lp.stop()
         finally:
-            CONFIG_PATH = old_cfg
+            _state().CONFIG_PATH = old_cfg
             DeepSeekWeb = real_web                           # type: ignore[misc,assignment]
     print("  [ok] multi-account: routing, cooldown, fail-over, /ds commands, dashboard API")
 
@@ -9972,7 +10379,6 @@ def _selftest_v61() -> None:
     """V6.1: files / images, per-account endpoints, settings, launcher, folder browser, console log, panel API."""
     import http.client
     import types
-    global CONFIG_PATH, BRIDGE, API_KEY, UPLOAD_TIMEOUT, MAX_TABS, ACCOUNT_WAIT_SECONDS
     PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 40
     b64 = lambda raw: base64.b64encode(raw).decode()
     img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64(PNG)}}
@@ -10049,14 +10455,14 @@ def _selftest_v61() -> None:
         raise AssertionError("expected an upload error")
     except BridgeError as exc:
         assert "upload HTTP 500" in str(exc)
-    old_to, UPLOAD_TIMEOUT = UPLOAD_TIMEOUT, 1
+    old_to, _state().UPLOAD_TIMEOUT = _state().UPLOAD_TIMEOUT, 1
     try:
         web._attach(_FP([{"n": 0, "open": 0, "seen": True}, {"n": 0, "open": 1, "seen": True}]), ["/x/a"], None)
         raise AssertionError("expected a timeout")
     except BridgeError as exc:
         assert exc.kind == "timeout"
     finally:
-        UPLOAD_TIMEOUT = old_to
+        _state().UPLOAD_TIMEOUT = old_to
 
     # ---- panel API, account endpoints, settings, launcher
     class _FE:
@@ -10076,10 +10482,10 @@ def _selftest_v61() -> None:
             return f
 
         def stop(self): pass
-    old_cfg, old_b, old_k, old_tabs = CONFIG_PATH, BRIDGE, API_KEY, MAX_TABS
+    old_cfg, old_b, old_k, old_tabs = _state().CONFIG_PATH, _state().BRIDGE, _state().API_KEY, _state().MAX_TABS
     real_which = shutil.which
     with tempfile.TemporaryDirectory() as td:
-        CONFIG_PATH = Path(td) / "cfg.json"
+        _state().CONFIG_PATH = Path(td) / "cfg.json"
         cfg = {"port": 8788, "api_key": "k", "accounts": [{"id": i, "name": i.upper(), "logged_in": True, "profile": td + "/" + i} for i in "ab"]}
         init_settings(cfg)
         pool = Pool(cfg, autostart=False)
@@ -10088,7 +10494,7 @@ def _selftest_v61() -> None:
             a.worker = _FW(a.id.upper())
         pool.routing.update(strategy="failover")
         (Path(td) / "sub").mkdir()
-        BRIDGE, API_KEY = pool, "k"
+        _state().BRIDGE, _state().API_KEY = pool, "k"
         server = start_server(0)
         port = server.server_address[1]
 
@@ -10108,18 +10514,18 @@ def _selftest_v61() -> None:
             assert call("POST", "/a/zzz/v1/messages", chat)[0] == 404
             assert call("GET", "/a/b/v1/models")[0] == 200
             pool.accounts[1].set_status("starting")
-            old_wait, ACCOUNT_WAIT_SECONDS = ACCOUNT_WAIT_SECONDS, 0
+            old_wait, _state().ACCOUNT_WAIT_SECONDS = _state().ACCOUNT_WAIT_SECONDS, 0
             try:
                 s, d = call("POST", "/a/b/v1/messages", chat)
             finally:
-                ACCOUNT_WAIT_SECONDS = old_wait
+                _state().ACCOUNT_WAIT_SECONDS = old_wait
             assert s >= 500 and b"not ready" in d                                       # never silently another account
             pool.accounts[1].set_status("ready")
             log("[v61-marker] hello console", C.yellow)
             s, d = call("GET", "/dash/api/info")
             info = json.loads(d)
             assert s == 200 and info["base"].endswith(":8788") and info["key"] == "k" and info["accounts"][1]["url"].endswith("/a/b")
-            assert len(info["settings"]) >= 20 and info["limits"]["files"] == ATTACH_MAX_FILES
+            assert len(info["settings"]) >= 20 and info["limits"]["files"] == _state().ATTACH_MAX_FILES
             s, d = call("GET", "/dash/api/logs?since=0")
             lg = json.loads(d)
             assert any("v61-marker" in x["m"] and x["l"] == "warn" for x in lg["lines"]) and lg["last"] >= 1
@@ -10141,16 +10547,16 @@ def _selftest_v61() -> None:
             assert s == 400 and b"not installed" in d
             shutil.which = real_which
             # settings: validated as a whole, applied live, saved, resettable
-            assert call("POST", "/dash/api/settings_set", {"values": {"MAX_TABS": 9, "KEEP_GOING": False}})[0] == 200 and MAX_TABS == 9
-            assert json.loads(CONFIG_PATH.read_text())["settings"]["MAX_TABS"] == 9
+            assert call("POST", "/dash/api/settings_set", {"values": {"MAX_TABS": 9, "KEEP_GOING": False}})[0] == 200 and _state().MAX_TABS == 9
+            assert json.loads(_state().CONFIG_PATH.read_text())["settings"]["MAX_TABS"] == 9
             s, d = call("POST", "/dash/api/settings_set", {"values": {"MAX_TABS": 11, "STALL_TIMEOUT": 1}})
-            assert s == 400 and MAX_TABS == 9, "an invalid value must not apply anything"
+            assert s == 400 and _state().MAX_TABS == 9, "an invalid value must not apply anything"
             assert call("POST", "/dash/api/settings_set", {"values": {"nope": 1}})[0] == 400
             s, d = call("POST", "/dash/api/settings_set", {"values": {"port": 9001, "permission_mode": "auto"}})
             assert json.loads(d)["restart"] == ["port"] and pool.cfg["port"] == 9001 and pool.cfg["permission_mode"] == "auto"
             call("POST", "/dash/api/settings_set", {"reset": ["port", "permission_mode", "MAX_TABS", "KEEP_GOING"]})
-            assert MAX_TABS == old_tabs and pool.cfg["port"] == DEFAULT_PORT and "permission_mode" not in pool.cfg
-            assert "MAX_TABS" not in json.loads(CONFIG_PATH.read_text())["settings"]
+            assert _state().MAX_TABS == old_tabs and pool.cfg["port"] == DEFAULT_PORT and "permission_mode" not in pool.cfg
+            assert "MAX_TABS" not in json.loads(_state().CONFIG_PATH.read_text())["settings"]
             pool.accounts[0].stats.record_exchange(4000, 400, 1)
             assert call("POST", "/dash/api/reset_usage", {})[0] == 200 and pool.accounts[0].stats.in_tok == 0
             assert call("POST", "/dash/api/bridge", {"action": "stop"})[0] == 400       # inside Claude Code: refused, not killed
@@ -10161,7 +10567,7 @@ def _selftest_v61() -> None:
         finally:
             shutil.which = real_which
             stop_server(server)
-            CONFIG_PATH, BRIDGE, API_KEY = old_cfg, old_b, old_k
+            _state().CONFIG_PATH, _state().BRIDGE, _state().API_KEY = old_cfg, old_b, old_k
     print("  [ok] v6.1: files + vision upload, account endpoints, settings, launcher, folder browser, console log")
 
 
@@ -10169,7 +10575,6 @@ def _selftest_api() -> None:
     """V6.2: API accounts (OpenAI-compatible + Anthropic), tiers, budget, parallel requests."""
     import types
     from http.server import BaseHTTPRequestHandler as _H, ThreadingHTTPServer as _S
-    global CONFIG_PATH, ACCOUNT_WAIT_SECONDS, MAX_TABS
     state: Dict[str, Any] = {"hits": [], "delay": 0.0}
 
     class Up(_H):
@@ -10218,7 +10623,7 @@ def _selftest_api() -> None:
                              "usage": {"input_tokens": 1000, "output_tokens": 200}})
     up = _S(("127.0.0.1", 0), Up)
     up.daemon_threads = True
-    threading.Thread(target=up.serve_forever, daemon=True).start()
+    state_thread(target=up.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{up.server_address[1]}"
 
     # ---- request conversion Anthropic -> OpenAI
@@ -10237,10 +10642,10 @@ def _selftest_api() -> None:
     assert guess_tier("claude-opus-4") == 5 and guess_tier("gpt-4o-mini") == 2 and guess_tier("grok-3") == 4 and guess_tier("deepseek-chat") == 3
     assert api_base("https://x.ai") == "https://x.ai/v1" and api_base("https://x.ai/v1/") == "https://x.ai/v1"
 
-    old_cfg, old_wait = CONFIG_PATH, ACCOUNT_WAIT_SECONDS
-    ACCOUNT_WAIT_SECONDS = 0
+    old_cfg, old_wait = _state().CONFIG_PATH, _state().ACCOUNT_WAIT_SECONDS
+    _state().ACCOUNT_WAIT_SECONDS = 0
     with tempfile.TemporaryDirectory() as td:
-        CONFIG_PATH = Path(td) / "c.json"
+        _state().CONFIG_PATH = Path(td) / "c.json"
         pool = Pool({"port": 1, "api_key": "k", "accounts": [{"id": "w", "name": "Web", "logged_in": True, "profile": td + "/w"}]}, autostart=False)
         web = pool.accounts[0]
         web.set_status("ready")
@@ -10344,17 +10749,17 @@ def _selftest_api() -> None:
         except ValueError:
             pass
         # settings / tiers from the console; API keys are refused inside a chat
-        old_tabs = MAX_TABS
-        assert pool.run_command("set MAX_TABS 12") == "MAX_TABS = 12" and MAX_TABS == 12 and "MAX_TABS = 12   (default" in pool.run_command("settings")
-        assert pool.run_command("set MAX_TABS 0").startswith("Error") and MAX_TABS == 12 and pool.run_command("set nope 1").startswith("Usage")
+        old_tabs = _state().MAX_TABS
+        assert pool.run_command("set MAX_TABS 12") == "MAX_TABS = 12" and _state().MAX_TABS == 12 and "MAX_TABS = 12   (default" in pool.run_command("settings")
+        assert pool.run_command("set MAX_TABS 0").startswith("Error") and _state().MAX_TABS == 12 and pool.run_command("set nope 1").startswith("Usage")
         assert "after a restart" in pool.run_command("set port 9000") and pool.run_command("tier Cheap2 5").startswith("'Cheap2' is now tier 5")
         settings_set(pool.cfg, {}, ["port", "MAX_TABS"])
-        assert MAX_TABS == old_tabs and "Never type an API key" in pool.run_command("add-api grok sk-secret")
+        assert _state().MAX_TABS == old_tabs and "Never type an API key" in pool.run_command("add-api grok sk-secret")
         added = pool.run_command("add-api grok sk-secret grok-4", secret=True)
         assert added.startswith("Added") and any(x.api_key == "sk-secret" and x.provider == "grok" and x.tier == 5 for x in pool.accounts)
         pool.stop()
     up.shutdown()
-    CONFIG_PATH, ACCOUNT_WAIT_SECONDS = old_cfg, old_wait
+    _state().CONFIG_PATH, _state().ACCOUNT_WAIT_SECONDS = old_cfg, old_wait
     print("  [ok] v6.2: API accounts (OpenAI + Anthropic wire formats), tool calls, tiers, budget, parallel, secrets")
 
 
@@ -10396,7 +10801,6 @@ def _selftest_swarm() -> None:
     """V6.2: activity feed, /panel + /swarm commands, quality plan parsing, and the parallel swarm itself."""
     import http.client
     import types
-    global CONFIG_PATH, BRIDGE, API_KEY, SWARM_FIX_ROUNDS
 
     # ---- pure helpers
     assert in_scope("api/x/y.py", ["api/**"]) and in_scope("api.py", ["api.py"]) and in_scope("a/b.txt", ["a/"])
@@ -10429,7 +10833,7 @@ def _selftest_swarm() -> None:
         return
 
     # ---- environment: a git project, a fake `claude` on PATH, a pool whose model returns a plan for the planner
-    old_cfg, old_b, old_k, old_path, old_fix = CONFIG_PATH, BRIDGE, API_KEY, os.environ.get("PATH", ""), SWARM_FIX_ROUNDS
+    old_cfg, old_b, old_k, old_path, old_fix = _state().CONFIG_PATH, _state().BRIDGE, _state().API_KEY, os.environ.get("PATH", ""), _state().SWARM_FIX_ROUNDS
     real_open = globals()["open_dashboard"]
     opened: List[Any] = []
     globals()["open_dashboard"] = lambda url, key, page="": opened.append(page)
@@ -10453,7 +10857,7 @@ def _selftest_swarm() -> None:
         def stop(self): pass
 
     with tempfile.TemporaryDirectory() as td:
-        CONFIG_PATH = Path(td) / "cfg.json"
+        _state().CONFIG_PATH = Path(td) / "cfg.json"
         binp = Path(td) / "bin"
         binp.mkdir()
         (binp / "claude").write_text(FAKE_CLAUDE.format(py=sys.executable))
@@ -10469,7 +10873,7 @@ def _selftest_swarm() -> None:
         pool = Pool({"port": 0, "api_key": "k", "accounts": [{"id": "a", "name": "A", "logged_in": True, "profile": td + "/a"}]}, autostart=False)
         pool.accounts[0].set_status("ready")
         pool.accounts[0].worker = _FW()
-        BRIDGE, API_KEY = pool, "k"
+        _state().BRIDGE, _state().API_KEY = pool, "k"
         server = start_server(0)
         pool.cfg["port"] = server.server_address[1]
         port = pool.cfg["port"]
@@ -10502,14 +10906,14 @@ def _selftest_swarm() -> None:
             assert s == 200 and json.loads(d)["project"] == str(proj.resolve())
 
             # ---- activity feed + commands
-            n0 = len(ACTIVITY)
+            n0 = len(_state().ACTIVITY)
             s, d = call("POST", "/s/swX.a9/v1/messages", {"model": "claude-sonnet-4", "max_tokens": 50, "messages": [{"role": "user", "content": "hello feed"}]})
             assert s == 200
-            last = ACTIVITY[-1]
-            assert len(ACTIVITY) == n0 + 1 and last["tag"] == "swX.a9" and last["kind"] == "agent" and last["account"] == "A" and "hello feed" in last["user"]
+            last = _state().ACTIVITY[-1]
+            assert len(_state().ACTIVITY) == n0 + 1 and last["tag"] == "swX.a9" and last["kind"] == "agent" and last["account"] == "A" and "hello feed" in last["user"]
             s, d = call("GET", "/dash/api/activity?since=0")
             assert any(x["tag"] == "swX.a9" for x in json.loads(d)["items"])
-            assert json.loads(call("GET", f"/dash/api/activity?since={ACTIVITY[-1]['n']}")[1])["items"] == []
+            assert json.loads(call("GET", f"/dash/api/activity?since={_state().ACTIVITY[-1]['n']}")[1])["items"] == []
             assert "Panel opened" in pool.run_command("panel swarm") and opened[-1] == "swarm"
             pool.run_command("panel nonsense")
             assert opened[-1] == ""
@@ -10538,8 +10942,8 @@ def _selftest_swarm() -> None:
             a3 = run.get("a3")
             assert "api/a.py" in git(["ls-tree", "-r", "--name-only", a3.base], proj).stdout, "a dependent task must start from the merged work"
             assert all(not a.violations for a in run.agents) and "3/3 agents merged" in run.summary
-            tags = {x["tag"] for x in ACTIVITY if x["tag"].startswith(run.id)}
-            assert {f"{run.id}.a1", f"{run.id}.a2", f"{run.id}.a3"} <= tags and all(x["role"] == "coder" for x in ACTIVITY if x["tag"].startswith(run.id + ".a"))
+            tags = {x["tag"] for x in _state().ACTIVITY if x["tag"].startswith(run.id)}
+            assert {f"{run.id}.a1", f"{run.id}.a2", f"{run.id}.a3"} <= tags and all(x["role"] == "coder" for x in _state().ACTIVITY if x["tag"].startswith(run.id + ".a"))
             assert git(["status", "--porcelain"], proj).stdout.strip() == "", "the swarm must not dirty the user's folder"
             assert "Merged into main" in pool.swarm.apply(run) and (proj / "api" / "a.py").read_text().strip() == "A = 1"
             try:
@@ -10617,7 +11021,7 @@ def _selftest_swarm() -> None:
             stop_server(server)
             globals()["open_dashboard"] = real_open
             os.environ["PATH"] = old_path
-            CONFIG_PATH, BRIDGE, API_KEY, SWARM_FIX_ROUNDS = old_cfg, old_b, old_k, old_fix
+            _state().CONFIG_PATH, _state().BRIDGE, _state().API_KEY, _state().SWARM_FIX_ROUNDS = old_cfg, old_b, old_k, old_fix
     print("  [ok] v6.2: live feed, /panel + /swarm, parallel git-worktree swarm (deps, cap, verify-fix, conflicts, strict scope, stop, apply)")
 
 
@@ -10785,15 +11189,10 @@ def _claude_hook_events() -> Tuple[str, ...]:
 _CLAUDE_MIRROR_EVENTS = _claude_hook_events()
 
 
-def _claude_hook_url() -> str:
-    """Return a concrete localhost URL; Claude Code validates URL syntax before launch."""
-    port = DEFAULT_PORT
-    try:
-        cfg = load_config()
-        port = int(cfg.get("port") or DEFAULT_PORT)
-    except Exception:
-        pass
-    return f"http://127.0.0.1:{port}/dash/api/claude-hook"
+def _claude_hook_url(port: Optional[int] = None) -> str:
+    """Return a concrete localhost URL matching the port of this runtime instance."""
+    resolved = int(port if port is not None else _state().RESOLVED_PORT)
+    return f"http://127.0.0.1:{resolved}/dash/api/claude-hook"
 
 
 def claude_mirror_settings() -> Dict[str, Any]:
@@ -10803,7 +11202,7 @@ def claude_mirror_settings() -> Dict[str, Any]:
     is validated against CLAUDE_HOOK_EVENT_UNION before it is emitted. The hook never returns a decision
     and therefore cannot block Claude.
     """
-    url = _claude_hook_url()
+    url = _claude_hook_url(int(_state().cfg.get("port", DEFAULT_PORT)))
     groups: Dict[str, Any] = {}
     for event in _CLAUDE_MIRROR_EVENTS:
         groups[event] = [{"hooks": [{
@@ -10880,8 +11279,6 @@ def _write_json_once(path: Path, obj: Dict[str, Any]) -> Optional[str]:
         return None
 
 
-KEEP_GOING = _env_bool("DS_BRIDGE_KEEP_GOING", True)
-KEEP_GOING_MAX = _env_int("DS_BRIDGE_KEEP_GOING_MAX", 400)
 
 _KEEP_GOING_SCRIPT = r'''# Written by DeepSeek Local Bridge: Claude Code "Stop" hook for unattended projects.
 # It only acts when <project>/PROGRESS.md exists and does not yet start with FINAL BUILD COMPLETE.
@@ -10930,7 +11327,7 @@ def keep_going_settings() -> Dict[str, Any]:
     script = _settings_path("keepgoing").with_suffix(".py")
     try:
         script.parent.mkdir(parents=True, exist_ok=True)
-        text = _KEEP_GOING_SCRIPT.replace("__MAX__", str(KEEP_GOING_MAX))
+        text = _KEEP_GOING_SCRIPT.replace("__MAX__", str(_state().KEEP_GOING_MAX))
         if not script.exists() or script.read_text(encoding="utf-8") != text:
             script.write_text(text, encoding="utf-8")
     except Exception as exc:
@@ -10941,7 +11338,7 @@ def keep_going_settings() -> Dict[str, Any]:
 
 
 def _settings_path(name: str) -> Path:
-    return CONFIG_PATH.with_name(f".deepseek_bridge_claude_{name}.json")
+    return _state().CONFIG_PATH.with_name(f".deepseek_bridge_claude_{name}.json")
 
 
 _ROOT_ALLOWED_TOOLS = ("Bash,Read,Write,Edit,MultiEdit,NotebookEdit,Glob,Grep,LS,WebFetch,WebSearch,"
@@ -10974,7 +11371,7 @@ def permission_args(mode: str, extra: List[str]) -> List[str]:
                                 "so all built-in tools are pre-approved instead")
         args = [f"--allowedTools={_ROOT_ALLOWED_TOOLS}", "--permission-mode", "acceptEdits"]
         if not has_settings:
-            conf = keep_going_settings() if KEEP_GOING else claude_mirror_settings()
+            conf = keep_going_settings() if _state().KEEP_GOING else claude_mirror_settings()
             sf = _write_json_once(_settings_path("auto"), conf)
             if sf:
                 args += ["--settings", sf]
@@ -10983,7 +11380,7 @@ def permission_args(mode: str, extra: List[str]) -> List[str]:
     if not has_settings:
         # Pre-accepts Claude Code's one-time "bypass permissions" warning screen.
         conf: Dict[str, Any] = _merge_claude_hook_settings({"skipDangerousModePermissionPrompt": True})
-        if KEEP_GOING:
+        if _state().KEEP_GOING:
             conf.update(keep_going_settings())
         sf = _write_json_once(_settings_path("auto"), conf)
         if sf:
@@ -11020,7 +11417,7 @@ def launch_claude(cfg: Dict[str, Any], url: str, project: Path, extra: List[str]
         print(C.red("[error] 'claude' was not found in PATH."))
         print("Install it with:  npm install -g @anthropic-ai/claude-code")
         return 127
-    install_claude_commands()
+    install_claude_commands(getattr(_state(), "CLAUDE_COMMANDS_DIR", None), getattr(_state(), "FORCE_CLAUDE_COMMANDS", False))
     cmd = [exe, *permission_args(mode, extra), *extra]
     old = signal.signal(signal.SIGINT, signal.SIG_IGN)   # Ctrl+C belongs to Claude Code
     try:
@@ -11063,7 +11460,6 @@ def _verify_safe(made: List[Path]) -> int:
     Exit code 0 = every expectation held.
     """
     import tempfile
-    global BRIDGE, API_KEY
     exe = shutil.which("claude")
     if not exe:
         print(C.red("[verify-safe] 'claude' was not found in PATH (npm install -g @anthropic-ai/claude-code)."))
@@ -11176,11 +11572,11 @@ def _verify_safe(made: List[Path]) -> int:
                     fut.set_result(fn(_Engine()))
                 except BaseException as exc:
                     fut.set_exception(exc)
-            threading.Thread(target=run, daemon=True).start()
+            state_thread(target=run, daemon=True).start()
             return fut
 
-    old_bridge, old_key = BRIDGE, API_KEY
-    BRIDGE, API_KEY = _Bridge(), "verify-key"           # type: ignore[assignment]
+    old_bridge, old_key = _state().BRIDGE, _state().API_KEY
+    _state().BRIDGE, _state().API_KEY = _Bridge(), "verify-key"           # type: ignore[assignment]
     server = start_server(0)
     print(C.bold(f"[verify-safe] {ver or 'claude'}  |  {len(cases)} scenarios  |  this takes about a minute"))
     try:
@@ -11189,7 +11585,7 @@ def _verify_safe(made: List[Path]) -> int:
         # policy settings, if any, still apply - that is what Claude Code enforces on this machine.)
         home = tempfile.mkdtemp(prefix="dsb_verify_home_")
         made.append(Path(home))
-        ours = claude_env({"api_key": API_KEY}, f"http://127.0.0.1:{server.server_address[1]}")
+        ours = claude_env({"api_key": _state().API_KEY}, f"http://127.0.0.1:{server.server_address[1]}")
         env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("CLAUDE", "ANTHROPIC"))}
         env.update({k: v for k, v in ours.items() if k.startswith(("CLAUDE", "ANTHROPIC"))})
         env.update({"HOME": home, "USERPROFILE": home, "CLAUDE_CONFIG_DIR": str(Path(home) / ".claude")})
@@ -11202,7 +11598,7 @@ def _verify_safe(made: List[Path]) -> int:
         print(C.red(f"[verify-safe] could not run Claude Code: {exc}"))
     finally:
         stop_server(server)
-        BRIDGE, API_KEY = old_bridge, old_key
+        _state().BRIDGE, _state().API_KEY = old_bridge, old_key
 
     bad = 0
     ran_n = 0
@@ -11271,7 +11667,6 @@ def ensure_dependencies(cfg: Dict[str, Any], need_claude: bool) -> bool:
     Claude Code. A system Chromium/Chrome binary is accepted before attempting a
     network-backed Playwright browser download.
     """
-    global BROWSER_CHANNEL
     import importlib
     try:
         importlib.import_module("playwright")
@@ -11286,9 +11681,9 @@ def ensure_dependencies(cfg: Dict[str, Any], need_claude: bool) -> bool:
         system_browser = (shutil.which("chromium") or shutil.which("chromium-browser") or
                           shutil.which("google-chrome") or shutil.which("chrome"))
         if system_browser:
-            BROWSER_CHANNEL = ""
+            _state().BROWSER_CHANNEL = ""
         else:
-            BROWSER_CHANNEL = ""                      # use Playwright's own Chromium
+            _state().BROWSER_CHANNEL = ""                      # use Playwright's own Chromium
             if not cfg.get("chromium_installed"):
                 print(C.yellow("[setup] no supported system browser found; installing Playwright Chromium..."), flush=True)
                 if not _run([sys.executable, "-m", "playwright", "install", "chromium"]):
@@ -11309,14 +11704,66 @@ def ensure_dependencies(cfg: Dict[str, Any], need_claude: bool) -> bool:
     return True
 
 
-def bridge_already_running(port: int) -> bool:
-    import urllib.request
+class BridgeInstanceConflict(RuntimeError):
+    pass
+
+
+def _health_identity(port: int, timeout: float = 1.2) -> Optional[Dict[str, Any]]:
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1.5) as r:
-            return bool(json.loads(r.read().decode("utf-8", "replace")).get("ok"))
+        with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}/health", timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        return data if isinstance(data, dict) and data.get("ok") and data.get("service") == "deepseek-local-bridge" else None
+    except Exception:
+        return None
+
+
+def _port_occupied(port: int) -> bool:
+    sck = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sck.settimeout(0.4)
+        return sck.connect_ex(("127.0.0.1", int(port))) == 0
     except Exception:
         return False
+    finally:
+        sck.close()
 
+
+def find_running_instances(start_port: int, end_port: int) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for port in range(int(start_port), int(end_port) + 1):
+        ident = _health_identity(port)
+        if ident is not None:
+            item = dict(ident)
+            item["port"] = int(item.get("port") or port)
+            out.append(item)
+    return out
+
+
+def bridge_already_running(port: int, state: Optional[RuntimeState] = None) -> Optional[Dict[str, Any]]:
+    ident = _health_identity(port)
+    if ident is None:
+        if _port_occupied(port):
+            raise BridgeInstanceConflict(
+                f"TCP port {port} is already in use by another process, but it is not a DeepSeek Local Bridge; "
+                f"pick a different --port."
+            )
+        return None
+    state = state or _state()
+    same_config = str(Path(str(ident.get("config", ""))).resolve(strict=False)) == str(state.CONFIG_PATH.resolve(strict=False))
+    same_script = str(Path(str(ident.get("script", ""))).resolve(strict=False)) == str(SCRIPT_PATH.resolve(strict=False))
+    same_home = str(Path(str(ident.get("instance_home", ""))).resolve(strict=False)) == str(state.paths.home.resolve(strict=False))
+    if same_config and same_script and same_home:
+        return ident
+    raise BridgeInstanceConflict(
+        "port conflict: another bridge instance is already listening here.\n"
+        f"  port: {port}\n"
+        f"  name: {ident.get('instance_name', '?')}\n"
+        f"  pid: {ident.get('pid', '?')}\n"
+        f"  script: {ident.get('script', '?')}\n"
+        f"  instance home: {ident.get('instance_home', '?')}\n"
+        f"  config: {ident.get('config', '?')}\n"
+        "Pick a different --port for this instance."
+    )
 
 
 # ============================================================================
@@ -11335,7 +11782,7 @@ def _startup_accounts_from_cfg(cfg: Dict[str, Any], provider: str) -> List[Dict[
     items = [d for d in raw if isinstance(d, dict) and d.get("id")] if isinstance(raw, list) else []
     if not items and provider == "deepseek_web":
         try:
-            had = PROFILE_DIR.exists() and any(PROFILE_DIR.iterdir())
+            had = _state().PROFILE_DIR.exists() and any(_state().PROFILE_DIR.iterdir())
         except Exception:
             had = False
         items = [{"id": "main", "name": "Account 1", "enabled": True, "logged_in": had,
@@ -11466,10 +11913,31 @@ def _startup_provider_items(cfg: Dict[str, Any]) -> List[Tuple[str, str]]:
 
 
 def startup_ai_menu(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the user's explicit startup choice. No AI worker is started here."""
+    """Interactive chooser; non-interactive callers must get deterministic startup behavior."""
     if not sys.stdin.isatty():
-        # Never silently start an AI in a non-interactive shell. Use an explicit --ai value instead.
-        return {"mode": "exit"}
+        raw = cfg.get("accounts")
+        accounts = [d for d in raw if isinstance(d, dict) and d.get("id") and d.get("enabled", True) and not d.get("deleted", False)] if isinstance(raw, list) else []
+        if not accounts:
+            try:
+                had = _state().PROFILE_DIR.exists() and any(_state().PROFILE_DIR.iterdir())
+            except Exception:
+                had = False
+            if had:
+                accounts = [{"id": "main", "name": "Account 1", "enabled": True, "logged_in": True, "kind": "web", "provider": "deepseek_web"}]
+        pinned = str((cfg.get("routing") or {}).get("pinned") or "")
+        if pinned and any(str(a.get("id")) == pinned for a in accounts):
+            chosen = next(a for a in accounts if str(a.get("id")) == pinned)
+        elif accounts:
+            chosen = accounts[0]
+        else:
+            print(C.red("[startup] non-interactive launch requires --ai <provider> or at least one enabled pre-configured web account."), flush=True)
+            print(C.dim("         Example: python bridge.py --instance B --port 8789 --ai deepseek --panel"), flush=True)
+            return {"mode": "error", "code": 2}
+        provider = str(chosen.get("provider") or ("deepseek_web" if chosen.get("kind") == "web" else ""))
+        if provider in STARTUP_WEB_PROVIDERS:
+            return {"mode": "provider", "provider": provider}
+        print(C.red(f"[startup] pre-configured account provider '{provider}' cannot be started by the web startup selector."), flush=True)
+        return {"mode": "error", "code": 2}
     items = _startup_provider_items(cfg)
     picked = _startup_menu("What should start now?", items)
     if picked is None or picked == 5:
@@ -11542,247 +12010,321 @@ def startup_prepare_accounts(pool: "Pool", choice: Dict[str, Any], headed: bool 
 # Main
 # ============================================================================
 
+def _parse_port_range(spec: str) -> Tuple[int, int]:
+    raw = str(spec or "8700-8800").strip()
+    if "-" not in raw:
+        n = int(raw)
+        return n, n
+    a, b = raw.split("-", 1)
+    start, end = int(a), int(b)
+    if not (1 <= start <= 65535 and 1 <= end <= 65535 and start <= end):
+        raise ValueError("port range must be between 1 and 65535")
+    return start, end
+
+
+def _print_instances(items: List[Dict[str, Any]]) -> None:
+    for x in items:
+        print(f"name={x.get('instance_name','?')} pid={x.get('pid','?')} port={x.get('port','?')} "
+              f"script={x.get('script','?')} instance_home={x.get('instance_home','?')} config={x.get('config','?')}")
+
+
+def _resolve_run_port(args: argparse.Namespace, cfg: Dict[str, Any]) -> Tuple[int, str]:
+    if getattr(args, "port", None) is not None:
+        return int(args.port), "--port"
+    env = os.getenv("DS_BRIDGE_PORT")
+    if env is not None:
+        try:
+            return int(env), "DS_BRIDGE_PORT"
+        except ValueError:
+            print(C.red(f"[port] DS_BRIDGE_PORT={env!r} is invalid; using config/default"), flush=True)
+    try:
+        return int(cfg.get("port", DEFAULT_PORT)), "config"
+    except Exception:
+        return DEFAULT_PORT, "default"
+
+
+def _validate_port(port: int) -> None:
+    if not (1 <= int(port) <= 65535):
+        raise ValueError("port must be between 1 and 65535")
+
+
 def main() -> int:
-    global BRIDGE, API_KEY, DEBUG_DIR, HEADLESS_MODE, LOG_FILE, RUN_MODE, PANEL_ONLY, SERVER
-    ap = argparse.ArgumentParser(
-        description=f"DeepSeek V{VERSION} bridge. Start explicitly from the lightweight AI selector or use --ai/--panel.",
-        epilog="Unknown arguments are passed to Claude Code (e.g. --continue, --resume).")
+    ap = argparse.ArgumentParser(description="DeepSeek V6.4 bridge. One process owns one instance home, config, browser profile set and TCP port.")
     ap.add_argument("project", nargs="?", help="project folder for Claude Code (drag a folder onto this file)")
     ap.add_argument("--terminal", action="store_true", help="bridge only, with the interactive terminal (no Claude Code)")
     ap.add_argument("--choose-project", action="store_true", help="pick the project folder again")
-    ap.add_argument("--here", action="store_true",
-                    help="use the folder that contains this .py file as the project folder")
-    ap.add_argument("--mode", type=_mode_arg, metavar="{safe,ask,auto}",
-                    help="Claude Code permission mode for this run: safe = free inside the project folder "
-                         "(default), ask = normal prompts, auto = fully autonomous")
+    ap.add_argument("--here", action="store_true", help="use the folder that contains this .py file as the project folder")
+    ap.add_argument("--mode", type=_mode_arg, metavar="{safe,ask,auto}", help="Claude Code permission mode for this run")
     ap.add_argument("--safe", dest="mode", action="store_const", const="safe", help="same as --mode safe")
     ap.add_argument("--ask", dest="mode", action="store_const", const="ask", help="same as --mode ask")
-    ap.add_argument("--auto", "--autonomous", dest="mode", action="store_const", const="auto",
-                    help="same as --mode auto")
-    ap.add_argument("--set-mode", type=_mode_arg, metavar="{safe,ask,auto}",
-                    help="save the default permission mode in the config file and continue")
-    ap.add_argument("--prompt-file", metavar="FILE",
-                    help="a long task prompt: copied into the project as AUTONOMOUS_PROMPT.md and Claude Code is "
-                         "started with a short instruction to read and execute it (terminals truncate big pastes)")
-    ap.add_argument("--port", type=int, help="local HTTP port")
+    ap.add_argument("--auto", "--autonomous", dest="mode", action="store_const", const="auto", help="same as --mode auto")
+    ap.add_argument("--set-mode", type=_mode_arg, metavar="{safe,ask,auto}", help="save the default permission mode in the config file and continue")
+    ap.add_argument("--prompt-file", metavar="FILE", help="copy a long task prompt into the project as AUTONOMOUS_PROMPT.md")
+    ap.add_argument("--port", type=int, help="local HTTP port for this run (not saved unless --save-port)")
     ap.add_argument("--no-color", action="store_true")
     ap.add_argument("--self-test", action="store_true", help="run offline regression tests and exit")
-    ap.add_argument("--verify-safe", action="store_true",
-                    help="run the real Claude Code against a fake model and check that safe mode holds, then exit")
+    ap.add_argument("--verify-safe", action="store_true", help="run the real Claude Code safe-mode verification")
     ap.add_argument("--headed", action="store_true", help="always use a visible browser window")
-    ap.add_argument("--ai", choices=("chatgpt", "deepseek", "grok", "multi", "dashboard"),
-                    help="skip the startup chooser explicitly: chatgpt | deepseek | grok | multi | dashboard")
+    ap.add_argument("--ai", choices=("chatgpt", "deepseek", "grok", "multi", "dashboard"), help="which AI account/provider to start")
     ap.add_argument("--debug-dir", help="dump every prompt / raw reply into this directory")
-    ap.add_argument("--add-account", action="append", metavar="NAME",
-                    help="add another DeepSeek account (its login window opens); can be repeated")
+    ap.add_argument("--add-account", action="append", metavar="NAME", help="add an account before startup")
     ap.add_argument("--list-accounts", action="store_true", help="show the saved accounts and exit")
-    ap.add_argument("--ctl", nargs="*", metavar="COMMAND",
-                    help="send a command to the RUNNING bridge, e.g. --ctl next | --ctl use 2 | --ctl status")
-    ap.add_argument("--panel", action="store_true",
-                    help="bridge + web panel only (no terminal needed afterwards); start Claude Code from the panel")
+    ap.add_argument("--ctl", nargs="*", metavar="COMMAND", help="control an already running bridge")
+    ap.add_argument("--panel", action="store_true", help="stay in foreground as a dashboard service; combines with --ai")
     ap.add_argument("--no-open", action="store_true", help="do not open the dashboard in your browser")
+    ap.add_argument("--instance", "--instance-home", dest="instance", metavar="PATH", help="instance home; defaults to the folder containing bridge.py")
+    ap.add_argument("--instance-name", metavar="NAME", help="human-readable instance name (default: home folder name)")
+    ap.add_argument("--list-instances", nargs="?", const="8700-8800", metavar="START-END", help="scan a port range and list live bridge instances")
+    ap.add_argument("--save-port", action="store_true", help="persist --port into this instance's config")
+    ap.add_argument("--print-paths", action="store_true", help="print resolved instance paths and exit")
+    ap.add_argument("--force-claude-commands", action="store_true", help="overwrite Claude command files generated by another bridge instance")
+    ap.add_argument("--install-commands-into", metavar="DIR", help="Claude config directory to receive generated commands")
     ap.add_argument("--version", action="version", version=f"deepseek-local-bridge {VERSION}")
-    args, claude_extra = ap.parse_known_args()
-    if args.port is not None and not (1 <= args.port <= 65535):
-        ap.error("--port must be between 1 and 65535")
+    args = ap.parse_args()
 
+    state = make_runtime_state(Path(args.instance).expanduser() if args.instance else SCRIPT_DIR, args.instance_name)
     if args.no_color:
-        C.enable(False)
-    if args.self_test:
-        self_test()
-        return 0
-    if args.verify_safe:
-        return verify_safe()
-    if args.headed:
-        HEADLESS_MODE = "0"
-    if args.debug_dir:
-        DEBUG_DIR = args.debug_dir
-
-    cfg = load_config()
-    init_settings(cfg)
-    if args.debug_dir:
-        DEBUG_DIR = args.debug_dir
-    if args.headed:
-        HEADLESS_MODE = "0"
-    if args.panel:
-        args.terminal, PANEL_ONLY = True, True
-    RUN_MODE = "panel" if args.panel else ("terminal" if args.terminal else "claude")
-    if args.port:
-        cfg["port"] = args.port
-        save_config(cfg)
-    if args.set_mode:
-        cfg["permission_mode"] = args.set_mode
-        save_config(cfg)
-        print(C.green(f"[mode] default permission mode saved: {args.set_mode}  ({CONFIG_PATH})"))
-    mode, mode_src = resolve_mode(args.mode or args.set_mode, cfg)
-    if args.set_mode and not args.mode:
-        mode_src = "--set-mode"
-    API_KEY = cfg["api_key"]
-    if args.ctl is not None:
-        return ctl_client(cfg, " ".join(args.ctl) or "status")
-    if args.list_accounts:
-        print(Pool(cfg, autostart=False).status_text())
-        return 0
-
-    if os.name == "nt":
-        os.system("title DeepSeek Bridge + Claude Code")
-    # Explicit startup selection comes before project/dependency work. Dashboard-only is genuinely cheap.
-    if args.panel:
-        startup_choice = {"mode":"dashboard"}
-    elif args.ai:
-        startup_choice = {"mode":"dashboard" if args.ai=="dashboard" else "multi" if args.ai=="multi" else "provider",
-                          **({} if args.ai in ("dashboard","multi") else {"provider":args.ai+"_web"}),
-                          **({"full":False} if args.ai=="multi" else {})}
-    elif args.terminal:
-        # --terminal is already an explicit startup choice; preserve legacy non-interactive use
-        # without invoking a keyboard menu or silently selecting a different provider.
-        startup_choice = {"mode": "provider", "provider": "deepseek_web"}
-    else:
-        startup_choice = startup_ai_menu(cfg)
-    if startup_choice.get("mode")=="exit":
-        print(C.dim("[startup] cancelled.")); return 0
-    startup_menu_done=time.perf_counter()
-    project = None
-    if not args.terminal:
-        project = pick_project_dir(cfg, args.project, args.choose_project, args.here)
-    if args.prompt_file and project is not None:
-        try:
-            src_text = Path(args.prompt_file).expanduser().read_text(encoding="utf-8-sig")
-            target = Path(project) / "AUTONOMOUS_PROMPT.md"
-            if not target.exists() or target.read_text(encoding="utf-8") != src_text:
-                target.write_text(src_text, encoding="utf-8")
-            claude_extra.append("Read AUTONOMOUS_PROMPT.md completely (it is the full specification) and execute it "
-                                "now, fully autonomously. Never ask me anything. Keep PROGRESS.md up to date; if you "
-                                "are ever unsure where you are, re-read AUTONOMOUS_PROMPT.md and PROGRESS.md.")
-            print(C.green(f"[prompt] {len(src_text):,} chars -> {target}"))
-        except Exception as exc:
-            print(C.red(f"[prompt] cannot use --prompt-file: {exc}"))
-            return 1
-    bridge_reused = (not args.terminal and bridge_already_running(int(cfg["port"])))
-    if bridge_reused:
-        # A second launch must synchronize the selected project into the already-running
-        # bridge, because its in-memory config is what the dashboard exposes.
-        if project is not None:
-            if ctl_project(cfg, project) != 0:
-                # Keep the launcher process's saved context correct as a fallback.
-                # The running bridge remains the canonical source when the RPC succeeds.
-                remember_project(cfg, project, persist=True)
-        for nm in args.add_account or []:
-            ctl_client(cfg, "add " + nm)
-        print(C.green(f"Bridge already running on port {cfg['port']}; starting another Claude Code."))
-        print(C.dim(f"Project: {project}\nPermissions: {permission_mode_text(mode, mode_src, claude_extra)}"))
-        return launch_claude(cfg, f"http://127.0.0.1:{cfg['port']}", project, claude_extra, mode)
-
-    if project is not None and not bridge_reused:
-        remember_project(cfg, project, persist=True)
-    # Startup is selection-driven: constructing the pool must never start saved browsers
-    # before the user-selected mode is known. Selected accounts are started explicitly below.
-    BRIDGE = Pool(cfg, autostart=False)
-    for nm in args.add_account or []:
-        BRIDGE.add_account(nm, start=False)
-    selected_ids = startup_prepare_accounts(BRIDGE, startup_choice, headed=bool(args.headed))
-
-    # --headed is a per-run hard requirement, including for accounts that already
-    # exist in the saved configuration. Previously it was only forwarded while
-    # creating a brand-new account, so an existing account could still launch
-    # headless and hide the login window.
-    if args.headed:
-        for aid in selected_ids:
-            account = BRIDGE.get_by_id(aid)
-            if account is not None and account.kind == "web":
-                account.headed = True
-        try:
-            BRIDGE._save()
-        except Exception:
-            pass
-
-    # Dependency installation is deliberately after account selection. Dashboard-only,
-    # empty Multi-AI, and other no-op selections must not trigger browser downloads.
-    selected_accounts = [BRIDGE.get_by_id(aid) for aid in selected_ids]
-    selected_web = any(a is not None and getattr(a, "kind", "") == "web" for a in selected_accounts)
-    need_claude = not args.terminal and startup_choice.get("mode") != "dashboard"
-    if (selected_web or (need_claude and bool(selected_ids))) and not ensure_dependencies(cfg, need_claude=need_claude):
-        BRIDGE.stop()
-        return 1
-
-    if startup_choice.get("mode") != "dashboard" and not selected_ids:
-        log("[startup] the selected mode has no ready/configured account; nothing was started", C.yellow)
-        BRIDGE.stop()
-        return 1
-
-    if startup_choice.get("mode") == "dashboard":
-        # Dashboard-only means exactly that: no AI worker and no Claude Code process.
-        args.terminal, PANEL_ONLY = True, True
-        RUN_MODE = "panel"
-        log("[main] starting Bridge without starting an AI browser (Dashboard only).", C.dim)
-    else:
-        names = [BRIDGE.get_by_id(aid).name for aid in selected_ids if BRIDGE.get_by_id(aid)]
-        log(f"[main] starting selected AI account(s): {', '.join(names) or 'none'} (selection latency {((time.perf_counter()-startup_menu_done)*1000):.0f}ms)", C.dim)
-        if not selected_ids:
-            log(f"[error] startup selection '{startup_choice.get('mode')}' has no eligible account; configure that provider explicitly in the dashboard.", C.red)
-            BRIDGE.stop()
-            return 1
-        BRIDGE.start_selected(selected_ids)
-        if not BRIDGE.wait_selected_ready(selected_ids, LOGIN_WAIT_SECONDS + 120):
-            log("[error] no selected AI account could be started / logged in.", C.red)
-            BRIDGE.stop()
-            return 1
-
+        state.COLOR_ENABLED = False
+    state.CLAUDE_COMMANDS_DIR = Path(args.install_commands_into).expanduser().resolve() if args.install_commands_into else None
+    state.FORCE_CLAUDE_COMMANDS = bool(args.force_claude_commands)
+    token = _CURRENT_STATE.set(state)
     try:
-        server = start_server(cfg["port"])
-        SERVER = server
-    except OSError as exc:
-        log(f"[server error] cannot listen on 127.0.0.1:{cfg['port']} ({exc}). "
-            f"Another bridge may already be running - close it or use --port <other>.", C.red)
-        BRIDGE.stop()
-        return 1
-    except Exception as exc:
-        log(f"[server error] {exc}", C.red)
-        BRIDGE.stop()
-        return 1
-
-    url = f"http://127.0.0.1:{cfg['port']}"
-    if DASH_AUTOOPEN and not args.no_open:
-        open_dashboard(url, cfg["api_key"])
-    try:
-        if args.terminal:
-            print_banner(cfg, url, mode, mode_src)
-            if PANEL_ONLY:
-                print(C.green("\nPanel mode: control everything from the dashboard. Press Ctrl+C here to stop the bridge."))
-                try:
-                    while True:
-                        time.sleep(3600)
-                except KeyboardInterrupt:
-                    pass
-            else:
-                terminal_loop(cfg, url)
-            return 0
-        logpath = SCRIPT_DIR / "bridge.log"
-        print(C.green(f"Bridge ready on {url}"))
-        print(C.dim(f"Dashboard: {url}/dash   |   in Claude Code: /panel  /swarm <goal>  /ds next  /ds use 2  /ds auto"))
-        print(C.dim(f"Project: {project}\nPermissions: {permission_mode_text(mode, mode_src, claude_extra)}\n"
-                    f"Bridge log: {logpath}\nStarting Claude Code..."))
-        try:                                        # simple rotation: bridge.log -> bridge.log.1 above 5 MB
-            if logpath.exists() and logpath.stat().st_size > 5 * 1024 * 1024:
-                os.replace(logpath, logpath.with_suffix(".log.1"))
-        except OSError:
-            pass
-        LOG_FILE = open(logpath, "a", encoding="utf-8", errors="replace")
-        old_stderr = sys.stderr
-        sys.stderr = LOG_FILE                       # tracebacks must not paint over Claude's UI
-        try:
-            code = launch_claude(cfg, url, project, claude_extra, mode)
-        finally:
-            sys.stderr = old_stderr
-            lf, LOG_FILE = LOG_FILE, None
+        # Read/list-only modes must have no config/browser side effects.
+        if args.list_instances is not None:
             try:
-                lf.close()
-            except Exception:
+                a, b = _parse_port_range(args.list_instances)
+                _print_instances(find_running_instances(a, b))
+                return 0
+            except Exception as exc:
+                print(C.red(f"[list-instances] {exc}"), flush=True)
+                return 2
+        if args.print_paths:
+            p = state.paths
+            print(f"instance_name={state.instance_name}")
+            print(f"instance_home={p.home}")
+            print(f"script={p.script}")
+            print(f"config={p.config}")
+            print(f"usage={p.usage}")
+            print(f"profile={p.profile}")
+            print(f"accounts={p.accounts}")
+            print(f"log={p.log}")
+            print(f"swarm_attachments={p.swarm_attachments}")
+            print(f"claude_settings_safe={p.claude_settings('safe')}")
+            print(f"claude_settings_ask={p.claude_settings('mirror')}")
+            print(f"claude_settings_auto={p.claude_settings('auto')}")
+            print(f"claude_settings_keepgoing={p.claude_settings('keepgoing')}")
+            print(f"keep_going_hook={p.keep_going_hook()}")
+            return 0
+
+        if args.self_test:
+            return self_test()
+        if args.verify_safe:
+            return verify_safe()
+
+        cfg = load_config()
+        init_settings(cfg)
+        if args.debug_dir:
+            state.DEBUG_DIR = args.debug_dir
+        if args.headed:
+            state.HEADLESS_MODE = "0"
+        state.cfg = cfg
+
+        resolved_port, port_src = _resolve_run_port(args, cfg)
+        _validate_port(resolved_port)
+        state.PERSISTED_PORT = int(cfg.get("port", DEFAULT_PORT))
+        state.RESOLVED_PORT = int(resolved_port)
+        state.PORT_SOURCE = port_src
+        state.PORT_PERSIST_ALLOWED = bool(args.save_port and args.port is not None)
+        cfg["port"] = resolved_port
+        state.API_KEY = cfg.get("api_key")
+        # Agents parse these exact first five stdout lines before browser startup begins.
+        print(VERSION)
+        print(state.instance_name)
+        print(state.paths.home)
+        print(state.CONFIG_PATH)
+        print(resolved_port)
+        if args.save_port and args.port is not None:
+            save_config(cfg)
+        elif args.save_port and args.port is None:
+            print(C.yellow("[port] --save-port has no effect without --port"), flush=True)
+
+        if args.set_mode:
+            cfg["permission_mode"] = args.set_mode
+            save_config(cfg)
+            print(C.green(f"[mode] default permission mode saved: {args.set_mode}  ({state.CONFIG_PATH})"))
+        mode, mode_src = resolve_mode(args.mode or args.set_mode, cfg)
+        if args.set_mode and not args.mode:
+            mode_src = "--set-mode"
+
+        if args.ctl is not None:
+            return ctl_client(cfg, " ".join(args.ctl) or "status")
+        if args.list_accounts:
+            return 0 if not print(Pool(cfg, autostart=False).status_text()) else 0
+
+        # Resolve port ownership before starting a browser. This is the key race-safety rule.
+        try:
+            existing = bridge_already_running(resolved_port, state)
+        except BridgeInstanceConflict as exc:
+            print(C.red(f"[port conflict] {exc}"), flush=True)
+            return 2
+
+        if existing is not None and not args.terminal:
+            project = pick_project_dir(cfg, args.project, args.choose_project, args.here)
+            if project is not None:
+                ctl_project(cfg, project)
+            for nm in args.add_account or []:
+                ctl_client(cfg, "add " + nm)
+            print(C.green(f"Bridge already running for instance {state.instance_name} on port {resolved_port}; starting another Claude Code."))
+            print(C.dim(f"Project: {project}\nPermissions: {permission_mode_text(mode, mode_src, [])}"))
+            if args.panel:
+                return 0
+            return launch_claude(cfg, f"http://127.0.0.1:{resolved_port}", project, [], mode)
+
+        if os.name == "nt":
+            os.system(f"title DeepSeek Bridge - {state.instance_name}")
+
+        # Explicit CLI startup modes. --panel means service mode, not dashboard-only when --ai is also present.
+        if args.panel:
+            state.PANEL_ONLY = True
+            state.RUN_MODE = "panel"
+            if args.ai in (None, "dashboard"):
+                startup_choice = {"mode": "dashboard"}
+            elif args.ai == "multi":
+                startup_choice = {"mode": "multi", "full": False}
+            else:
+                startup_choice = {"mode": "provider", "provider": args.ai + "_web"}
+        elif args.ai:
+            state.RUN_MODE = "claude"
+            startup_choice = {"mode": "dashboard" if args.ai == "dashboard" else "multi" if args.ai == "multi" else "provider",
+                              **({} if args.ai in ("dashboard", "multi") else {"provider": args.ai + "_web"}),
+                              **({"full": False} if args.ai == "multi" else {})}
+        elif args.terminal:
+            state.RUN_MODE = "terminal"
+            startup_choice = {"mode": "provider", "provider": "deepseek_web"}
+        else:
+            state.RUN_MODE = "claude"
+            startup_choice = startup_ai_menu(cfg)
+        if startup_choice.get("mode") in ("exit", "error"):
+            if startup_choice.get("mode") == "error":
+                return int(startup_choice.get("code", 2))
+            print(C.dim("[startup] cancelled."), flush=True)
+            return 0
+
+        claude_extra: List[str] = []
+        project = None
+        if not args.terminal and not args.panel:
+            project = pick_project_dir(cfg, args.project, args.choose_project, args.here)
+        if args.prompt_file and project is not None:
+            try:
+                src_text = Path(args.prompt_file).expanduser().read_text(encoding="utf-8-sig")
+                target = Path(project) / "AUTONOMOUS_PROMPT.md"
+                if not target.exists() or target.read_text(encoding="utf-8") != src_text:
+                    target.write_text(src_text, encoding="utf-8")
+                claude_extra.append("Read AUTONOMOUS_PROMPT.md completely (it is the full specification) and execute it now, fully autonomously. Never ask me anything. Keep PROGRESS.md up to date; if you are ever unsure where you are, re-read AUTONOMOUS_PROMPT.md and PROGRESS.md.")
+                print(C.green(f"[prompt] {len(src_text):,} chars -> {target}"))
+            except Exception as exc:
+                print(C.red(f"[prompt] cannot use --prompt-file: {exc}"))
+                return 1
+
+        if project is not None:
+            remember_project(cfg, project, persist=True)
+        state.BRIDGE = Pool(cfg, autostart=False)
+        for nm in args.add_account or []:
+            state.BRIDGE.add_account(nm, start=False)
+        selected_ids = startup_prepare_accounts(state.BRIDGE, startup_choice, headed=bool(args.headed))
+        if args.headed:
+            for aid in selected_ids:
+                account = state.BRIDGE.get_by_id(aid)
+                if account is not None and account.kind == "web":
+                    account.headed = True
+            state.BRIDGE._save()
+
+        selected_accounts = [state.BRIDGE.get_by_id(aid) for aid in selected_ids]
+        selected_web = any(a is not None and getattr(a, "kind", "") == "web" for a in selected_accounts)
+        need_claude = not args.terminal and not args.panel and startup_choice.get("mode") != "dashboard"
+        if (selected_web or (need_claude and bool(selected_ids))) and not ensure_dependencies(cfg, need_claude=need_claude):
+            state.BRIDGE.stop()
+            return 1
+        if startup_choice.get("mode") != "dashboard" and not selected_ids:
+            log("[startup] the selected mode has no ready/configured account; nothing was started", C.yellow)
+            state.BRIDGE.stop()
+            return 1
+        if startup_choice.get("mode") == "dashboard":
+            state.PANEL_ONLY = True
+            state.RUN_MODE = "panel"
+            log("[main] starting Bridge without starting an AI browser (Dashboard only).", C.dim)
+        else:
+            names = [state.BRIDGE.get_by_id(aid).name for aid in selected_ids if state.BRIDGE.get_by_id(aid)]
+            log(f"[main] starting selected AI account(s): {', '.join(names) or 'none'}", C.dim)
+            state.BRIDGE.start_selected(selected_ids)
+            if not state.BRIDGE.wait_selected_ready(selected_ids, state.LOGIN_WAIT_SECONDS + 120):
+                log("[error] no selected AI account could be started / logged in.", C.red)
+                state.BRIDGE.stop()
+                return 1
+
+        try:
+            server = start_server(resolved_port, state)
+            state.SERVER = server
+        except OSError as exc:
+            ident = _health_identity(resolved_port)
+            if ident:
+                print(C.red("[server error] requested port is already occupied by:\n"
+                            f"  instance={ident.get('instance_name')} pid={ident.get('pid')}\n"
+                            f"  home={ident.get('instance_home')}\n  config={ident.get('config')}\n"
+                            f"Use --port <different-port>."), flush=True)
+            else:
+                print(C.red(f"[server error] cannot listen on 127.0.0.1:{resolved_port} ({exc}). Use --port <different-port>."), flush=True)
+            state.BRIDGE.stop()
+            return 1
+        except Exception as exc:
+            log(f"[server error] {exc}", C.red)
+            state.BRIDGE.stop()
+            return 1
+
+        url = f"http://127.0.0.1:{resolved_port}"
+        if state.DASH_AUTOOPEN and not args.no_open:
+            open_dashboard(url, cfg["api_key"])
+        try:
+            if args.terminal or args.panel:
+                print_banner(cfg, url, mode, mode_src)
+                if state.PANEL_ONLY:
+                    print(C.green("\nPanel mode: control everything from the dashboard. Press Ctrl+C here to stop the bridge."))
+                    try:
+                        while True:
+                            time.sleep(3600)
+                    except KeyboardInterrupt:
+                        pass
+                else:
+                    terminal_loop(cfg, url)
+                return 0
+
+            logpath = state.paths.log
+            print(C.green(f"Bridge ready on {url}"))
+            print(C.dim(f"Dashboard: {url}/dash   |   in Claude Code: /panel  /swarm <goal>  /ds next  /ds use 2  /ds auto"))
+            print(C.dim(f"Project: {project}\nPermissions: {permission_mode_text(mode, mode_src, claude_extra)}\nBridge log: {logpath}\nStarting Claude Code..."))
+            try:
+                if logpath.exists() and logpath.stat().st_size > 5 * 1024 * 1024:
+                    os.replace(logpath, logpath.with_suffix(".log.1"))
+            except OSError:
                 pass
-        return code
+            state.LOG_FILE = open(logpath, "a", encoding="utf-8", errors="replace")
+            old_stderr = sys.stderr
+            sys.stderr = state.LOG_FILE
+            try:
+                code = launch_claude(cfg, url, project, claude_extra, mode)
+            finally:
+                sys.stderr = old_stderr
+                lf, state.LOG_FILE = state.LOG_FILE, None
+                try:
+                    lf.close()
+                except Exception:
+                    pass
+            return code
+        finally:
+            stop_server(server)
+            state.BRIDGE.stop()
     finally:
-        stop_server(server)
-        BRIDGE.stop()
+        _CURRENT_STATE.reset(token)
 
 
 if __name__ == "__main__":
