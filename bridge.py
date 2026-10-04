@@ -5805,7 +5805,18 @@ class Pool:
         while time.time() < end:
             if any(a.status == "ready" for a in self.accounts if a.id in wanted):
                 return True
-            live = [a for a in self.accounts if a.id in wanted and a.enabled and a.status in ("starting", "login")]
+            # A web account may legitimately sit in `login_needed` while the user
+            # is still completing the interactive browser login.  Treat that as a
+            # live startup state; otherwise the main thread immediately calls
+            # Pool.stop(), which closes the just-opened login window.  API accounts
+            # use `login_needed` for invalid/missing keys, so keep those as failures.
+            live = [
+                a for a in self.accounts
+                if a.id in wanted
+                and a.enabled
+                and (a.status in ("starting", "login") or
+                     (a.status == "login_needed" and a.kind == "web"))
+            ]
             if not live:
                 return False
             time.sleep(0.3)
@@ -5829,7 +5840,14 @@ class Pool:
         while time.time() < end:
             if any(a.status == "ready" for a in self.accounts):
                 return True
-            live = [a for a in self.accounts if a.enabled and a.status in ("starting", "login")]
+            # Keep waiting while a website-login account is waiting for the user.
+            # Do not treat API `login_needed` (e.g. a bad/missing key) as a live state.
+            live = [
+                a for a in self.accounts
+                if a.enabled
+                and (a.status in ("starting", "login") or
+                     (a.status == "login_needed" and a.kind == "web"))
+            ]
             if not live:
                 return False
             time.sleep(0.3)
@@ -9784,6 +9802,16 @@ def _selftest_multi() -> None:
             time.sleep(0.3)
             la, lb = lp.accounts
             assert la.status == "ready" and lb.status == "login" and lp.wait_any_ready(5)
+            # Regression: the real browser maps LOGIN_REQUIRED -> login_needed;
+            # startup must continue waiting instead of closing the login window.
+            la.set_status("login_needed")
+            lb.set_status("login_needed")
+            def _finish_interactive_login():
+                time.sleep(0.25)
+                la.set_status("ready")
+            threading.Thread(target=_finish_interactive_login, daemon=True).start()
+            assert lp.wait_selected_ready([la.id], 1.5) is True
+            lb.set_status("login")
             time.sleep(1.2)
             assert lb.status == "ready" and lb.logged_in                      # login detected, saved
             lp.login(la)
