@@ -46,7 +46,8 @@ DS_BRIDGE_OPEN_DASH, DS_BRIDGE_PARALLEL_MODE, DS_BRIDGE_PARAM_DESC_LIMIT, DS_BRI
 DS_BRIDGE_PORT, DS_BRIDGE_PROFILE_DIR, DS_BRIDGE_READY_TIMEOUT, DS_BRIDGE_REQUEST_GAP, DS_BRIDGE_RETRY_BACKOFF_MAX,
 DS_BRIDGE_ROTATE_CHARS, DS_BRIDGE_STALL_TIMEOUT, DS_BRIDGE_SUBMIT_TIMEOUT, DS_BRIDGE_SWARM_AGENTS,
 DS_BRIDGE_SWARM_AGENT_TIMEOUT, DS_BRIDGE_SWARM_ATTACH_DIR, DS_BRIDGE_SWARM_FIX_ROUNDS, DS_BRIDGE_SWARM_MAX_AGENTS,
-DS_BRIDGE_SWARM_REVIEW, DS_BRIDGE_THINK_MODE, DS_BRIDGE_TOOL_DESC_LIMIT, DS_BRIDGE_UI_MODE,
+DS_BRIDGE_SWARM_REVIEW, DS_BRIDGE_SWARM_QUALITY, DS_BRIDGE_SWARM_QUALITY_TIMEOUT, DS_BRIDGE_SWARM_DIRTY_POLICY, DS_BRIDGE_ENGINEERING_GUARD,
+DS_BRIDGE_THINK_MODE, DS_BRIDGE_TOOL_DESC_LIMIT, DS_BRIDGE_UI_MODE,
 DS_BRIDGE_UI_PERFORMANCE, DS_BRIDGE_UPLOAD_TIMEOUT. Explicit path env vars remain overrides; defaults are instance-local.
 
 What is new in V6.2 (ACCOUNT TYPES, QUALITY TIERS, LIVE VIEW, PARALLEL AGENTS)
@@ -239,6 +240,7 @@ Claude Code (PowerShell):
 """
 
 from __future__ import annotations
+import ast
 
 import argparse
 import base64
@@ -246,6 +248,7 @@ import concurrent.futures
 import contextvars
 import contextlib
 import hashlib
+import importlib.util
 import itertools
 import json
 import math
@@ -309,6 +312,12 @@ if os.getenv("DS_BRIDGE_PARALLEL_MODE", "auto").strip().lower() not in PARALLEL_
         print(f"[warning] DS_BRIDGE_PARALLEL_MODE={_warn_bad!r} is invalid; using auto", file=sys.stderr, flush=True)
 MODES = ("safe", "ask", "auto")
 DEFAULT_MODE = "safe"
+# Matches upstream API failures that Claude Code reports in a `result` event while still exiting 0,
+# so the swarm can fail over instead of treating them as a finished task.
+_API_ERROR_RE = re.compile(
+    r"API Error|no AI account is available|migrate to a newer model|overloaded_error|"
+    r"rate limit|invalid_request_error|insufficient_quota|authentication_error",
+    re.IGNORECASE)
 SWARM_DIR_NAME = ".dsb-swarm"
 BROWSER_STATES = ("CREATED", "STARTING", "LOGIN_REQUIRED", "READY", "BUSY",
                   "WAITING_RESPONSE", "RECOVERING", "FAILED", "CLOSED")
@@ -348,7 +357,31 @@ def _env_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
-    return v.strip().lower() in ("1", "true", "yes", "on")
+    value = v.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    print(f"[warning] {name}={v!r} is not a boolean; using {default}", file=sys.stderr, flush=True)
+    return default
+
+
+def _clamp_int(name: str, value: int, lo: int, hi: Optional[int] = None) -> int:
+    bounded = max(lo, value)
+    if hi is not None:
+        bounded = min(hi, bounded)
+    if bounded != value:
+        _warn_once(f"env-clamp-{name}", f"{name}={value!r} is outside the supported range; using {bounded}")
+    return bounded
+
+
+def _clamp_float(name: str, value: float, lo: float, hi: Optional[float] = None) -> float:
+    bounded = max(lo, value)
+    if hi is not None:
+        bounded = min(hi, bounded)
+    if bounded != value:
+        _warn_once(f"env-clamp-{name}", f"{name}={value!r} is outside the supported range; using {bounded}")
+    return bounded
 
 
 def _resolve_env_path(name: str, default: Path) -> Path:
@@ -414,6 +447,12 @@ class RuntimeState:
     _TASKS: set = field(default_factory=set, repr=False)
     BRIDGE: Any = None
     SERVER: Any = None
+    # embedded Claude Code console (only meaningful when RUN_MODE == "claude")
+    CONSOLE_PROC: Any = None          # the live `claude` child process, if supervised
+    CONSOLE_SESSION: Optional[str] = None   # last session_id seen from a SessionStart hook
+    CONSOLE_STATE: str = "idle"        # idle | running | restarting
+    CONSOLE_RESTART_MODE: Optional[str] = None   # set to a mode to make the supervisor respawn
+    CONSOLE_LOCK: Any = field(default_factory=threading.RLock, repr=False)
     API_KEY: Optional[str] = None
     DEBUG_DIR: str = ""
     BROWSER_CHANNEL: str = "chrome"
@@ -438,6 +477,10 @@ class RuntimeState:
     SWARM_AGENT_TIMEOUT: int = 3600
     SWARM_FIX_ROUNDS: int = 2
     SWARM_REVIEW: str = "auto"
+    SWARM_QUALITY: str = "strict"
+    SWARM_QUALITY_TIMEOUT: int = 1800
+    SWARM_DIRTY_POLICY: str = "block"
+    ENGINEERING_GUARD: bool = True
     STALL_TIMEOUT: int = 900
     MAX_REPLY_SECONDS: int = 10800
     SUBMIT_TIMEOUT: int = 25
@@ -506,6 +549,10 @@ class RuntimeState:
         self.SWARM_AGENT_TIMEOUT = _env_int("DS_BRIDGE_SWARM_AGENT_TIMEOUT", 3600)
         self.SWARM_FIX_ROUNDS = _env_int("DS_BRIDGE_SWARM_FIX_ROUNDS", 2)
         self.SWARM_REVIEW = os.getenv("DS_BRIDGE_SWARM_REVIEW", "auto")
+        self.SWARM_QUALITY = os.getenv("DS_BRIDGE_SWARM_QUALITY", "strict").strip().lower()
+        self.SWARM_QUALITY_TIMEOUT = _env_int("DS_BRIDGE_SWARM_QUALITY_TIMEOUT", 1800)
+        self.SWARM_DIRTY_POLICY = os.getenv("DS_BRIDGE_SWARM_DIRTY_POLICY", "block").strip().lower()
+        self.ENGINEERING_GUARD = _env_bool("DS_BRIDGE_ENGINEERING_GUARD", True)
         self.STALL_TIMEOUT = _env_int("DS_BRIDGE_STALL_TIMEOUT", 900)
         self.MAX_REPLY_SECONDS = _env_int("DS_BRIDGE_MAX_REPLY_SECONDS", 10800)
         self.SUBMIT_TIMEOUT = _env_int("DS_BRIDGE_SUBMIT_TIMEOUT", 25)
@@ -536,6 +583,52 @@ class RuntimeState:
             self.PARALLEL_MODE = "auto"
         self.KEEP_GOING = _env_bool("DS_BRIDGE_KEEP_GOING", True)
         self.KEEP_GOING_MAX = _env_int("DS_BRIDGE_KEEP_GOING_MAX", 400)
+
+        # Environment variables are an intentionally supported configuration path, so
+        # apply the same safety bounds that the dashboard/settings UI enforces. Without
+        # this, values such as CHARS_PER_TOKEN=0 or POLL_SECONDS=0 could crash token
+        # accounting or create hot polling loops before the first request arrives.
+        self.LOGIN_WAIT_SECONDS = _clamp_int("DS_BRIDGE_LOGIN_WAIT", self.LOGIN_WAIT_SECONDS, 5, 86_400)
+        self.HEADLESS_READY_TIMEOUT = _clamp_int("DS_BRIDGE_READY_TIMEOUT", self.HEADLESS_READY_TIMEOUT, 1, 3_600)
+        self.MAX_PROMPT_CHARS = _clamp_int("DS_BRIDGE_MAX_PROMPT_CHARS", self.MAX_PROMPT_CHARS, 1_000, 8_000_000)
+        self.HISTORY_BUDGET_CHARS = _clamp_int("DS_BRIDGE_HISTORY_BUDGET_CHARS", self.HISTORY_BUDGET_CHARS, 1_000, 8_000_000)
+        self.ROTATE_CHARS = _clamp_int("DS_BRIDGE_ROTATE_CHARS", self.ROTATE_CHARS, 1_000, 16_000_000)
+        self.KEEP_RECENT_MESSAGES_FULL = _clamp_int("DS_BRIDGE_KEEP_RECENT_MESSAGES", self.KEEP_RECENT_MESSAGES_FULL, 0, 200)
+        self.BASE_BLOCK_LIMIT = _clamp_int("DS_BRIDGE_OLD_BLOCK_LIMIT", self.BASE_BLOCK_LIMIT, 64, 200_000)
+        self.TOOL_DESC_LIMIT = _clamp_int("DS_BRIDGE_TOOL_DESC_LIMIT", self.TOOL_DESC_LIMIT, 64, 50_000)
+        self.PARAM_DESC_LIMIT = _clamp_int("DS_BRIDGE_PARAM_DESC_LIMIT", self.PARAM_DESC_LIMIT, 32, 20_000)
+        self.DELTA_BLOCK_LIMIT = _clamp_int("DS_BRIDGE_DELTA_BLOCK_LIMIT", self.DELTA_BLOCK_LIMIT, 1_000, 2_000_000)
+        self.MAX_HTTP_BODY_BYTES = _clamp_int("DS_BRIDGE_MAX_HTTP_BODY_BYTES", self.MAX_HTTP_BODY_BYTES, 64 * 1024, 256 * 1024 * 1024)
+        self.ATTACH_MAX_FILES = _clamp_int("DS_BRIDGE_MAX_FILES", self.ATTACH_MAX_FILES, 1, 32)
+        self.ATTACH_MAX_BYTES = _clamp_int("DS_BRIDGE_MAX_FILE_BYTES", self.ATTACH_MAX_BYTES, 1_024, 512 * 1024 * 1024)
+        self.UPLOAD_TIMEOUT = _clamp_int("DS_BRIDGE_UPLOAD_TIMEOUT", self.UPLOAD_TIMEOUT, 5, 3_600)
+        self.SWARM_AGENTS = _clamp_int("DS_BRIDGE_SWARM_AGENTS", self.SWARM_AGENTS, 0, 12)
+        self.SWARM_MAX_AGENTS = _clamp_int("DS_BRIDGE_SWARM_MAX_AGENTS", self.SWARM_MAX_AGENTS, 1, 24)
+        self.SWARM_AGENT_TIMEOUT = _clamp_int("DS_BRIDGE_SWARM_AGENT_TIMEOUT", self.SWARM_AGENT_TIMEOUT, 30, 24 * 3_600)
+        self.SWARM_FIX_ROUNDS = _clamp_int("DS_BRIDGE_SWARM_FIX_ROUNDS", self.SWARM_FIX_ROUNDS, 0, 10)
+        if self.SWARM_QUALITY not in {"off", "standard", "strict", "audit"}:
+            print(C.yellow(f"[config] invalid DS_BRIDGE_SWARM_QUALITY={self.SWARM_QUALITY!r}; using strict"), file=sys.stderr)
+            self.SWARM_QUALITY = "strict"
+        self.SWARM_QUALITY_TIMEOUT = _clamp_int("DS_BRIDGE_SWARM_QUALITY_TIMEOUT", self.SWARM_QUALITY_TIMEOUT, 30, 7_200)
+        if self.SWARM_DIRTY_POLICY not in {"block", "warn", "allow"}:
+            print(C.yellow(f"[config] invalid DS_BRIDGE_SWARM_DIRTY_POLICY={self.SWARM_DIRTY_POLICY!r}; using block"), file=sys.stderr)
+            self.SWARM_DIRTY_POLICY = "block"
+        self.STALL_TIMEOUT = _clamp_int("DS_BRIDGE_STALL_TIMEOUT", self.STALL_TIMEOUT, 5, 86_400)
+        self.MAX_REPLY_SECONDS = _clamp_int("DS_BRIDGE_MAX_REPLY_SECONDS", self.MAX_REPLY_SECONDS, 5, 86_400)
+        self.SUBMIT_TIMEOUT = _clamp_int("DS_BRIDGE_SUBMIT_TIMEOUT", self.SUBMIT_TIMEOUT, 1, 600)
+        self.POLL_SECONDS = _clamp_float("DS_BRIDGE_POLL_SECONDS", self.POLL_SECONDS, 0.02, 5.0)
+        self.MAX_CONTINUES = _clamp_int("DS_BRIDGE_MAX_CONTINUES", self.MAX_CONTINUES, 0, 100)
+        self.MAX_REPAIRS = _clamp_int("DS_BRIDGE_MAX_REPAIRS", self.MAX_REPAIRS, 0, 50)
+        self.REQUEST_GAP_SECONDS = _clamp_float("DS_BRIDGE_REQUEST_GAP", self.REQUEST_GAP_SECONDS, 0.0, 60.0)
+        self.MAX_TABS = _clamp_int("DS_BRIDGE_MAX_TABS", self.MAX_TABS, 1, 64)
+        self.MAX_KEPT_CONVS = _clamp_int("DS_BRIDGE_MAX_KEPT_CONVS", self.MAX_KEPT_CONVS, 0, 500)
+        self.MAX_RETRIES = _clamp_int("DS_BRIDGE_MAX_RETRIES", self.MAX_RETRIES, 0, 50)
+        self.RETRY_BACKOFF_MAX = _clamp_int("DS_BRIDGE_MAX_RETRY_BACKOFF_MAX", self.RETRY_BACKOFF_MAX, 0, 3_600)
+        self.CHARS_PER_TOKEN = _clamp_float("DS_BRIDGE_CHARS_PER_TOKEN", self.CHARS_PER_TOKEN, 1.0, 20.0)
+        self.COOLDOWN_BASE = _clamp_int("DS_BRIDGE_COOLDOWN_BASE", self.COOLDOWN_BASE, 0, 86_400)
+        self.COOLDOWN_MAX = _clamp_int("DS_BRIDGE_COOLDOWN_MAX", self.COOLDOWN_MAX, self.COOLDOWN_BASE, 7 * 86_400)
+        self.ACCOUNT_WAIT_SECONDS = _clamp_int("DS_BRIDGE_ACCOUNT_WAIT", self.ACCOUNT_WAIT_SECONDS, 0, 3_600)
+        self.KEEP_GOING_MAX = _clamp_int("DS_BRIDGE_KEEP_GOING_MAX", self.KEEP_GOING_MAX, 0, 10_000)
 
 
 _CURRENT_STATE: contextvars.ContextVar[Optional[RuntimeState]] = contextvars.ContextVar("ds_bridge_runtime_state", default=None)
@@ -832,6 +925,32 @@ def classify_error(err: str) -> str:
     if _RL_RE.search(s):
         return "rate_limit"
     return "upstream"
+
+
+_HINT_TEXT_RE = re.compile(r'"(?:content|message|msg|error|detail)"\s*:\s*"((?:[^"\\]|\\.)*)"', re.I)
+
+
+def humanize_site_error(err: str) -> str:
+    """Turn the raw browser-hook error into a short, readable line.
+
+    DeepSeek sends rate-limit / busy notices as a JSON hint blob
+    (`hint: {"type":"error","content":"Messages too frequent.","finish_reason":"rate_limit_reached"}`),
+    and the hook stores that verbatim. Showing the whole blob in the panel and in
+    `status_err` is noise, so prefer the embedded human sentence when there is one.
+    """
+    s = (err or "").strip()
+    if not s:
+        return s
+    m = _HINT_TEXT_RE.search(s)
+    if m:
+        try:
+            inner = json.loads('"' + m.group(1) + '"')
+        except Exception:
+            inner = m.group(1)
+        inner = str(inner).strip()
+        if inner and len(inner) <= 160:
+            return inner
+    return s[:160]
 
 
 _NOTICE_BUSY_RE = re.compile(r"server (?:is )?busy|服务器繁忙|系统繁忙|too many requests|"
@@ -3168,6 +3287,51 @@ class DeepSeekWeb:
         except Exception:
             self.restart()
 
+    def submit_login(self, email: str, password: str, timeout: float = 25.0) -> bool:
+        """Sign in on the account's own page exactly as a human would.
+
+        Used only by the panel's automated login (the account still owns a real
+        persistent Chrome profile). Returns True once a token is present.
+        """
+        page = self.scratch
+        if page is None or page.is_closed():
+            self.ensure_alive()
+            page = self.scratch
+        if page is None:
+            raise BridgeError("no browser page for login", "login")
+        if self._logged_in(page):
+            return True
+        # DeepSeek shows the sign-in form at /sign_in; the composer page has a "Log in" link.
+        if "sign_in" not in (page.url or ""):
+            try:
+                page.goto("https://chat.deepseek.com/sign_in", wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
+        email_box = page.locator("input[type=text], input[placeholder*='mail' i], input[placeholder*='Phone' i]").first
+        pwd_box = page.locator("input[type=password]").first
+        email_box.wait_for(state="visible", timeout=int(timeout * 1000))
+        email_box.fill(email)
+        pwd_box.fill(password)
+        submit = page.locator("div.ds-button--primary:has-text('Log in'), button:has-text('Log in')").first
+        try:
+            submit.click(timeout=6000)
+        except Exception:
+            pwd_box.press("Enter")
+        end = time.time() + timeout
+        while time.time() < end:
+            if self._logged_in(page):
+                return True
+            err = page.locator("[class*='error' i], [class*='alert' i]").first
+            try:
+                if err.count() and err.is_visible():
+                    raise BridgeError(err.inner_text().strip()[:200] or "login rejected", "login")
+            except BridgeError:
+                raise
+            except Exception:
+                pass
+            time.sleep(0.5)
+        raise BridgeError("login did not complete (wrong password, captcha, or verification required)", "login")
+
     # ---- pages ------------------------------------------------------------
 
     def new_page(self):
@@ -3516,7 +3680,7 @@ class DeepSeekWeb:
                 if st.get("error"):
                     err = str(st["error"])
                     kind = classify_error(err)
-                    raise BridgeError("DeepSeek: " + err, kind)
+                    raise BridgeError("DeepSeek: " + humanize_site_error(err), kind)
                 if st.get("done"):
                     return {"text": text, "incomplete": bool(st.get("incomplete")), "seq": st["id"],
                             "sessionId": st.get("sessionId"), "status": st.get("status")}
@@ -4349,7 +4513,11 @@ class Bridge:
         return self._ready.wait(timeout)
 
     def alive(self) -> bool:
-        return self.ok and self._thread.is_alive()
+        # For lifecycle/restart safety, "alive" means the worker thread still exists.
+        # `ok` is a health/readiness flag and may already be False while the thread is
+        # unwinding Playwright shutdown; starting a second persistent context in that
+        # window can recreate the profile-lock race this pool is designed to prevent.
+        return self._thread.is_alive()
 
     def _status(self, status: str, err: str = "") -> None:
         if self.acct is not None and not self.stopping:
@@ -4462,7 +4630,7 @@ class Bridge:
 # ============================================================================
 
 TIER_NAMES = {1: "Basic", 2: "Fast", 3: "Standard", 4: "Strong", 5: "Top"}
-API_TIMEOUT = _env_int("DS_BRIDGE_API_TIMEOUT", 900)
+API_TIMEOUT = _clamp_int("DS_BRIDGE_API_TIMEOUT", _env_int("DS_BRIDGE_API_TIMEOUT", 900), 5, 86_400)
 
 # Suggested models only: "Fetch models" in the panel asks the provider for the real, current list.
 WEB_RECIPES: Dict[str, Dict[str, Any]] = {
@@ -4529,18 +4697,48 @@ def _opener_for(url: str):
 
 def http_json(method: str, url: str, headers: Dict[str, str], body: Optional[Dict[str, Any]], timeout: float,
               cancel: Optional[threading.Event] = None, abort: Optional[threading.Event] = None) -> Dict[str, Any]:
-    """One HTTP request in a helper thread so a cancelled client never has to wait for the provider."""
+    """One bounded HTTP request in a helper thread so cancellation stays responsive.
+
+    Provider responses are untrusted input. Enforce the bridge-wide response cap even when
+    the server omits Content-Length (chunked/streamed bodies), preventing an unexpectedly
+    huge custom-provider response from exhausting the bridge process.
+    """
     result: Dict[str, Any] = {}
     done = threading.Event()
+    limit = max(64 * 1024, int(_state().MAX_HTTP_BODY_BYTES))
+
+    def read_limited(stream: Any) -> bytes:
+        length = stream.headers.get("Content-Length") if getattr(stream, "headers", None) is not None else None
+        try:
+            if length is not None and int(length) > limit:
+                raise BridgeError(f"upstream HTTP response is too large (> {limit:,} bytes)", "upstream")
+        except ValueError:
+            pass
+        chunks: List[bytes] = []
+        total = 0
+        while True:
+            chunk = stream.read(min(64 * 1024, limit - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise BridgeError(f"upstream HTTP response is too large (> {limit:,} bytes)", "upstream")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     def run() -> None:
         try:
             rq = urllib.request.Request(url, data=json.dumps(body).encode("utf-8") if body is not None else None,
                                         method=method, headers=headers)
             with _opener_for(url).open(rq, timeout=timeout) as r:
-                result.update(status=r.status, data=r.read(), headers=dict(r.headers))
+                result.update(status=r.status, data=read_limited(r), headers=dict(r.headers))
         except urllib.error.HTTPError as exc:
-            result.update(status=exc.code, data=exc.read() or b"", headers=dict(exc.headers or {}))
+            try:
+                data = read_limited(exc)
+            except BridgeError as bounded:
+                result["exc"] = bounded
+            else:
+                result.update(status=exc.code, data=data or b"", headers=dict(exc.headers or {}))
         except Exception as exc:
             result["exc"] = exc
         finally:
@@ -4550,7 +4748,10 @@ def http_json(method: str, url: str, headers: Dict[str, str], body: Optional[Dic
         if (cancel is not None and cancel.is_set()) or (abort is not None and abort.is_set()):
             raise BridgeCancelled()
     if "exc" in result:
-        raise BridgeError(f"network error: {result['exc']}", "upstream")
+        exc = result["exc"]
+        if isinstance(exc, BridgeError):
+            raise exc
+        raise BridgeError(f"network error: {exc}", "upstream")
     return result
 
 
@@ -4803,7 +5004,7 @@ class ApiWorker:
         return self._ready.wait(timeout)
 
     def alive(self) -> bool:
-        return self.ok and self._thread.is_alive()
+        return self._thread.is_alive()
 
     def submit(self, fn: Callable[[Any], Any], priority: int = PRIORITY_MAIN,
                cancel: Optional[threading.Event] = None) -> concurrent.futures.Future:
@@ -4825,7 +5026,8 @@ class ApiWorker:
         self.engine.abort.set()
         self._ex.shutdown(wait=False, cancel_futures=True)
         self._stop.set()
-
+        if self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=5)
 
 
 # ============================================================================
@@ -5020,6 +5222,241 @@ def detect_verify(cwd: Any) -> str:
     return ""
 
 
+
+ENGINEERING_EXECUTION_PROTOCOL = """ENGINEERING EXECUTION PROTOCOL — NON-NEGOTIABLE
+1. Inspect the repository, existing tests, configuration, conventions, and current implementation before editing.
+2. Derive explicit, testable acceptance criteria from the task. Preserve existing behavior unless the task requires a change.
+3. Implement the smallest coherent architecture that solves the requirement. Never use placeholders, fake success, silent fallbacks, or TODOs as completion.
+4. Respect the assigned ownership/scope. Do not modify another developer's files or unrelated project areas.
+5. Handle normal and abnormal paths: validation, empty input, retries, timeouts, concurrency, persistence, cleanup, rollback, compatibility, and observability where relevant.
+6. Treat secrets and generated artifacts as forbidden source material. Never add credentials, private keys, caches, build output, or local machine state to commits.
+7. Verify with the strongest relevant checks available: syntax/static checks, tests, type checks, lint, build/verify, and focused regression tests.
+8. Inspect the final diff, not just the test output. Confirm every changed file is intentional and every acceptance criterion is satisfied.
+9. When a check fails, diagnose the cause, fix it, and rerun the failed check. Do not declare success because a different check passed.
+10. Report only evidence-backed results. Explicitly disclose checks that were unavailable, skipped, or not applicable.
+"""
+
+_SECRET_PATTERNS = (
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\b(?:ghp|github_pat)_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),
+)
+_GENERATED_PARTS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".nox", ".hypothesis"}
+_GENERATED_SUFFIXES = (".pyc", ".pyo")
+
+
+def _normalize_repo_path(value: str) -> str:
+    return str(value or "").replace("\\", "/").lstrip("./")
+
+
+def _working_paths(wt: Any, base: str = "HEAD") -> List[str]:
+    p = git(["diff", "--name-only", base], wt, check=False)
+    paths = {_normalize_repo_path(x) for x in p.stdout.splitlines() if x.strip()}
+    p = git(["ls-files", "--others", "--exclude-standard", "-z"], wt, check=False)
+    paths.update(_normalize_repo_path(x) for x in p.stdout.split("\0") if x.strip())
+    return sorted(paths)
+
+
+def _generated_artifact(path: str) -> bool:
+    parts = [x for x in _normalize_repo_path(path).split("/") if x]
+    name = parts[-1].lower() if parts else ""
+    return any(x in _GENERATED_PARTS for x in parts) or name.endswith(_GENERATED_SUFFIXES) or name in {".coverage", "coverage.xml"}
+
+
+def _remove_worktree_path(wt: Path, rel: str) -> None:
+    root = wt.resolve()
+    target = (root / _normalize_repo_path(rel)).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise ValueError(f"refusing to remove path outside worktree: {rel}")
+    if target == root:
+        raise ValueError("refusing to remove the worktree root")
+    if target.is_dir() and not target.is_symlink():
+        shutil.rmtree(target, ignore_errors=False)
+    elif target.exists() or target.is_symlink():
+        target.unlink()
+
+
+def _staged_generated_paths(wt: Any) -> List[str]:
+    p = git(["diff", "--cached", "--name-only", "-z"], wt, check=False)
+    return sorted({_normalize_repo_path(x) for x in p.stdout.split("\0") if x.strip() and _generated_artifact(x)})
+
+
+def _unstage_paths(wt: Any, paths: List[str]) -> None:
+    if not paths:
+        return
+    git(["reset", "-q", "HEAD", "--", *paths], wt, check=False)
+
+
+def _staged_secret_hits(wt: Any, paths: Optional[List[str]] = None) -> List[str]:
+    paths = paths or [x for x in git(["diff", "--cached", "--name-only"], wt, check=False).stdout.splitlines() if x]
+    hits: List[str] = []
+    for rel in paths:
+        out = git(["show", f":{rel}"], wt, check=False)
+        if out.returncode != 0 or not out.stdout:
+            continue
+        sample = out.stdout[:2_000_000]
+        if "\x00" in sample[:4096]:
+            continue
+        if any(rx.search(sample) for rx in _SECRET_PATTERNS):
+            hits.append(rel)
+    return sorted(dict.fromkeys(hits))
+
+
+def _changed_texts(wt: Any, paths: List[str]) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+    root = Path(wt).resolve()
+    for rel in paths:
+        fp = (root / rel).resolve()
+        try:
+            fp.relative_to(root)
+            if not fp.is_file() or fp.stat().st_size > 2_000_000:
+                continue
+            data = fp.read_bytes()
+            if b"\x00" in data[:4096]:
+                continue
+            out.append((rel, data.decode("utf-8", errors="replace")))
+        except OSError:
+            continue
+    return out
+
+
+def _quality_static_audit(wt: Any, base: str = "HEAD", strict: bool = True) -> Dict[str, Any]:
+    findings: List[str] = []
+    checks: List[Dict[str, Any]] = []
+    diff_check = git(["diff", "--check", base], wt, check=False)
+    checks.append({"name": "git diff --check", "ok": diff_check.returncode == 0})
+    if diff_check.returncode != 0:
+        findings.append((diff_check.stdout + diff_check.stderr)[-2000:] or "whitespace/error in diff")
+    paths = _working_paths(wt, base)
+    conflict_hits = []
+    for rel, textv in _changed_texts(wt, paths):
+        for ln, line in enumerate(textv.splitlines(), 1):
+            if line.startswith(("<<<<<<< ", ">>>>>>> ")) or bool(re.fullmatch(r"={7,}", line)):
+                conflict_hits.append(f"{rel}:{ln}: conflict marker")
+    checks.append({"name": "conflict markers", "ok": not conflict_hits})
+    findings.extend(conflict_hits[:30])
+    py_files = [p for p in paths if p.endswith(".py") and not _generated_artifact(p)]
+    py_errors = []
+    for rel, textv in _changed_texts(wt, py_files):
+        try:
+            ast.parse(textv, filename=rel)
+        except SyntaxError as exc:
+            py_errors.append(f"{rel}:{exc.lineno or '?'}: {exc.msg}")
+    checks.append({"name": "python syntax", "ok": not py_errors, "files": len(py_files)})
+    findings.extend(py_errors[:30])
+    secret_hits = []
+    for rel, textv in _changed_texts(wt, paths):
+        if any(rx.search(textv) for rx in _SECRET_PATTERNS):
+            secret_hits.append(rel)
+    checks.append({"name": "high-confidence secret scan", "ok": not secret_hits})
+    if secret_hits:
+        findings.append("possible secret(s) in: " + ", ".join(secret_hits[:30]))
+    return {"ok": not findings, "checks": checks, "findings": findings, "paths": paths, "strict": strict}
+
+
+def _project_quality_commands(cwd: Any, final: bool = False) -> List[Tuple[str, str]]:
+    p = Path(cwd)
+    cmds: List[Tuple[str, str]] = []
+    try:
+        if (p / "package.json").exists():
+            data = json.loads((p / "package.json").read_text(encoding="utf-8"))
+            scripts = data.get("scripts") or {}
+            for key in (("lint", "typecheck", "test") if not final else ("lint", "typecheck", "test", "build")):
+                cmd = str(scripts.get(key) or "").strip()
+                if cmd and "no test specified" not in cmd:
+                    cmds.append((f"npm run {key} --silent", f"npm:{key}"))
+            if cmds:
+                return cmds
+        if (p / "pom.xml").exists():
+            return [("mvn -q test", "maven:test")] if not final else [("mvn -q verify", "maven:verify")]
+        if (p / "build.gradle").exists() or (p / "build.gradle.kts").exists():
+            return [("gradlew.bat test" if os.name == "nt" and (p / "gradlew.bat").exists() else "./gradlew test", "gradle:test")] if not final else [("gradlew.bat build" if os.name == "nt" and (p / "gradlew.bat").exists() else "./gradlew build", "gradle:build")]
+        if (p / "go.mod").exists():
+            return [("go test ./...", "go:test")] if not final else [("go test ./...", "go:test"), ("go vet ./...", "go:vet"), ("go build ./...", "go:build")]
+        if (p / "Cargo.toml").exists():
+            return [("cargo test --quiet", "cargo:test")] if not final else [("cargo test --quiet", "cargo:test"), ("cargo check --quiet", "cargo:check"), ("cargo build --quiet", "cargo:build")]
+        if list(p.glob("*.csproj")) or list(p.glob("*.sln")) or list(p.rglob("*.csproj")):
+            return [("dotnet test --nologo", "dotnet:test")] if not final else [("dotnet test --nologo", "dotnet:test"), ("dotnet build --nologo", "dotnet:build")]
+        if any((p / n).exists() for n in ("pyproject.toml", "pytest.ini", "tox.ini", "tests", "conftest.py")) or list(p.glob("test_*.py")):
+            if shutil.which("pytest") or importlib.util.find_spec("pytest"):
+                cmds.append((f'"{sys.executable}" -m pytest -q -x', "python:pytest"))
+            if shutil.which("ruff"):
+                cmds.append(("ruff check .", "python:ruff"))
+            if shutil.which("mypy") and (p / "mypy.ini").exists():
+                cmds.append(("mypy .", "python:mypy"))
+    except Exception:
+        pass
+    return cmds
+
+
+def detect_quality_checks(cwd: Any, final: bool = False, custom_verify: str = "") -> List[Tuple[str, str]]:
+    cmds = _project_quality_commands(cwd, final=final)
+    if custom_verify and custom_verify.strip().lower() not in {"off", "auto"}:
+        cmds.insert(0, (custom_verify.strip(), "custom"))
+    return cmds
+
+
+def run_quality_gate(cwd: Any, base: str = "HEAD", level: str = "strict", final: bool = False, custom_verify: str = "") -> Dict[str, Any]:
+    level = (level or "strict").lower()
+    if level == "off":
+        return {"ok": True, "level": "off", "checks": [], "findings": [], "summary": "quality gate disabled"}
+    report = _quality_static_audit(cwd, base=base, strict=level in {"strict", "audit"})
+    checks = list(report["checks"])
+    findings = list(report["findings"])
+    commands = detect_quality_checks(cwd, final=final, custom_verify=custom_verify)
+    for cmd, name in commands:
+        try:
+            proc = subprocess.run(cmd, shell=True, cwd=str(cwd), capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  timeout=_state().SWARM_QUALITY_TIMEOUT, env={**os.environ, "CI": "1"})
+            ok = proc.returncode == 0
+            checks.append({"name": name, "cmd": cmd, "ok": ok})
+            if not ok:
+                findings.append(f"{name} failed: " + ((proc.stdout or "") + (proc.stderr or ""))[-2500:])
+                break
+        except Exception as exc:
+            checks.append({"name": name, "cmd": cmd, "ok": False})
+            findings.append(f"{name} could not run: {exc}")
+            break
+    ok = not findings
+    return {"ok": ok, "level": level, "checks": checks, "findings": findings[-30:],
+            "summary": ("PASSED" if ok else "FAILED") + f" ({len(checks)} checks)", "paths": report.get("paths", [])}
+
+
+def _patterns_overlap(a: str, b: str) -> bool:
+    a, b = _normalize_repo_path(a), _normalize_repo_path(b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    def prefix(x: str) -> str:
+        return x.split("*", 1)[0].split("?", 1)[0].rstrip("/")
+    pa, pb = prefix(a), prefix(b)
+    ea, eb = Path(a).suffix.lower(), Path(b).suffix.lower()
+    if ea and eb and ea != eb:
+        return False
+    if pa == pb:
+        return bool(pa) or ("*" in a and "*" in b)
+    if pa and pb and (pa.startswith(pb + "/") or pb.startswith(pa + "/")):
+        return True
+    if "**" in a and pb.startswith(a.split("**", 1)[0].rstrip("/") + "/"):
+        return True
+    if "**" in b and pa.startswith(b.split("**", 1)[0].rstrip("/") + "/"):
+        return True
+    return False
+
+
+def validate_plan_ownership(tasks: List[Dict[str, Any]]) -> None:
+    for i, left in enumerate(tasks):
+        for right in tasks[i + 1:]:
+            for lp in left.get("files") or []:
+                for rp in right.get("files") or []:
+                    if _patterns_overlap(lp, rp):
+                        raise ValueError(f"tasks '{left['id']}' and '{right['id']}' have overlapping ownership: {lp!r} vs {rp!r}")
+
 def parse_plan(text: str, max_tasks: int = 12) -> Dict[str, Any]:
     t = re.sub(r"^```(?:json)?\s*|\s*```$", "", (text or "").strip(), flags=re.M)
     i, j = t.find("{"), t.rfind("}")
@@ -5040,16 +5477,41 @@ def parse_plan(text: str, max_tasks: int = 12) -> Dict[str, Any]:
         ids[aid] = True
         tasks.append({"id": aid, "title": str(x.get("title") or f"Task {n}")[:80], "prompt": str(x["prompt"]).strip(),
                       "files": [str(f) for f in (x.get("files") or []) if isinstance(f, str)][:30],
-                      "deps": [str(k) for k in (x.get("depends_on") or [])]})
+                      "deps": [str(k) for k in (x.get("depends_on") or [])],
+                      "acceptance": [str(c).strip()[:500] for c in (x.get("acceptance_criteria") or []) if str(c).strip()][:12]})
     for tk in tasks:
-        tk["deps"] = [k for k in tk["deps"] if k in ids and k != tk["id"]]
+        tk["deps"] = list(dict.fromkeys(k for k in tk["deps"] if k in ids and k != tk["id"]))
+
+    # A dependency cycle otherwise leaves every task queued forever: the scheduler
+    # waits for a predecessor that can never become merged/done. Reject the plan
+    # before any worktree is created so the run fails fast and predictably.
+    deps = {tk["id"]: set(tk["deps"]) for tk in tasks}
+    visit: set = set()
+    active: set = set()
+
+    def visit_task(aid: str) -> None:
+        if aid in active:
+            raise ValueError(f"the plan contains a dependency cycle involving '{aid}'")
+        if aid in visit:
+            return
+        active.add(aid)
+        for dep in deps[aid]:
+            visit_task(dep)
+        active.remove(aid)
+        visit.add(aid)
+
+    for aid in deps:
+        visit_task(aid)
+    validate_plan_ownership(tasks)
     return {"summary": str(d.get("summary") or "")[:300], "contracts": str(d.get("contracts") or "")[:4000], "tasks": tasks}
 
 
 class SwarmAgent:
-    def __init__(self, aid: str, title: str, prompt: str, files: List[str], deps: List[str], account_id: str = "") -> None:
+    def __init__(self, aid: str, title: str, prompt: str, files: List[str], deps: List[str], account_id: str = "", acceptance: Optional[List[str]] = None) -> None:
         self.id, self.title, self.prompt, self.files, self.deps = aid, title, prompt, files, deps
+        self.acceptance = list(acceptance or [])[:12]
         self.account_id = str(account_id or "")
+        self.tried_accounts: List[str] = [self.account_id] if self.account_id else []
         self.status = "queued"           # queued starting running verifying reviewing merging merged done failed conflict skipped stopped
         self.activity, self.note = "", ""
         self.log: "deque" = deque(maxlen=400)
@@ -5063,6 +5525,8 @@ class SwarmAgent:
         self.verify_ok: Optional[bool] = None
         self.verify_out = ""
         self.result = ""
+        self.api_error = ""      # set when the CLI reported an upstream API failure (it still exits 0)
+        self.quality_report: Dict[str, Any] = {}
 
     def add_log(self, line: str) -> None:
         self.log_n += 1
@@ -5089,6 +5553,8 @@ class SwarmRun:
         self.applied = self.cleaned = False
         self.review_on = False
         self.verify = str(opts.get("verify") or "auto")
+        self.quality = str(opts.get("quality") or "strict").lower()
+        self.quality_report: Dict[str, Any] = {}
 
     def ev(self, msg: str) -> None:
         item = {"t": time.time(), "msg": msg}
@@ -5104,7 +5570,7 @@ class SwarmRun:
              "created": self.created, "finished": self.finished, "max_agents": self.max_agents,
              "attachments": list(self.opts.get("attachments") or []),
              "account_ids": list(self.opts.get("account_ids") or []),
-             "verify": self.verify, "review": self.review_on, "mode": self.opts.get("mode"), "applied": self.applied,
+             "verify": self.verify, "quality": self.quality, "quality_report": self.quality_report, "review": self.review_on, "mode": self.opts.get("mode"), "applied": self.applied,
              "cleaned": self.cleaned, "base_branch": self.base_branch, "merged_branch": self.merged_branch,
              "plan": self.summary_plan, "summary": self.summary, "final_verify": self.final_verify,
              "counts": {s: sum(1 for a in self.agents if a.status == s) for s in {a.status for a in self.agents}}}
@@ -5112,8 +5578,8 @@ class SwarmRun:
             d["contracts"] = self.contracts
             d["events"] = list(self.events)[::-1]
             d["agents"] = [{"id": a.id, "title": a.title, "status": a.status, "prompt": a.prompt, "files": a.files,
-                            "deps": a.deps, "activity": a.activity, "note": a.note, "attempts": a.attempts,
-                            "changed": a.changed, "violations": a.violations, "verify_ok": a.verify_ok,
+                            "deps": a.deps, "acceptance": a.acceptance, "activity": a.activity, "note": a.note, "attempts": a.attempts,
+                            "changed": a.changed, "violations": a.violations, "verify_ok": a.verify_ok, "quality_report": a.quality_report,
                             "verify_out": a.verify_out[-1500:], "started": a.started, "finished": a.finished,
                             "tail": [x[1] for x in list(a.log)[-6:]]} for a in self.agents]
         return d
@@ -5159,14 +5625,35 @@ class Swarm:
             git(["init", "-q"], proj)
             self.pool.event("info", f"swarm: initialised a git repository in {proj}")
         if git(["rev-parse", "--verify", "-q", "HEAD"], proj, check=False).returncode != 0:
-            git(["add", "-A"], proj, check=False)
-            git(["commit", "-q", "--allow-empty", "-m", "Initial snapshot (DeepSeek Bridge swarm)"], proj)
+            git(["add", "-A"], proj, check=True)
+            generated = _staged_generated_paths(proj)
+            if generated:
+                _unstage_paths(proj, generated)
+            secret_hits = _staged_secret_hits(proj)
+            if secret_hits:
+                _unstage_paths(proj, secret_hits)
+                raise ValueError("refusing to create the swarm baseline commit because secret-like content was detected: " + ", ".join(secret_hits[:10]))
+            p0 = git(["commit", "-q", "--allow-empty", "-m", "Initial snapshot (DeepSeek Bridge swarm)"], proj, check=False)
+            if p0.returncode != 0:
+                raise ValueError("could not create the swarm baseline commit: " + (p0.stderr.strip() or "unknown git error"))
+        dirty = git(["status", "--porcelain=v1", "-uall"], proj, check=False).stdout.strip()
+        dirty_policy = _state().SWARM_DIRTY_POLICY
+        if dirty:
+            if dirty_policy == "block":
+                raise ValueError("target repository has uncommitted changes; commit or stash them first (or set DS_BRIDGE_SWARM_DIRTY_POLICY=warn/allow)")
+            if dirty_policy == "warn":
+                self.pool.event("warn", "swarm: repository has uncommitted changes; they are excluded from the swarm baseline")
         top = Path(git(["rev-parse", "--show-toplevel"], proj).stdout.strip())
-        selected_accounts=[x for x in (account_ids or []) if self.pool.get(x) is not None and self.pool.get(x).enabled]
-        if not selected_accounts:
-            selected_accounts=self.pool.project_accounts_for(str(top))
-        if not selected_accounts:
-            selected_accounts=[a.id for a in self.pool.accounts if a.enabled]
+        picked=[x for x in (account_ids or []) if self.pool.get(x) is not None and self.pool.get(x).enabled]
+        if not picked:
+            picked=self.pool.project_accounts_for(str(top))
+        if not picked:
+            picked=[a.id for a in self.pool.accounts if a.enabled]
+        # Prefer accounts that can serve a request right now (Account.usable covers cooldown and
+        # budget, not just status); a stopped/busy/cooling account pinned to an agent makes it hang.
+        # Fall back to enabled-but-not-ready so the run can still start+rotate.
+        ready=[x for x in picked if (self.pool.get(x) is not None and self.pool.get(x).usable())]
+        selected_accounts=ready or picked
         if not selected_accounts:
             raise ValueError("no enabled AI account is available for this swarm")
         base = git(["rev-parse", "HEAD"], proj).stdout.strip()
@@ -5187,17 +5674,19 @@ class Swarm:
         else:
             n = int(agents)
         n = max(1, min(_state().SWARM_MAX_AGENTS, n or 1))
+        quality = str(_state().SWARM_QUALITY or "strict").lower()
         run = SwarmRun(rid, goal, top, base, branch, {"agents": n, "mode": mode or _norm_mode(self.pool.cfg.get("permission_mode")) or DEFAULT_MODE,
-                                                       "strict": bool(strict), "tasks_text": tasks_text,
+                                                       "strict": bool(strict) or quality in {"strict", "audit"},
+                                                       "quality": quality, "tasks_text": tasks_text,
                                                        "attachments": list(attachments or [])[:_state().ATTACH_MAX_FILES],
                                                        "account_ids": list(dict.fromkeys(selected_accounts))})
         run.verify = verify or "auto"
         self.pool.set_project_accounts(str(top), list(dict.fromkeys(selected_accounts)))
         rv = (review or _state().SWARM_REVIEW).lower()
-        run.review_on = rv == "on" or (rv == "auto" and len({a.tier for a in self.pool.accounts if a.usable()}) > 1)
+        run.review_on = rv == "on" or (rv == "auto" and (quality in {"strict", "audit"} or len({a.tier for a in self.pool.accounts if a.usable()}) > 1))
         with self.lock:
             self.runs[rid] = run
-        run.ev(f"started on {branch} @ {base[:8]} with up to {n} agent(s)")
+        run.ev(f"started on {branch} @ {base[:8]} with up to {n} agent(s), quality={quality}, review={run.review_on}")
         self.pool.event("ok", f"swarm {rid} started: {goal[:80]}")
         state_thread(target=self._drive, args=(run,), daemon=True, name=f"swarm-{rid}").start()
         return run
@@ -5223,7 +5712,7 @@ class Swarm:
     def _plan(self, run: SwarmRun) -> None:
         txt = str(run.opts.get("tasks_text") or "").strip()
         if txt:
-            tasks = [{"id": f"a{i}", "title": " ".join(l.split()[:7]), "prompt": l.strip(), "files": [], "deps": []}
+            tasks = [{"id": f"a{i}", "title": " ".join(l.split()[:7]), "prompt": l.strip(), "files": [], "deps": [], "acceptance": []}
                      for i, l in enumerate((l for l in txt.splitlines() if l.strip()), 1)]
             plan = {"summary": "manual task list", "contracts": "", "tasks": tasks}
         else:
@@ -5232,14 +5721,16 @@ class Swarm:
             tree_txt = "\n".join(tree[:300])[:6000] or "(empty repository)"
             q = (f"You are the tech lead of a team of {run.max_agents} AI developers working IN PARALLEL on ONE code repository.\n"
                  f"GOAL:\n{run.goal}\n\nCURRENT FILES (git ls-files, may be truncated):\n{tree_txt}\n\n"
-                 f"Split the goal into at most {max(run.max_agents, 1)} tasks that can be built at the same time WITHOUT touching the same files. Rules:\n"
+                 f"{ENGINEERING_EXECUTION_PROTOCOL}\n\nSplit the goal into at most {max(run.max_agents, 1)} tasks that can be built at the same time WITHOUT touching the same files. Rules:\n"
                  "- every task owns a disjoint set of paths (\"files\": glob patterns such as \"src/api/**\" or \"tests/test_api.py\"),\n"
                  "- shared decisions (function names, data shapes, routes, file formats) go into \"contracts\" so every developer follows the same interfaces,\n"
                  "- if task B truly needs the code of task A first, put A's id in B's \"depends_on\" (use sparingly: parallel is the point),\n"
                  "- if the goal is small or cannot be split safely, return ONE task,\n"
                  "- each \"prompt\" must be a complete, self-contained instruction for one developer.\n"
+                 "- each task must include 1-12 concrete \"acceptance_criteria\" items that are objectively testable.\n"
+                 "- never assign overlapping path patterns to two tasks.\n"
                  "Reply with ONLY JSON, no prose, exactly in this shape:\n"
-                 "{\"summary\":\"one line\",\"contracts\":\"...\",\"tasks\":[{\"id\":\"a1\",\"title\":\"...\",\"prompt\":\"...\",\"files\":[\"...\"],\"depends_on\":[]}]}")
+                 "{\"summary\":\"one line\",\"contracts\":\"...\",\"tasks\":[{\"id\":\"a1\",\"title\":\"...\",\"prompt\":\"...\",\"files\":[\"...\"],\"acceptance_criteria\":[\"...\"],\"depends_on\":[]}]}")
             plan = None
             for attempt in (1, 2):
                 try:
@@ -5251,12 +5742,17 @@ class Swarm:
             if plan is None:
                 run.ev("falling back to a single agent that does the whole goal")
                 plan = {"summary": "single agent (the planner did not produce a usable plan)", "contracts": "",
-                        "tasks": [{"id": "a1", "title": run.goal[:60], "prompt": run.goal, "files": [], "deps": []}]}
+                        "tasks": [{"id": "a1", "title": run.goal[:60], "prompt": run.goal, "files": [], "deps": [], "acceptance": []}]}
         run.summary_plan, run.contracts = plan["summary"], plan["contracts"]
         aids=list(run.opts.get("account_ids") or [])
-        run.agents = [SwarmAgent(t["id"], t["title"], t["prompt"], t["files"], t["deps"], aids[i % len(aids)])
+        run.agents = [SwarmAgent(t["id"], t["title"], t["prompt"], t["files"], t["deps"], aids[i % len(aids)], t.get("acceptance", []))
                       for i,t in enumerate(plan["tasks"])]
         run.ev(f"plan: {len(run.agents)} task(s) - " + "; ".join(f"{a.id} {a.title}" for a in run.agents))
+
+    @staticmethod
+    def _agent_alive(run: SwarmRun, ag: SwarmAgent) -> bool:
+        name = f"agent-{run.id}-{ag.id}"
+        return any(t.name == name and t.is_alive() for t in threading.enumerate())
 
     def _schedule(self, run: SwarmRun) -> None:
         while not run.stop.is_set():
@@ -5272,6 +5768,15 @@ class Swarm:
                     state_thread(target=self._agent_main, args=(run, a), daemon=True, name=f"agent-{run.id}-{a.id}").start()
                 if all(a.status in SW_DONE for a in run.agents):
                     return
+                # A dead agent thread can leave its task 'running' forever, which used
+                # to block _finish and hang the whole run at running:N. If nothing is
+                # actually alive, fail those tasks so the run can complete.
+                if active and not any(a.status in SW_ACTIVE and self._agent_alive(run, a)
+                                      for a in run.agents):
+                    for a in run.agents:
+                        if a.status in SW_ACTIVE:
+                            a.status, a.note = "failed", "agent thread died"
+                    return
             time.sleep(0.4)
 
     # ---- one agent ---------------------------------------------------------------
@@ -5281,15 +5786,17 @@ class Swarm:
         attachments = ("\nATTACHMENTS AVAILABLE TO YOU (read-only inputs unless your task explicitly requires extracting/processing them):\n"
                        + "\n".join(f"- {p}" for p in (attachment_paths or []))
                        if attachment_paths else "")
-        return (f"You are developer {ag.id} (\"{ag.title}\") in a team of {len(run.agents)} developers building one project IN PARALLEL. "
+        acceptance = "\n".join(f"- {x}" for x in ag.acceptance) or "- Derive concrete criteria from the task and verify them before reporting success."
+        return (f"{ENGINEERING_EXECUTION_PROTOCOL}\n\nYou are developer {ag.id} (\"{ag.title}\") in a team of {len(run.agents)} developers building one project IN PARALLEL. "
                 f"You work alone in your own git worktree/branch; the others work at the same time in theirs.\n\n"
                 f"OVERALL GOAL: {run.goal}\n\nYOUR TASK:\n{ag.prompt}\n\n"
+                f"ACCEPTANCE CRITERIA (must all be satisfied):\n{acceptance}\n\n"
                 f"ASSIGNED BRIDGE ACCOUNT: {self.pool.get(ag.account_id).name if self.pool.get(ag.account_id) else ag.account_id or '(auto)'}\n"
                 f"YOU OWN THESE PATHS (create / modify only these): {', '.join(ag.files) or 'whatever your task needs'}\n"
                 f"OTHER DEVELOPERS AND THEIR PATHS (do NOT touch them; assume their code exists as described in the contracts):\n{others}\n\n"
                 f"SHARED CONTRACTS (interfaces everybody follows):\n{run.contracts or '(none)'}\n" + attachments + "\n\n"
                 "RULES: stay inside your paths; do not commit (the orchestrator does it); run the tests/build for YOUR part when they exist; "
-                "do not add the supplied attachments to git; finish with a short summary of what you changed.")
+                "do not add supplied attachments to git; inspect your final diff; finish with a short evidence-backed summary.\n")
 
     def _claude(self, run: SwarmRun, ag: SwarmAgent, prompt: str, role: str, cwd: Any, tag: str, account_id: str = "") -> int:
         exe = shutil.which("claude")
@@ -5327,6 +5834,30 @@ class Swarm:
             return p.wait()
         finally:
             timer.cancel()
+            # Stop may race this finally block and clear the process reference before
+            # the child has been reaped. Always reap here so a killed Claude Code
+            # subprocess cannot survive the agent lifecycle or trigger ResourceWarning
+            # at interpreter shutdown.
+            try:
+                if p.poll() is None:
+                    p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                try:
+                    p.wait(timeout=1)
+                except Exception:
+                    pass
+            except OSError:
+                pass
+            for stream in (p.stdin, p.stdout, p.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except Exception:
+                    pass
             ag.proc = None
 
     @staticmethod
@@ -5337,6 +5868,14 @@ class Swarm:
         try:
             o = json.loads(line)
         except Exception:
+            # Non-JSON output: the CLI prints upstream API failures here as plain text (still exit 0),
+            # so detect them - otherwise the agent shows the error but never fails over.
+            if _API_ERROR_RE.search(line):
+                ag.api_error = line[:200]
+                ag.add_log("✗ " + ag.api_error)
+                ag.activity = "✗ " + ag.api_error[:120]
+                emit_dash_event("agent", {"tag": tag, "agent": ag.id, "status": ag.status, "activity": ag.activity[:180]})
+                return
             ag.add_log(line)
             ag.activity = line[:120]
             emit_dash_event("agent", {"tag": tag, "agent": ag.id, "status": ag.status, "activity": ag.activity[:180]})
@@ -5356,14 +5895,74 @@ class Swarm:
                     emit_dash_event("agent", {"tag": tag, "agent": ag.id, "status": ag.status, "activity": ag.activity[:180]})
         elif o.get("type") == "result":
             ag.result = str(o.get("result") or "")
+            # The CLI exits 0 even when the upstream API failed (bad model, no ready account, 5xx...).
+            # Record it so the agent can fail over / fail instead of sitting "running" forever.
+            if o.get("is_error") or _API_ERROR_RE.search(ag.result):
+                ag.api_error = ag.result.strip().splitlines()[0][:200] or "upstream API error"
+                ag.add_log("✗ " + ag.api_error)
+                emit_dash_event("agent", {"tag": tag, "agent": ag.id, "status": ag.status, "activity": "✗ " + ag.api_error[:180]})
+                return
+            ag.api_error = ""
             ag.add_log("✓ " + ag.result.strip().splitlines()[0][:160] if ag.result.strip() else "✓ finished")
             emit_dash_event("agent", {"tag": tag, "agent": ag.id, "status": ag.status, "activity": "✓ finished"})
 
+    def _prepare_commit(self, ag: SwarmAgent, wt: Any, strict: bool = False) -> Dict[str, Any]:
+        paths = _working_paths(wt, ag.base)
+        generated = [p for p in paths if _generated_artifact(p)]
+        for rel in generated:
+            try:
+                _remove_worktree_path(Path(wt), rel)
+            except OSError:
+                pass
+        paths = _working_paths(wt, ag.base)
+        ag.violations = [f for f in paths if not in_scope(f, ag.files)]
+        if ag.violations and strict:
+            for rel in list(ag.violations):
+                if git(["cat-file", "-e", f"{ag.base}:{rel}"], wt, check=False).returncode == 0:
+                    git(["checkout", ag.base, "--", rel], wt, check=False)
+                else:
+                    try:
+                        _remove_worktree_path(Path(wt), rel)
+                    except OSError:
+                        git(["clean", "-qf", "--", rel], wt, check=False)
+            raise ValueError("ownership violation: " + ", ".join(ag.violations[:30]))
+        if ag.violations:
+            self_ev = f"out-of-scope changes retained under non-strict quality: {', '.join(ag.violations[:30])}"
+            ag.note = self_ev[:300]
+        # Secrets are never allowed even in non-strict mode.
+        hits = []
+        for rel, textv in _changed_texts(wt, _working_paths(wt, ag.base)):
+            if any(rx.search(textv) for rx in _SECRET_PATTERNS):
+                hits.append(rel)
+        if hits:
+            for rel in hits:
+                if git(["cat-file", "-e", f"{ag.base}:{rel}"], wt, check=False).returncode == 0:
+                    git(["checkout", ag.base, "--", rel], wt, check=False)
+                else:
+                    try:
+                        _remove_worktree_path(Path(wt), rel)
+                    except OSError:
+                        pass
+            raise ValueError("secret-like content detected; refusing to commit: " + ", ".join(hits[:30]))
+        static = _quality_static_audit(wt, base=ag.base, strict=strict)
+        if not static.get("ok"):
+            raise ValueError("pre-commit quality gate failed: " + "; ".join(static.get("findings") or [])[:1500])
+        return {"paths": paths, "generated_removed": generated, "violations": list(ag.violations), "secret_hits": hits, "static": static}
+
     def _commit(self, ag: SwarmAgent, wt: Any, msg: str) -> bool:
-        git(["add", "-A"], wt, check=False)
+        git(["add", "-A"], wt, check=True)
+        generated = _staged_generated_paths(wt)
+        if generated:
+            _unstage_paths(wt, generated)
+        secret_hits = _staged_secret_hits(wt)
+        if secret_hits:
+            _unstage_paths(wt, secret_hits)
+            raise ValueError("secret-like content detected in staged files: " + ", ".join(secret_hits[:30]))
         if git(["diff", "--cached", "--quiet"], wt, check=False).returncode == 0:
             return False
-        git(["commit", "-q", "-m", msg], wt)
+        p = git(["commit", "-q", "-m", msg], wt, check=False)
+        if p.returncode != 0:
+            raise ValueError("git commit failed: " + (p.stderr.strip() or "unknown git error"))
         return True
 
     def _changed(self, ag: SwarmAgent, wt: Any) -> List[str]:
@@ -5378,21 +5977,27 @@ class Swarm:
                         subprocess.run(["cmd", "/c", "mklink", "/J", str(dst), str(src)], capture_output=True)
                     else:
                         os.symlink(src, dst, target_is_directory=True)
-                    with open(run.project / ".git" / "info" / "exclude", "a", encoding="utf-8") as f:
-                        f.write(f"\n/{name}\n")
+                    # Multiple agents can create their worktrees concurrently. Serialize
+                    # this shared metadata write so `.git/info/exclude` cannot be interleaved.
+                    with run.merge_lock:
+                        ex = run.project / ".git" / "info" / "exclude"
+                        current = ex.read_text(encoding="utf-8", errors="ignore") if ex.exists() else ""
+                        if f"/{name}" not in current:
+                            with open(ex, "a", encoding="utf-8") as f:
+                                f.write(f"\n/{name}\n")
                 except Exception:
                     pass
 
     def _verify(self, run: SwarmRun, ag: Optional[SwarmAgent], cwd: Any) -> Tuple[Optional[bool], str, str]:
-        cmd = detect_verify(cwd) if run.verify == "auto" else ("" if run.verify == "off" else run.verify)
-        if not cmd:
+        custom = "" if run.verify in {"off", "auto"} else run.verify
+        if run.quality == "off" and not custom:
             return None, "", ""
-        try:
-            p = subprocess.run(cmd, shell=True, cwd=str(cwd), capture_output=True, text=True, encoding="utf-8",
-                               errors="replace", timeout=900, env={**os.environ, "CI": "1"})
-            return p.returncode == 0, cmd, ((p.stdout or "") + (p.stderr or ""))[-3000:]
-        except Exception as exc:
-            return False, cmd, f"could not run the check: {exc}"
+        report = run_quality_gate(cwd, base=(ag.base if ag else run.base), level=run.quality, final=ag is None, custom_verify=custom)
+        if ag is not None:
+            ag.quality_report = report
+        cmd = "; ".join(x.get("cmd") or x.get("name") or "quality" for x in report.get("checks", []))
+        out = "\n".join(report.get("findings") or [])[-3000:]
+        return bool(report.get("ok")), cmd, out or report.get("summary", "")
 
     def _materialize_attachments(self, run: SwarmRun, ag: SwarmAgent, wt: Path) -> List[str]:
         ids = [str(x) for x in (run.opts.get("attachments") or [])]
@@ -5432,6 +6037,21 @@ class Swarm:
         ag.add_log(f"＋ {len(paths)} attachment(s) available in .dsb-agent-input")
         return paths
 
+    def _rotate_account(self, run: SwarmRun, ag: SwarmAgent) -> str:
+        """Move an agent off a failed pinned account onto another usable one. Returns the new id or ''."""
+        if not self.pool.routing.get("auto_failover", True):
+            return ""
+        tried = set(getattr(ag, "tried_accounts", None) or [ag.account_id])
+        for a in self.pool.accounts:
+            if a.id in tried or not a.enabled or not a.usable():
+                continue
+            if a.status != "ready" or a.worker is None or not a.worker.ok:
+                continue
+            ag.tried_accounts = list(tried | {a.id})
+            ag.account_id = a.id
+            return a.id
+        return ""
+
     def _agent_main(self, run: SwarmRun, ag: SwarmAgent) -> None:
         try:
             ag.started = time.time()
@@ -5452,18 +6072,24 @@ class Swarm:
                 if run.stop.is_set():
                     ag.status = "stopped"
                     return
+                self._prepare_commit(ag, wt, strict=run.quality in {"strict", "audit"} or bool(run.opts.get("strict")))
                 changed = self._commit(ag, wt, f"swarm({ag.id}): {ag.title}")
-                if rc != 0 and not changed and not self._changed(ag, wt):
-                    tail = ag.log[-1][1] if ag.log else ""
-                    raise ValueError(f"Claude Code exited with code {rc}. {tail}")
+                # The CLI exits 0 on an upstream API failure (bad model, no ready account, 5xx). That
+                # means the call did no work, so check it unconditionally - a fix round already has
+                # committed changes in the worktree, which would otherwise mask the failure forever.
+                failed = ag.api_error or (rc != 0 and not changed and not self._changed(ag, wt))
+                if failed:
+                    tail = ag.api_error or (ag.log[-1][1] if ag.log else "") or f"exit code {rc}"
+                    # A dead/pinned account must not hang the run: rotate to another ready account and
+                    # retry the same task once before giving up (failover does not apply to hard errors).
+                    rotated = self._rotate_account(run, ag)
+                    if rotated:
+                        ag.api_error = ""
+                        run.ev(f"{ag.id}: account failed ({tail[:60]}) - retrying on '{rotated}'")
+                        continue
+                    raise ValueError(f"agent could not run: {tail}")
                 files = self._changed(ag, wt)
                 ag.violations = [f for f in files if not in_scope(f, ag.files)]
-                if ag.violations and run.opts.get("strict"):
-                    for f in ag.violations:
-                        git(["checkout", ag.base, "--", f], wt, check=False) if git(["cat-file", "-e", f"{ag.base}:{f}"], wt, check=False).returncode == 0 \
-                            else git(["rm", "-qf", "--", f], wt, check=False)
-                    self._commit(ag, wt, f"swarm({ag.id}): revert out-of-scope files")
-                    run.ev(f"{ag.id}: reverted out-of-scope files {', '.join(ag.violations)}")
                 ag.status = "verifying"
                 ok, cmd, out = self._verify(run, ag, wt)
                 ag.verify_ok, ag.verify_out = ok, out
@@ -5476,10 +6102,15 @@ class Swarm:
                           f"passes, then reply.\n\nYOUR TASK (for reference):\n{ag.prompt}")
             if run.review_on and self._changed(ag, wt):
                 ag.status = "reviewing"
-                self._claude(run, ag, (f"You are the reviewer of developer {ag.id}'s work (task: {ag.title}). Run `git diff {ag.base}..HEAD` and review it for "
-                                       "correctness bugs, missed edge cases, security problems and broken interfaces. Fix only REAL problems directly in "
-                                       "the code - no style refactors. Reply with a one-line verdict."), "reviewer", wt, f"{run.id}.{ag.id}r")
+                self._claude(run, ag, (f"{ENGINEERING_EXECUTION_PROTOCOL}\n\nYou are reviewing developer {ag.id}'s work (task: {ag.title}). Inspect `git diff {ag.base}..HEAD` against the acceptance criteria and shared contracts. "
+                                       "Review for correctness bugs, missed edge cases, security, concurrency/resource leaks, compatibility, and test gaps. "
+                                       "Fix only REAL problems directly in the code - no cosmetic refactors. Re-run the strongest relevant checks after fixing. Reply with an evidence-backed verdict."), "reviewer", wt, f"{run.id}.{ag.id}r")
+                self._prepare_commit(ag, wt, strict=run.quality in {"strict", "audit"} or bool(run.opts.get("strict")))
                 self._commit(ag, wt, f"swarm({ag.id}): review fixes")
+                ok, cmd, out = self._verify(run, ag, wt)
+                ag.verify_ok, ag.verify_out = ok, out
+                if ok is False:
+                    raise ValueError(f"reviewer left quality checks failing: {out[-500:]}")
             ag.changed = self._changed(ag, wt)
             if run.stop.is_set():
                 ag.status = "stopped"
@@ -5518,11 +6149,13 @@ class Swarm:
                 left = [x for x in git(["diff", "--name-only", "--diff-filter=U"], md, check=False).stdout.splitlines() if x]
                 marks = [c for c in conflicts if (md / c).is_file() and re.search(r"^(<<<<<<<|>>>>>>>) ", (md / c).read_text(encoding="utf-8", errors="replace"), re.M)]
                 if not marks:
-                    git(["add", "-A"], md, check=False)
-                    if git(["commit", "-q", "--no-edit"], md, check=False).returncode == 0 or git(["diff", "--cached", "--quiet"], md, check=False).returncode == 0:
-                        ag.status, ag.note = "merged", "conflict auto-resolved: " + ", ".join(conflicts)
-                        run.ev(f"{ag.id} merged (conflict resolved)")
-                        return
+                    try:
+                        if self._commit(ag, md, "swarm: conflict resolution") or git(["diff", "--cached", "--quiet"], md, check=False).returncode == 0:
+                            ag.status, ag.note = "merged", "conflict auto-resolved: " + ", ".join(conflicts)
+                            run.ev(f"{ag.id} merged (conflict resolved)")
+                            return
+                    except Exception as exc:
+                        run.ev(f"{ag.id}: conflict resolution commit blocked: {exc}")
                 left = left or marks
             git(["merge", "--abort"], md, check=False)
             git(["reset", "-q", "--hard", "HEAD"], md, check=False)
@@ -5530,26 +6163,74 @@ class Swarm:
             ag.note = "could not be merged automatically: " + ", ".join(conflicts or [p.stderr.strip()[:120]])
             run.ev(f"{ag.id}: CONFLICT - {ag.note}")
 
+    def _final_audit(self, run: SwarmRun) -> Dict[str, Any]:
+        if run.quality != "audit":
+            return {"ok": True, "skipped": True, "reason": "quality level is not audit"}
+        usable = [a for a in self.pool.accounts if a.enabled and a.usable() and a.status == "ready" and a.worker is not None and a.worker.ok]
+        if not usable:
+            return {"ok": False, "skipped": False, "reason": "no ready account is available for independent final audit"}
+        strongest = max(usable, key=lambda a: (getattr(a, "tier", 1), getattr(a, "priority", 0)))
+        ag = SwarmAgent("auditor", "independent final audit", "", ["**"], [], strongest.id, [])
+        ag.base = run.base
+        run.ev("audit: independent reviewer is inspecting the final merged diff")
+        prompt = (f"{ENGINEERING_EXECUTION_PROTOCOL}\\n\\n"
+                  f"You are the INDEPENDENT FINAL AUDITOR for swarm {run.id}. Inspect the actual final tree and `git diff {run.base}..HEAD`.\n"
+                  f"OVERALL GOAL:\n{run.goal}\n\n"
+                  f"PLANNER CONTRACTS:\n{run.contracts or '(none)'}\n\n"
+                  "Do a final adversarial review for functional correctness, acceptance criteria, security/secrets, race conditions, resource leaks, data loss, error handling, compatibility, generated artifacts, conflict markers, and missing tests.\n"
+                  "Fix only concrete defects you can justify from the repository. Preserve intentional behavior. After fixes, rerun the strongest relevant quality checks.\n"
+                  "Do not make cosmetic refactors. Reply with a concise evidence-backed verdict and list any remaining limitations.")
+        try:
+            self._claude(run, ag, prompt, "reviewer", run.merge_dir, f"{run.id}.audit", strongest.id)
+            self._prepare_commit(ag, run.merge_dir, strict=False)
+            changed = self._commit(ag, run.merge_dir, "swarm: independent final audit")
+            ok, cmd, out = self._verify(run, None, run.merge_dir)
+            report = {"ok": ok is not False, "changed": changed, "cmd": cmd, "out": out[-2500:],
+                      "account_id": strongest.id, "account_tier": getattr(strongest, "tier", None)}
+            run.ev("audit: " + ("PASSED" if report["ok"] else "FAILED") + (f" ({cmd})" if cmd else ""))
+            return report
+        except Exception as exc:
+            run.ev(f"audit failed: {exc}")
+            return {"ok": False, "skipped": False, "reason": str(exc)[:1000]}
+
     def _finish(self, run: SwarmRun) -> None:
         merged = [a for a in run.agents if a.status == "merged"]
-        if merged and run.verify != "off":
+        if merged and (run.verify != "off" or run.quality != "off"):
             run.status = "verifying"
             rounds = 0
             while True:
                 ok, cmd, out = self._verify(run, None, run.merge_dir)
-                run.final_verify = {"ok": ok, "cmd": cmd, "out": out[-1500:]}
+                run.final_verify = {"ok": ok, "cmd": cmd, "out": out[-1500:], "quality": run.quality,
+                                    "checks": ((getattr(run, "quality_report", None) or {}).get("checks") if isinstance(getattr(run, "quality_report", None), dict) else [])}
+                if run.agents:
+                    reports = [a.quality_report for a in run.agents if a.quality_report]
+                    run.quality_report = {"agents": reports, "final": {"ok": ok, "cmd": cmd, "out": out[-1500:]}, "level": run.quality}
                 if ok is not False or rounds >= _state().SWARM_FIX_ROUNDS or run.stop.is_set():
                     break
                 rounds += 1
                 run.ev(f"integration check failed - integrator round {rounds}")
                 ag = SwarmAgent("integrator", "integration fixes", "", [], [])
                 try:
-                    self._claude(run, ag, f"The merged project fails its check `{cmd}`:\n{out}\n\nFix the integration problems (mismatched interfaces, "
-                                          "missing glue code, broken imports) until it passes, then reply.", "reviewer", run.merge_dir, f"{run.id}.int")
+                    self._claude(run, ag, f"{ENGINEERING_EXECUTION_PROTOCOL}\n\nThe merged project fails its quality check `{cmd}`:\n{out}\n\nFix the integration problems (mismatched interfaces, "
+                                          "missing glue code, broken imports) until all relevant acceptance criteria and checks pass, then reply.", "reviewer", run.merge_dir, f"{run.id}.int")
+                    self._prepare_commit(ag, run.merge_dir, strict=False)
                     self._commit(ag, run.merge_dir, "swarm: integration fixes")
                 except Exception as exc:
                     run.ev(f"integrator failed: {exc}")
                     break
+        if merged and run.quality == "audit" and not run.stop.is_set():
+            audit = self._final_audit(run)
+            run.quality_report["audit"] = audit
+            if not audit.get("ok"):
+                run.final_verify["ok"] = False
+                run.final_verify["out"] = (run.final_verify.get("out", "") + "\n" + str(audit.get("reason") or "audit failed"))[-1500:]
+        # Never leave build/test caches in the merge worktree that could accidentally enter a later commit.
+        for rel in _working_paths(run.merge_dir, run.base):
+            if _generated_artifact(rel):
+                try:
+                    _remove_worktree_path(run.merge_dir, rel)
+                except OSError:
+                    pass
         bad = [a for a in run.agents if a.status in SW_BAD]
         run.status = "done" if not bad and run.final_verify.get("ok") is not False else "done_with_issues"
         run.finished = time.time()
@@ -5577,6 +6258,12 @@ class Swarm:
                 pass
             if a.status not in SW_DONE:
                 a.status = "stopped"
+            # Killing the claude process does not cancel the bridge request it left
+            # in flight: the account's worker stays wedged in WAITING_RESPONSE and
+            # reads 'busy' forever. Restart it so the pool gets the account back.
+            acct = self.pool.get(a.account_id) if a.account_id else None
+            if acct is not None and acct.status == "busy":
+                self.pool.restart_account(acct)
         if run.status in ("planning", "running", "verifying"):
             run.status, run.finished = "stopped", time.time()
         run.ev("stopped by the user")
@@ -5679,6 +6366,7 @@ class AcctStats:
         self.last_error = ""
         self.last_error_at = 0.0
         self.dirty = False
+        self.dirty_seq = 0
 
     def reset(self) -> None:
         with self.lock:
@@ -5687,7 +6375,9 @@ class AcctStats:
             self.last_used = self.streak_start = 0.0
             self.minutes.clear()
             self.days.clear()
-            self.last_error, self.last_error_at, self.dirty = "", 0.0, True
+            self.last_error, self.last_error_at = "", 0.0
+            self.dirty = True
+            self.dirty_seq += 1
 
     def record_exchange(self, prompt_chars: int, reply_chars: int, seconds: float) -> None:
         self.record_tokens(int(prompt_chars / _state().CHARS_PER_TOKEN), int(reply_chars / _state().CHARS_PER_TOKEN), seconds)
@@ -5714,11 +6404,16 @@ class AcctStats:
             for k in sorted(self.days)[:-14]:
                 del self.days[k]
             self.dirty = True
+            self.dirty_seq += 1
 
     def note_ok(self) -> None:
         with self.lock:
             self.ok += 1
+            # A success means the account recovered: drop any stale error so the panel
+            # stops showing a 30-minute-old rate-limit notice on a healthy card.
+            self.last_error, self.last_error_at = "", 0.0
             self.dirty = True
+            self.dirty_seq += 1
 
     def note_err(self, kind: str, msg: str = "") -> None:
         with self.lock:
@@ -5728,6 +6423,7 @@ class AcctStats:
             self.last_error = f"[{kind}] {msg}"[:220]
             self.last_error_at = time.time()
             self.dirty = True
+            self.dirty_seq += 1
 
     def recent_tokens(self, window_s: int = 600) -> int:
         lo = int((time.time() - window_s) // 60)
@@ -5755,6 +6451,17 @@ class AcctStats:
             return {"req": self.req, "ok": self.ok, "err": self.err, "rate_limits": self.rate_limits,
                     "in_tok": self.in_tok, "out_tok": self.out_tok, "active_s": self.active_s,
                     "since": self.since, "days": self.days}
+
+    def persistence_snapshot(self) -> Tuple[Dict[str, Any], int]:
+        with self.lock:
+            return ({"req": self.req, "ok": self.ok, "err": self.err, "rate_limits": self.rate_limits,
+                     "in_tok": self.in_tok, "out_tok": self.out_tok, "active_s": self.active_s,
+                     "since": self.since, "days": self.days}, self.dirty_seq)
+
+    def mark_persisted(self, seq: int) -> None:
+        with self.lock:
+            if self.dirty_seq == seq:
+                self.dirty = False
 
     def load(self, d: Optional[Dict[str, Any]]) -> None:
         if not isinstance(d, dict):
@@ -5818,6 +6525,7 @@ class Account:
         self.rl_streak = 0
         self.fail_streak = 0
         self.inflight = 0
+        self.req_started_at = 0.0    # when the current request began; 0 when idle
         self.stint_reqs = 0
         self.stint_start = time.time()
         self.worker: Optional[Bridge] = None
@@ -5836,8 +6544,11 @@ class Account:
     def set_status(self, status: str, err: str = "") -> None:
         if status != self.status:
             self.status, self.status_since = status, time.time()
-        if err:
-            self.status_err = err
+        # An error message belongs to the status it was set with. Moving back to a healthy
+        # state (e.g. the worker reconnecting, a restart, or an explicit "ready") must drop it,
+        # otherwise the card keeps showing a failure the account has already recovered from.
+        # Error/login statuses without a message also clear so a stale err can't outlive its cause.
+        self.status_err = err if status in ("error", "login_needed") else ""
 
     def set_browser_state(self, state: str, reason: str = "") -> None:
         if state not in BROWSER_STATES:
@@ -5964,6 +6675,7 @@ class Pool:
         self._last_route: Optional[str] = None
         self._stop = threading.Event()
         self._usage_saved = 0.0
+        self._usage_lock = threading.Lock()
         self.governor = ResourceGovernor()
         raw_pa = cfg.get("project_accounts")
         self.project_accounts: Dict[str, List[str]] = {str(k): [str(x) for x in v if str(x)]
@@ -6022,28 +6734,66 @@ class Pool:
             if not str(profile):
                 return
             resolved = profile.expanduser().resolve(strict=False)
-            trusted_roots = [_state().ACCOUNTS_DIR.resolve(strict=False), _state().PROFILE_DIR.resolve(strict=False)]
-            trusted = any(resolved == root or root in resolved.parents for root in trusted_roots)
+            accounts_root = _state().ACCOUNTS_DIR.resolve(strict=False)
+            profile_root = _state().PROFILE_DIR.resolve(strict=False)
+            # Never remove an instance root itself. A malformed/corrupted config must
+            # not be able to turn account deletion into "delete every browser profile".
+            if resolved == accounts_root:
+                _warn_once("profile_cleanup_root", f"refusing to delete account profile root {resolved!s}")
+                return
+            if resolved == profile_root:
+                # The legacy single-account profile historically lived at PROFILE_DIR.
+                # Clear its children but preserve the root directory itself.
+                children = list(resolved.iterdir()) if resolved.exists() and resolved.is_dir() else []
+                for child in children:
+                    last: Optional[BaseException] = None
+                    for attempt in range(8):
+                        try:
+                            if child.is_dir() and not child.is_symlink():
+                                shutil.rmtree(child, ignore_errors=False)
+                            else:
+                                child.unlink()
+                            last = None
+                            break
+                        except Exception as exc:
+                            last = exc
+                            if attempt < 7:
+                                time.sleep(0.25)
+                    if last is not None:
+                        raise last
+                return
+            trusted = resolved.parent == accounts_root or accounts_root in resolved.parents or profile_root in resolved.parents
             if trusted and resolved.exists():
-                shutil.rmtree(resolved, ignore_errors=False)
+                last: Optional[BaseException] = None
+                for attempt in range(8):
+                    try:
+                        shutil.rmtree(resolved, ignore_errors=False)
+                        return
+                    except Exception as exc:
+                        last = exc
+                        if attempt < 7:
+                            time.sleep(0.25)
+                if last is not None:
+                    raise last
         except Exception as exc:
             _warn_once("profile_cleanup", f"could not remove account browser profile {profile!s}: {exc}")
 
     def _remove_usage_account(self, account_id: str) -> None:
         """Remove one account's persisted usage/stats entry immediately."""
         try:
-            path = self._usage_path()
-            if not path.exists():
-                return
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                return
-            accounts = data.get("accounts")
-            if isinstance(accounts, dict) and account_id in accounts:
-                accounts.pop(account_id, None)
-                tmp = path.with_suffix(path.suffix + ".tmp")
-                tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-                os.replace(tmp, path)
+            with self._usage_lock:
+                path = self._usage_path()
+                if not path.exists():
+                    return
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    return
+                accounts = data.get("accounts")
+                if isinstance(accounts, dict) and account_id in accounts:
+                    accounts.pop(account_id, None)
+                    tmp = path.with_suffix(path.suffix + ".tmp")
+                    tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+                    os.replace(tmp, path)
         except Exception as exc:
             self.event("warn", f"usage record for deleted account could not be removed: {exc}")
 
@@ -6066,16 +6816,33 @@ class Pool:
             pass
 
     def save_usage(self) -> None:
+        """Persist usage without losing updates that race the disk write.
+
+        A simple boolean dirty flag is insufficient: clearing it before writing creates
+        a window where a concurrent request can update counters and that update then gets
+        falsely marked clean. Snapshot a per-account sequence number and clear the flag
+        only when the exact snapshot is the version still present after the atomic replace.
+        """
         try:
-            if not any(a.stats.dirty for a in self.accounts):
-                return
-            for a in self.accounts:
-                a.stats.dirty = False
-            path = self._usage_path()
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(json.dumps({"version": 1, "accounts": {a.id: a.stats.to_json() for a in self.accounts}}),
-                           encoding="utf-8")
-            os.replace(tmp, path)
+            with self._usage_lock:
+                with self.lock:
+                    accounts = list(self.accounts)
+                snapshots: Dict[str, Tuple[Dict[str, Any], int]] = {}
+                for a in accounts:
+                    data, seq = a.stats.persistence_snapshot()
+                    if a.stats.dirty:
+                        snapshots[a.id] = (data, seq)
+                if not snapshots:
+                    return
+                path = self._usage_path()
+                tmp = path.with_suffix(path.suffix + ".tmp")
+                payload = {"version": 1, "accounts": {aid: data for aid, (data, _) in snapshots.items()}}
+                tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                os.replace(tmp, path)
+                for a in accounts:
+                    snap = snapshots.get(a.id)
+                    if snap is not None:
+                        a.stats.mark_persisted(snap[1])
         except Exception:
             pass
 
@@ -6116,6 +6883,9 @@ class Pool:
     # ---- lifecycle ----------------------------------------------------------------
 
     def start_account(self, a: Account, force_login: bool = False) -> None:
+        if self._stop.is_set():
+            self.event("info", f"not starting '{a.name}': bridge pool is stopping")
+            return
         if a.deleted or not a.enabled:
             a.set_status("disabled")
             try: a.set_browser_state("CLOSED", "disabled")
@@ -6138,25 +6908,57 @@ class Pool:
         return started
 
     def wait_selected_ready(self, account_ids: List[str], timeout: float) -> bool:
+        """Wait for selected accounts without aborting a recoverable browser startup.
+
+        A persistent Playwright context can fail transiently (profile lock, browser
+        process race, Chromium startup hiccup, extension/process cleanup, etc.).
+        The old implementation returned False as soon as a selected account entered
+        ``error``. Main() then called Pool.stop(), which destroyed the very browser
+        session that should have been allowed to recover.
+
+        Web accounts therefore get a small, bounded startup-recovery budget here.
+        Interactive ``login_needed`` remains a live state and is never treated as a
+        failure. API accounts keep their strict failure semantics.
+        """
         wanted = {str(x) for x in account_ids if str(x)}
         if not wanted:
             return False
-        end = time.time() + timeout
+        end = time.time() + max(0.0, float(timeout))
+        recovery_attempts: Dict[str, int] = {}
+        next_retry: Dict[str, float] = {}
+
         while time.time() < end:
-            if any(a.status == "ready" for a in self.accounts if a.id in wanted):
+            selected = [a for a in self.accounts if a.id in wanted]
+            if any(a.status == "ready" and a.worker is not None and a.worker.ok for a in selected):
                 return True
-            # A web account may legitimately sit in `login_needed` while the user
-            # is still completing the interactive browser login.  Treat that as a
-            # live startup state; otherwise the main thread immediately calls
-            # Pool.stop(), which closes the just-opened login window.  API accounts
-            # use `login_needed` for invalid/missing keys, so keep those as failures.
-            live = [
-                a for a in self.accounts
-                if a.id in wanted
-                and a.enabled
-                and (a.status in ("starting", "login") or
-                     (a.status == "login_needed" and a.kind == "web"))
-            ]
+
+            live = []
+            for a in selected:
+                if not a.enabled or a.deleted:
+                    continue
+                if a.status in ("starting", "login"):
+                    live.append(a)
+                    continue
+                if a.status == "login_needed" and a.kind == "web":
+                    # The visible login window is intentionally kept alive until the
+                    # user finishes authentication or the caller's overall timeout ends.
+                    live.append(a)
+                    continue
+                if a.status == "error" and a.kind == "web":
+                    # Give a failed startup a bounded recovery path. Do not hammer
+                    # Playwright: at most two immediate restarts, spaced by a second.
+                    now = time.time()
+                    attempts = recovery_attempts.get(a.id, 0)
+                    if attempts < 2 and now >= next_retry.get(a.id, 0.0):
+                        recovery_attempts[a.id] = attempts + 1
+                        next_retry[a.id] = now + 1.0
+                        reason = a.status_err or "unknown startup error"
+                        self.event("warn", f"'{a.name}' startup failed ({reason[:140]}); retrying browser startup "
+                                   f"({attempts + 1}/2)")
+                        self.restart_account(a)
+                        live.append(a)
+                        continue
+
             if not live:
                 return False
             time.sleep(0.3)
@@ -6165,12 +6967,21 @@ class Pool:
     def restart_account(self, a: Account, force_login: bool = False) -> None:
         def run() -> None:
             with a.op_lock:
+                # A queued restart can outlive the caller that requested it. Never let
+                # such a thread resurrect an account after pool shutdown has begun.
+                if self._stop.is_set():
+                    return
                 old = a.worker
                 a.set_status("starting")
                 if old is not None:
                     old.stop()
-                if not a.enabled:
-                    a.set_status("disabled")
+                if not a.enabled or a.deleted or self._stop.is_set():
+                    if a.deleted or not a.enabled:
+                        a.set_status("disabled")
+                    return
+                if old is not None and hasattr(old, "alive") and old.alive():
+                    a.set_status("error", "previous worker did not stop cleanly; refusing overlapping restart")
+                    self.event("error", f"'{a.name}' restart aborted: previous worker is still alive")
                     return
                 self.start_account(a, force_login)
         state_thread(target=run, daemon=True, name=f"restart-{a.id}").start()
@@ -6178,7 +6989,7 @@ class Pool:
     def wait_any_ready(self, timeout: float) -> bool:
         end = time.time() + timeout
         while time.time() < end:
-            if any(a.status == "ready" for a in self.accounts):
+            if any(a.status == "ready" and a.worker is not None and a.worker.ok for a in self.accounts):
                 return True
             # Keep waiting while a website-login account is waiting for the user.
             # Do not treat API `login_needed` (e.g. a bad/missing key) as a live state.
@@ -6665,11 +7476,18 @@ class Pool:
     def _succeeded(self, a: Account) -> None:
         a.rl_streak = max(0, a.rl_streak - 1)
         a.fail_streak = 0
+        # Clear stale failure text only. Do NOT force the status back to "ready": a web worker
+        # keeps ok=True even while the page is logged out, so a lucky reply would otherwise
+        # resurrect an account the worker already marked login_needed/error.
+        if a.status == "ready":
+            a.status_err = ""
 
     def _can_wait(self) -> bool:
         now = time.time()
-        return any(a.enabled and (a.status == "starting" or (a.status == "ready" and a.cooldown_until > now))
-                   for a in self.accounts)
+        return any(a.enabled and not a.deleted and (
+            a.status in ("starting", "login") or
+            (a.status == "login_needed" and a.kind == "web") or
+            (a.status == "ready" and a.cooldown_until > now)) for a in self.accounts)
 
     def dispatch(self, req: Any, cancel: Optional[threading.Event], on_partial: Any,
                  streamed: Optional[Callable[[], bool]] = None, priority: int = PRIORITY_MAIN
@@ -6697,6 +7515,7 @@ class Pool:
                     self._route_note(a, why, req)
                     with self.lock:
                         a.inflight += 1
+                        a.req_started_at = time.time()
                     try:
                         fut = a.worker.submit(lambda eng: eng.process(req, cancel, on_partial), priority, cancel)
                         res = fut.result()
@@ -6722,6 +7541,7 @@ class Pool:
                     finally:
                         with self.lock:
                             a.inflight -= 1
+                            a.req_started_at = 0.0
                     if getattr(req, "pin", None):
                         raise last                          # an account endpoint never moves to another account
                     if streamed is not None and streamed():
@@ -6749,14 +7569,50 @@ class Pool:
 
     # ---- watchdog ------------------------------------------------------------------
 
+    def _reap_expired_cooldowns(self, now: float) -> None:
+        """Return accounts to the pool once their cooldown has elapsed."""
+        for a in list(self.accounts):
+            if a.cooldown_until and a.cooldown_until <= now:
+                a.cooldown_until, a.cooldown_reason = 0.0, ""
+                if a.rl_streak:
+                    a.rl_streak = 0
+                if not a.cool_notified:
+                    a.cool_notified = True
+                    self.event("ok", f"'{a.name}' is available again")
+
+    def _reap_wedged_workers(self, now: float) -> None:
+        """Restart a worker wedged mid-generation.
+
+        A killed swarm agent leaves its bridge request alive: the page sits in
+        WAITING_RESPONSE (account status 'busy') and no normal return ever flips it
+        back to READY. The thread is still alive, so the dead-thread check above
+        never fires and the account is stuck 'busy' forever. Treat a generation
+        that has shown no progress for far longer than any real reply as dead.
+        """
+        limit = max(600.0, float(_state().STALL_TIMEOUT) * 6)
+        for a in list(self.accounts):
+            w = a.worker
+            if (not a.enabled or w is None or w.stopping or a.inflight > 0
+                    or a.status != "busy" or not a.req_started_at):
+                continue
+            if now - a.req_started_at < limit:
+                continue
+            with self.lock:
+                a.restarts = [t for t in a.restarts if now - t < 600]
+                if len(a.restarts) >= 3:
+                    a.set_status("error", "worker wedged and restart budget exhausted")
+                    continue
+                a.restarts.append(now)
+            self.event("warn", f"worker of '{a.name}' looks wedged - restarting it")
+            self.restart_account(a)
+
     def _watchdog(self) -> None:
         while not self._stop.wait(5.0):
             try:
                 now = time.time()
+                self._reap_expired_cooldowns(now)
+                self._reap_wedged_workers(now)
                 for a in list(self.accounts):
-                    if not a.cool_notified and a.cooldown_until <= now:
-                        a.cool_notified = True
-                        self.event("ok", f"'{a.name}' is available again")
                     w = a.worker
                     if (a.enabled and w is not None and not w.stopping and not w._thread.is_alive()
                             and a.status not in ("starting", "login", "disabled")
@@ -7109,6 +7965,14 @@ def dash_action(pool: Any, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
         pool.set_enabled(acct(), False)
     elif action == "login":
         pool.login(web_acct())
+    elif action == "submit_login":
+        a = web_acct()
+        if a.worker is None or not a.worker.ok or a.worker.ds is None:
+            raise ValueError("this account is not running")
+        ok = a.worker.submit(lambda eng: eng.submit_login(str(data.get("email", "")),
+                                                           str(data.get("password", ""))),
+                             _state().PRIORITY_MAIN).result(timeout=180)
+        return {"ok": bool(ok)}
     elif action == "show":
         pool.set_headed(web_acct(), True)
     elif action == "hide":
@@ -7207,7 +8071,7 @@ def dash_action(pool: Any, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
         pool.event("info", f"swarm project selected: {run.project}")
         emit_dash_event("swarm_started", {"id": run.id, "project": str(run.project), "attachments": attachment_ids,
                                              "account_ids": list(run.opts.get("account_ids") or [])})
-        return {"ok": True, "id": run.id, "project": run.project, "attachments": attachment_ids,
+        return {"ok": True, "id": run.id, "project": str(run.project), "attachments": attachment_ids,
                 "account_ids": list(run.opts.get("account_ids") or [])}
     elif action in ("swarm_stop", "swarm_agents", "swarm_apply", "swarm_cleanup"):
         run = pool.swarm.runs.get(str(data.get("run", "")))
@@ -7222,7 +8086,9 @@ def dash_action(pool: Any, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
         else:
             pool.swarm.cleanup(run)
     elif action == "bridge":
-        return bridge_control(pool, str(data.get("action", "")))
+        return bridge_control(pool, str(data.get("action", "")), str(data.get("mode", "")))
+    elif action == "apply_mode":
+        return apply_mode(pool, str(data.get("mode", "")), str(data.get("project", "")), bool(data.get("dry")))
     elif action == "reset_usage":
         for x in pool.accounts:
             x.stats.reset()
@@ -7247,7 +8113,7 @@ def dash_action(pool: Any, action: str, data: Dict[str, Any]) -> Dict[str, Any]:
 
 # name, kind, group, English label, Persian label, min (or choices), max, when it takes effect
 SETTINGS_SCHEMA: Tuple[Tuple[Any, ...], ...] = (
-    ("permission_mode", "choice", "claude", "Default Claude Code mode", "حالت پیش‌فرض Claude Code", ["safe", "ask", "auto"], 0, "launch"),
+    ("permission_mode", "choice", "claude", "Default Claude Code mode", "حالت پیش‌فرض Claude Code", ["safe", "ask", "auto"], 0, "newwin"),
     ("KEEP_GOING", "bool", "claude", "Autonomous mode: do not let Claude stop before PROGRESS.md says done",
      "حالت خودکار: Claude قبل از پایان کار متوقف نشود", 0, 0, "launch"),
     ("KEEP_GOING_MAX", "int", "claude", "Autonomous mode: maximum forced continues", "حداکثر تعداد ادامه اجباری", 1, 5000, "launch"),
@@ -7278,6 +8144,10 @@ SETTINGS_SCHEMA: Tuple[Tuple[Any, ...], ...] = (
     ("SWARM_AGENTS", "int", "swarm", "Parallel agents per swarm run (0 = automatic: what the accounts can serve)", "تعداد ایجنت موازی (۰ = خودکار)", 0, 32, "live"),
     ("SWARM_MAX_AGENTS", "int", "swarm", "Upper limit for the automatic number of agents", "سقف خودکار تعداد ایجنت", 1, 32, "live"),
     ("SWARM_REVIEW", "choice", "swarm", "Review every agent's work (auto = only when a stronger account exists)", "بازبینی کار هر ایجنت", ["auto", "on", "off"], 0, "live"),
+    ("SWARM_QUALITY", "choice", "swarm", "Engineering quality enforcement: off / standard / strict / audit", "سطح کنترل کیفیت مهندسی", ["off", "standard", "strict", "audit"], 0, "live"),
+    ("SWARM_QUALITY_TIMEOUT", "int", "swarm", "Maximum seconds for one quality verification command", "حداکثر زمان بررسی کیفیت (ثانیه)", 30, 7200, "live"),
+    ("SWARM_DIRTY_POLICY", "choice", "swarm", "What to do when the target repository has uncommitted changes", "رفتار در برابر تغییرات commit نشده", ["block", "warn", "allow"], 0, "live"),
+    ("ENGINEERING_GUARD", "bool", "developer", "Inject the engineering execution protocol into coding sessions", "تزریق استاندارد مهندسی به جلسات کدنویسی", 0, 0, "live"),
     ("SWARM_FIX_ROUNDS", "int", "swarm", "Automatic fix rounds when a check fails", "تعداد دور رفع خطای خودکار", 0, 10, "live"),
     ("SWARM_AGENT_TIMEOUT", "int", "swarm", "Longest time one agent may run (s)", "بیشترین زمان یک ایجنت (ثانیه)", 60, 86400, "live"),
     ("port", "int", "panel", "Local port of the bridge", "پورت محلی bridge", 1, 65535, "bridge"),
@@ -7458,6 +8328,27 @@ def launch_claude_from_panel(pool: Any, opts: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "where": where, "project": b["project"], "mode": b["mode"]}
 
 
+def apply_mode(pool: Any, mode: str, project: str = "", dry: bool = False) -> Dict[str, Any]:
+    """Persist a permission mode, then open a NEW Claude Code window using it.
+
+    Claude Code reads --permission-mode once at process start, so a running session can never
+    switch modes. The only honest way to "apply now" is a fresh window - which is why this
+    spawns a separate terminal and leaves the current session untouched.
+    """
+    mode = _norm_mode(mode)
+    if not mode:
+        raise ValueError(f"unknown permission mode '{mode}'")
+    saved = _norm_mode(pool.cfg.get("permission_mode")) or ""
+    settings_set(pool.cfg, {"permission_mode": mode}, [])
+    project = project or pool.cfg.get("project_dir") or str(SCRIPT_DIR)
+    if dry:
+        return {"ok": True, "mode": mode, "saved": saved, "project": project}
+    pool.event("info", f"permission mode set to '{mode}' - opening a new Claude Code window")
+    r = launch_claude_from_panel(pool, {"project": project, "mode": mode})
+    r["saved"] = saved
+    return r
+
+
 def fs_list(path: str = "") -> Dict[str, Any]:
     p = Path(path).expanduser() if path else Path.home()
     try:
@@ -7505,7 +8396,13 @@ def run_task(pool: Any, name: str) -> Dict[str, Any]:
             for line in p.stdout:                                   # type: ignore[union-attr]
                 if line.strip():
                     log(f"[task:{name}] {line.rstrip()}")
-            log(f"[task:{name}] finished with exit code {p.wait()}", C.green if p.returncode == 0 else C.red)
+            code = p.wait()
+            log(f"[task:{name}] finished with exit code {code}", C.green if code == 0 else C.red)
+            try:
+                if p.stdout is not None:
+                    p.stdout.close()
+            except Exception:
+                pass
         except Exception as exc:
             log(f"[task:{name}] failed: {exc}", C.red)
         finally:
@@ -7514,10 +8411,56 @@ def run_task(pool: Any, name: str) -> Dict[str, Any]:
     return {"ok": True}
 
 
-def bridge_control(pool: Any, action: str) -> Dict[str, Any]:
-    if _state().RUN_MODE == "claude":
-        raise ValueError("The bridge runs inside your Claude Code window. Close Claude Code to stop it, or start "
-                         "the bridge with  --panel  to control it from here.")
+def restart_console(pool: Any, mode: str = "") -> Dict[str, Any]:
+    """Restart the embedded Claude Code console with a new permission mode.
+
+    The bridge keeps running: the supervised launcher (launch_claude) owns the `claude` child, so
+    we only ask it to respawn. The conversation is resumed via the session id captured from a
+    SessionStart hook, so the user does not lose their session.
+    """
+    state = _state()
+    if state.RUN_MODE != "claude":
+        raise ValueError("Restart Claude Code is only available when the bridge runs inside a Claude Code window.")
+    with state.CONSOLE_LOCK:
+        proc = state.CONSOLE_PROC
+        if state.CONSOLE_STATE == "restarting":
+            raise ValueError("Claude Code is already restarting.")
+        if proc is None or proc.poll() is not None:
+            raise ValueError("There is no running Claude Code console to restart.")
+        new_mode = str(mode or "").strip() or resolve_mode(None, pool.cfg)[0] or DEFAULT_MODE
+        state.CONSOLE_RESTART_MODE = new_mode
+        state.CONSOLE_STATE = "restarting"   # closes the double-click window before stop_child runs
+        resume = bool(state.CONSOLE_SESSION)
+    def stop_child() -> None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=8)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    state_thread(target=stop_child, daemon=True).start()
+    return {"ok": True, "mode": new_mode, "resume": resume,
+            "session": state.CONSOLE_SESSION if resume else None}
+
+
+def bridge_control(pool: Any, action: str, mode: str = "") -> Dict[str, Any]:
+    if action not in ("restart", "stop", "restart_console"):
+        raise ValueError(f"unknown bridge action '{action}'")
+    state = _state()
+    if action == "restart_console":
+        return restart_console(pool, mode)
+    # Embedded mode (bridge launched from inside a Claude Code window): a *stop* would leave that
+    # window behind a dead bridge, so it stays refused. A *restart* is safe - the child is spawned
+    # detached and only this bridge process exits, so the parent Claude Code window is untouched.
+    if state.RUN_MODE == "claude" and action != "restart":
+        raise ValueError("The bridge runs inside your Claude Code window. Stopping it would close that window. "
+                         "To change the permission mode now, use Restart Claude Code - it reopens the console "
+                         "with the new mode and resumes your session.")
 
     def later() -> None:
         time.sleep(0.6)
@@ -7528,17 +8471,23 @@ def bridge_control(pool: Any, action: str) -> Dict[str, Any]:
         except Exception:
             pass
         if action == "restart":
+            # Never recursively relaunch the offline regression suite. A real bridge
+            # restart should preserve normal CLI flags, while --self-test is explicitly
+            # a terminating diagnostic mode and must not turn into an endless process tree.
+            if "--self-test" in sys.argv:
+                log("[bridge] restart suppressed during --self-test", C.dim)
+                return
             time.sleep(1.5)
             try:
-                devnull = open(os.devnull, "wb")
-                args = [sys.executable] + sys.argv
-                if os.name == "nt":
-                    flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-                    subprocess.Popen(args, cwd=str(SCRIPT_DIR), stdin=devnull, stdout=devnull,
-                                     stderr=devnull, creationflags=flags, close_fds=True)
-                else:
-                    subprocess.Popen(args, cwd=str(SCRIPT_DIR), stdin=devnull, stdout=devnull,
-                                     stderr=devnull, start_new_session=True, close_fds=True)
+                args = [sys.executable] + [x for x in sys.argv if x not in ("--self-test",)]
+                with open(os.devnull, "wb") as devnull:
+                    if os.name == "nt":
+                        flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                        subprocess.Popen(args, cwd=str(SCRIPT_DIR), stdin=devnull, stdout=devnull,
+                                         stderr=devnull, creationflags=flags, close_fds=True)
+                    else:
+                        subprocess.Popen(args, cwd=str(SCRIPT_DIR), stdin=devnull, stdout=devnull,
+                                         stderr=devnull, start_new_session=True, close_fds=True)
             except Exception as exc:
                 log(f"restart failed: {exc}", C.red)
         os._exit(0)
@@ -7938,9 +8887,11 @@ cBase:["آدرس","Base URL"],cKey:["کلید API","API key"],cModel:["مدل","
 cNote:["مدل نادیده گرفته می‌شود؛ همان گفتگوی DeepSeek استفاده می‌شود. هر نامی بنویسید کار می‌کند.","The model name is ignored; the DeepSeek chat is used. Any name works."],
 cProf:["پوشه ورود (پروفایل)","Login profile folder"],
 g_claude:["Claude Code","Claude Code"],g_rel:["پایداری و تلاش مجدد","Reliability & retries"],g_ctx:["حافظه و طول گفتگو","Context & chat length"],g_browser:["مرورگر و فایل‌ها","Browser & files"],g_panel:["پنل و شبکه","Panel & network"],
-w_live:["فوری","instant"],w_launch:["اجرای بعدی","next launch"],w_browser:["ریستارت اکانت","account restart"],w_bridge:["ریستارت bridge","bridge restart"],
-look:["ظاهر","Appearance"],accent:["رنگ","Accent"],maint:["نگهداری","Maintenance"],restartB:["ریستارت bridge","Restart bridge"],stopB:["توقف bridge","Stop bridge"],resetU:["صفر کردن آمار","Reset usage stats"],selftest:["اجرای تست داخلی","Run self-test"],verify:["بررسی حالت امن","Verify safe mode"],
+w_live:["فوری","instant"],w_launch:["اجرای بعدی","next launch"],w_browser:["ریستارت اکانت","account restart"],w_bridge:["ریستارت bridge","bridge restart"],w_newwin:["پنجره جدید","new window"],
+look:["ظاهر","Appearance"],accent:["رنگ","Accent"],maint:["نگهداری","Maintenance"],restartB:["ریستارت bridge","Restart bridge"],restartCC:["ریستارت Claude Code","Restart Claude Code"],ccResumed:["نشست ادامه یافت","session resumed"],stopB:["توقف bridge","Stop bridge"],resetU:["صفر کردن آمار","Reset usage stats"],selftest:["اجرای تست داخلی","Run self-test"],verify:["بررسی حالت امن","Verify safe mode"],
 saveChg:["ذخیره تغییرات","Save changes"],saved:["ذخیره شد","Saved"],needRestart:["برای اعمال، ریستارت لازم است:","Restart needed for:"],unsaved:["تغییر ذخیره‌نشده","unsaved change(s)"],
+modeHint:["این bridge داخل پنجره Claude Code اجرا می‌شود — حالت جدید در اجرای بعدی Claude Code اعمال می‌شود. برای استفاده همین حالا، پنجره جدید باز کنید.","This bridge is running inside your Claude Code window — a new mode applies to the next Claude Code launch. To use it now, open a new window."],
+applyNewWin:["اعمال در پنجره جدید","Apply in a new window"],modeSame:["همان حالت ذخیره‌شده","same as saved mode"],
 palPh:["جست‌وجوی دستور…","Search commands…"],lang:["تغییر زبان","Switch language"],started:["شروع شد — خروجی در کنسول","Started - output is in Console"],
 n_live:["زنده","Live"],n_swarm:["تیم ایجنت","Swarm"],dock:["نمای زنده","Live dock"],g_swarm:["تیم ایجنت (Swarm)","Swarm (parallel agents)"],
 smart:["مسیریابی هوشمند بر اساس کیفیت مدل","Smart routing by model quality"],tierStrong:["حداقل سطح برای کار سنگین","Min tier for hard work"],tierBal:["حداقل سطح کار عادی","Min tier for normal work"],
@@ -7950,7 +8901,7 @@ wizTitle:["چه اکانتی اضافه کنیم؟","Which account do you want t
 f_pin:["قیمت ورودی ($ هر میلیون توکن)","Input price ($ per M tokens)"],f_pout:["قیمت خروجی ($ هر میلیون توکن)","Output price ($ per M tokens)"],f_budget:["سقف بودجه ($، ۰ = نامحدود)","Budget limit ($, 0 = none)"],fetchM:["دریافت مدل‌ها","Fetch models"],testAdd:["افزودن و تست","Add & test"],
 tier1:["پایه","Basic"],tier2:["سریع","Fast"],tier3:["استاندارد","Standard"],tier4:["قوی","Strong"],tier5:["برتر","Top"],s_budget:["بودجه تمام شد","Budget used"],powAuto:["قدرت: خودکار","Power: auto"],powStrong:["قدرت: بالا","Power: strong"],
 lv_all:["همه","all"],lv_main:["اصلی","main"],lv_agent:["ایجنت‌ها","agents"],lv_side:["جانبی","side"],lvEmpty:["هنوز فعالیتی نیست؛ Claude Code را اجرا کنید یا پیامی بفرستید.","No activity yet - start Claude Code or send a message."],
-swNew:["شروع یک تیم ایجنت موازی","Start a parallel agent team"],swGoalPh:["چه چیزی ساخته شود؟ (مثلاً: بک‌اند API + رابط کاربری + تست‌ها)","What should the team build? (e.g. backend API + UI + tests)"],swAgents:["ایجنت همزمان","parallel agents"],swAuto:["خودکار","auto"],swOff:["خاموش","off"],swOn:["روشن","on"],
+swNew:["شروع یک تیم ایجنت موازی","Start a parallel agent team"],swNoAcct:["حساب آماده‌ای نیست — ابتدا یک حساب AI را وارد کنید","no ready AI account — sign in to an account first"],swGoalPh:["چه چیزی ساخته شود؟ (مثلاً: بک‌اند API + رابط کاربری + تست‌ها)","What should the team build? (e.g. backend API + UI + tests)"],swAgents:["ایجنت همزمان","parallel agents"],swAuto:["خودکار","auto"],swOff:["خاموش","off"],swOn:["روشن","on"],
 swVerify:["اجرای تست/بیلد","Run tests / build"],swReview:["بازبینی با حساب قوی‌تر","Review with a stronger account"],swStrict:["محدودیت سخت‌گیرانه‌ی مسیرها","Strict path ownership"],swInit:["اگر git نیست، بساز","git init if needed"],
 swManual:["لیست دستی تسک‌ها (به‌جای برنامه‌ریزی خودکار)","Manual task list (instead of auto-planning)"],swManualPh:["هر خط یک تسک","one task per line"],swStart:["شروع","Start"],
 swTip:["هر ایجنت در worktree و branch جدا کار می‌کند؛ تا «اعمال» نزنید به پروژه‌تان دست نمی‌خورد.","Each agent works in its own worktree/branch; nothing touches your project until you press Apply."],
@@ -8122,7 +9073,7 @@ function updCard(el,a,tt){const s=a.stats;el.classList.toggle("cur",a.current);e
 F(el,"live").hidden=!a.current;F(el,"pin").hidden=!(S.settings.strategy==="pinned"&&a.pinned);const p=F(el,"pill");p.className="pill st-"+a.state;p.textContent=t("s_"+a.state)+(a.state==="cooldown"?" "+dur(a.cooldown_left):"");
 const v={tin:tok(s.in_tok),tout:tok(s.out_tok),today:tok(s.today_in+s.today_out),msgs:s.req,errs:s.err+" / "+s.rate_limits,avg:s.avg_s+"s",active:dur(s.active_s),streak:dur(s.streak_s)+(s.streak_live?" •":""),last:s.last_used_ago==null?t("never"):dur(s.last_used_ago)+" "+t("ago")};
 for(const k in v)setf(el,"kv_"+k,v[k]);F(el,"bar").style.width=((s.in_tok+s.out_tok)/tt*100).toFixed(0)+"%";F(el,"spark").innerHTML=spark(s.spark);
-setf(el,"err",a.status_err||(s.last_error&&s.last_error_ago<1800?s.last_error:""));const web=a.kind==="web";setf(el,"sub",pvIcon(a.provider)+" "+(web?"DeepSeek":a.model)+" · T"+a.tier+" "+stars(a.tier));const rm=F(el,"remove");if(rm)rm.hidden=!!a.deleted;
+setf(el,"err",a.status_err||(a.state!=="ready"&&s.last_error&&s.last_error_ago<1800?s.last_error:""));const web=a.kind==="web";setf(el,"sub",pvIcon(a.provider)+" "+(web?"DeepSeek":a.model)+" · T"+a.tier+" "+stars(a.tier));const rm=F(el,"remove");if(rm)rm.hidden=!!a.deleted;
 setf(el,"chats",web?a.chats+" "+t("chats")+(a.headed?" · □":""):"⚡ ×"+a.max_parallel+(a.cost>0||a.budget>0?" · $"+a.cost.toFixed(4)+(a.budget>0?" / $"+a.budget:""):""));
 el.querySelectorAll("[data-web]").forEach(b=>b.hidden=!web);F(el,"bshow").hidden=!web||a.headed;F(el,"bhide").hidden=!web||!a.headed;F(el,"ben").hidden=a.enabled;F(el,"bdis").hidden=!a.enabled}
 function renderDash(){const T=S.totals,A=S.accounts,st=S.settings;
@@ -8290,13 +9241,13 @@ let pend={};
 let openGroups=JSON.parse(localStorage.dsb_sgrp||'{}');
 async function renderSettings(){const I=await loadInfo(true);pend={};const lab=s=>L==="fa"?s.fa:s.en;
 const ctl=s=>{const n=esc(s.name);if(s.kind==="bool")return `<label class="sw"><input type="checkbox" data-n="${n}" ${s.value?"checked":""}><i></i></label>`;
-if(s.kind==="choice")return `<select class="inp" data-n="${n}" style="width:100%">${s.choices.map(c=>`<option ${c===s.value?"selected":""}>${c}</option>`).join("")}</select>`;
+if(s.kind==="choice")return `<select class="inp" data-n="${n}" style="width:100%">${s.choices.map(c=>`<option ${c===s.value?"selected":""}>${c}</option>`).join("")}</select>`+(s.name==="permission_mode"&&INFO.run_mode==="claude"?`<div class="tip" style="margin-top:6px">${t("modeHint")}</div><button class="btn sm" data-applymode="1" style="margin-top:6px">⇱ ${t("applyNewWin")}</button>`:"");
 if(s.kind==="str")return `<input class="inp" data-n="${n}" value="${esc(s.value)}">`;return `<input class="inp" type="number" data-n="${n}" value="${s.value}" min="${s.min}" max="${s.max}" step="${s.kind==="int"?1:.1}">`};
 const grp=g=>`<details class="box sgrp" data-g="${g}" ${openGroups[g]!==false?"open":""}><summary><h3>${t("g_"+g)}</h3><span class="dim">${I.settings.filter(s=>s.group===g).length}</span></summary>${I.settings.filter(s=>s.group===g).map(s=>`<div class="srow" data-r="${esc(s.name)}"><div><b>${esc(lab(s))}</b><small>${esc(s.name)} · ${t("w_"+s.when)}</small></div><div class="ctl">${ctl(s)}</div><button class="ib" data-reset="${esc(s.name)}" title="↺">↺</button></div>`).join("")}</details>`;
 const th=localStorage.dsb_theme||"dark",ac=localStorage.dsb_acc||"violet";
 $("#sw").innerHTML=`<div class="box"><h3>🎨 ${t("look")}</h3><div class="tb"><button class="btn ${th==="dark"?"pri":""}" data-th="dark">◐ Dark</button><button class="btn ${th==="light"?"pri":""}" data-th="light">○ Light</button><button class="btn" id="slang">🌐 ${t("lang")}</button>
 <span class="tip">${t("accent")}:</span>${["violet","emerald","amber","sky"].map(c=>`<button class="btn sm ${ac===c?"pri":""}" data-ac="${c}">${c}</button>`).join("")}</div></div>
-${["claude","rel","ctx","browser","swarm","panel"].map(grp).join("")}<div class="box"><h3>＋ ${t("maint")}</h3><div class="tb"><button class="btn" data-m="restart">↻ ${t("restartB")}</button><button class="btn dng" data-m="stop">⏹ ${t("stopB")}</button><button class="btn" data-m="usage">× ${t("resetU")}</button><button class="btn" data-task="selftest">🧪 ${t("selftest")}</button><button class="btn" data-task="verify">[] ${t("verify")}</button></div>
+${["claude","rel","ctx","browser","swarm","panel"].map(grp).join("")}<div class="box"><h3>＋ ${t("maint")}</h3>${I.run_mode==="claude"?`<div class="tip">${t("modeHint")}</div>`:""}<div class="tb">${I.run_mode==="claude"?`<button class="btn pri" data-m="restart_console">↻ ${t("restartCC")}</button>`:`<button class="btn" data-m="restart">↻ ${t("restartB")}</button>`}<button class="btn dng" data-m="stop" ${I.run_mode==="claude"?"disabled":""}>⏹ ${t("stopB")}</button><button class="btn" data-m="usage">× ${t("resetU")}</button><button class="btn" data-task="selftest">🧪 ${t("selftest")}</button><button class="btn" data-task="verify">[] ${t("verify")}</button></div>
 <div class="tip mono"><b>${esc(I.instance_name||"Bridge")}</b><br>home: ${esc(I.instance_home||"")}<br>config: ${esc(I.config||"")}<br>pid: ${esc(I.pid||"")} · port: ${esc(I.port||"")}<br>log: ${esc(I.log||"")}<br>profiles: ${esc(I.profiles||"")}<br><br><b>Running multiple instances</b><br>Each instance owns its home, config, profiles, logs and swarm attachments. Run a copied bridge with a different <code>--instance</code> and <code>--port</code>; never reuse another instance's port.</div></div><div id="savebar" hidden><span id="sbn"></span><button class="btn pri" id="sbsave">${t("saveChg")}</button></div>`}
 function setPend(el){const n=el.dataset.n,s=INFO.settings.find(x=>x.name===n);let v=el.type==="checkbox"?el.checked:el.value;if(s.kind==="int"||s.kind==="float")v=el.value===""?s.value:+el.value;
 if(v===s.value)delete pend[n];else pend[n]=v;el.closest(".srow").classList.toggle("chg",n in pend);const c=Object.keys(pend).length;$("#savebar").hidden=!c;$("#sbn").textContent=c+" "+t("unsaved")}
@@ -8307,7 +9258,8 @@ if(el.dataset.reset){const s=INFO.settings.find(x=>x.name===el.dataset.reset),i=
 else if(el.dataset.th){localStorage.dsb_theme=el.dataset.th;applyTheme();renderSettings()}else if(el.dataset.ac){localStorage.dsb_acc=el.dataset.ac;applyTheme();renderSettings()}else if(el.id==="slang")$("#blang").click();
 else if(el.id==="sbsave"){const r=await act("settings_set",{values:pend});if(r){toast("✓ "+t("saved")+(r.restart.length?"\n"+t("needRestart")+" "+r.restart.join(", "):""));await loadInfo(true);renderSettings()}}
 else if(el.dataset.m==="usage"){if(await ask(t("resetU")+"?")){await act("reset_usage");toast("✓")}}
-else if(el.dataset.m){if(await ask(t(el.dataset.m==="restart"?"restartB":"stopB")+"?")){const r=await act("bridge",{action:el.dataset.m});if(r)toast("…")}}
+else if(el.dataset.applymode){const m=$('[data-n="permission_mode"]').value;const r=await act("apply_mode",{mode:m});if(r)toast("⇱ "+t("applyNewWin")+": "+r.where+(r.mode===r.saved&&r.saved?("\n("+t("modeSame")+")"):""))}
+else if(el.dataset.m){const m=el.dataset.m;const label=m==="restart"?"restartB":m==="restart_console"?"restartCC":"stopB";if(await ask(t(label)+"?")){const payload={action:m};if(m==="restart_console")payload.mode=$('[data-n="permission_mode"]')?$('[data-n="permission_mode"]').value:"";const r=await act("bridge",payload);if(r)toast(m==="restart_console"?("↻ "+t("restartCC")+": "+t("ccResumed")):"…")}}
 else if(el.dataset.task){const r=await act("task",{name:el.dataset.task});if(r){toast(t("started"));go("console")}}});
 /* ---------- command palette ---------- */
 function openPalette(){const both=k=>{const e=K[k]||[k,k];return e[0]+" "+e[1]};const items=[...PAGES.map(p=>({n:"→ "+t("n_"+p),s:"→ "+both("n_"+p),r:()=>go(p)})),{n:"› "+t("nextAcct"),s:"› "+both("nextAcct"),r:()=>act("command",{text:"next"})},{n:"⚖ "+t("balanced"),s:"⚖ "+both("balanced"),r:()=>act("settings",{strategy:"balanced"})},{n:"＋ "+t("newchat"),s:"＋ "+both("newchat"),r:()=>{go("chat");newChat()}},{n:"＋ "+t("add"),s:"＋ "+both("add"),r:addWizard},
@@ -8367,7 +9319,7 @@ async function refineSwarmPrompt(){const improved=$("#sp2").value.trim();const c
 
 async function enterSwarm(){try{await loadInfo(true);S=await api("state")}catch{};if(!$("#sg"))swForm();else if($("#sp")&&$("#sp").dataset.autoProject!=="0")$("#sp").value=INFO&&INFO.project?INFO.project:($("#sp").value||LS.project||"");renderSwarmAccounts();pollSwarm();clearInterval(swTimer);if(!dashStreamReady)swTimer=setInterval(pollSwarm,5000)}
 const sgp=s=>`<span class="stp sg-${s}">${t("sg_"+s)}</span>`;
-async function pollSwarm(){if(page!=="swarm"){clearInterval(swTimer);return}try{swMeta=await api("swarm");$("#scap").textContent=`(${t("capacity")}: ${swMeta.capacity})`;if(!swSel&&swMeta.runs[0])swSel=swMeta.runs[0].id;SW=swSel&&swMeta.runs.find(r=>r.id===swSel)?await api("swarm_run?id="+swSel):null;renderRuns()}catch{}}
+async function pollSwarm(){if(page!=="swarm"){clearInterval(swTimer);return}try{swMeta=await api("swarm");$("#scap").textContent=`(${t("capacity")}: ${swMeta.capacity})`;const sa=$("#sa"),go=$("#sgo");if(sa&&!sa.dataset.touched){const cap=swMeta.capacity||0;sa.value=cap>0?Math.max(1,Math.min(cap,swMeta.max_agents||cap)):"";sa.placeholder=cap>0?String(Math.max(1,Math.min(cap,swMeta.max_agents||cap))):t("swNoAcct")}if(go){const cap=swMeta.capacity||0;go.disabled=cap<=0;go.title=cap<=0?t("swNoAcct"):""}if(!swSel&&swMeta.runs[0])swSel=swMeta.runs[0].id;SW=swSel&&swMeta.runs.find(r=>r.id===swSel)?await api("swarm_run?id="+swSel):null;renderRuns()}catch{}}
 function renderRuns(){const R=SW,box=$("#swr");let h=`<div class="runs">${swMeta.runs.map(r=>`<div class="rn ${r.id===swSel?"on":""}" data-r="${r.id}">${sgp(r.status)} <b>${esc(r.id)}</b> <span class="tip">${esc(r.goal.slice(0,34))}</span></div>`).join("")||`<div class="tip">${t("swNone")}</div>`}</div>`;
 if(R){if(swPrev[R.id]&&swPrev[R.id]!==R.status&&/^done/.test(R.status)){beep();toast("* "+R.id+": "+t("sg_"+R.status))}swPrev[R.id]=R.status;const live=["planning","running","verifying"].includes(R.status),fin=/^done/.test(R.status);
 h+=`<div class="box"><div class="ch"><b>${esc(R.id)}</b>${sgp(R.status)}<span class="tip">${esc(R.project)} · ${esc(R.base_branch)}</span></div><div style="margin:6px 0">${esc(R.goal)}</div>${R.plan?`<div class="tip">≡ ${esc(R.plan)}</div>`:""}
@@ -9421,6 +10373,22 @@ def _selftest_startup_menu() -> None:
 
 
 def self_test() -> None:
+    # Hermetic: the suite must not depend on the invoking shell. ANTHROPIC_BASE_URL / _API_KEY
+    # leak into claude_env()'s env-diff and silently change the launcher preview, so neutralise
+    # them (and restore afterwards) before any test runs.
+    _saved_env = {k: os.environ.pop(k, None) for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY",
+                                                       "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL")}
+    try:
+        _self_test_inner()
+    finally:
+        for _k, _v in _saved_env.items():
+            if _v is not None:
+                os.environ[_k] = _v
+            else:
+                os.environ.pop(_k, None)
+
+
+def _self_test_inner() -> None:
     _selftest_master_hardening()
     _selftest_startup_menu()
     # 1. Original failure: malformed <tool_call> JSON + DSML residue.
@@ -9932,6 +10900,13 @@ def _selftest_multi() -> None:
     assert site_notice_kind("Sure, I will try again later.") is None
     assert site_notice_kind("word " * 100 + " server is busy") is None
     assert site_notice_kind("This conversation has reached its length limit.") == "chat_full"
+    # A DeepSeek hint blob must classify as rate_limit AND display as the human sentence, not JSON.
+    _hint = ('hint: {"type":"error","content":"Messages too frequent.","clear_response":true,'
+             '"finish_reason":"rate_limit_reached"}')
+    assert classify_error(_hint) == "rate_limit"
+    assert humanize_site_error(_hint) == "Messages too frequent."
+    assert humanize_site_error("plain upstream boom") == "plain upstream boom"
+    assert len(humanize_site_error("x" * 400)) == 160
     assert fmt_tok(1234) == "1.2k" and fmt_dur(3725) == "1h 02m"
 
     # ---- /ds command extraction (only the LAST plain user message counts)
@@ -10169,6 +11144,12 @@ def _selftest_multi() -> None:
         res = pool.dispatch(R, None, None, lambda: False).result(timeout=5)
         assert res.text == "from B" and A.cooldown_until > time.time() and A.rl_streak == 1
         assert any("moved from 'A' to 'B'" in e["msg"] for e in pool.events), list(pool.events)
+        # a rate-limited account is excluded now, but recovers once its cooldown expires
+        assert not A.usable() and A.state(time.time()) == "cooldown"
+        A.cooldown_until, A.cool_notified = time.time() - 1, False
+        pool._reap_expired_cooldowns(time.time())
+        assert A.usable() and A.state(time.time()) == "ready" and A.rl_streak == 0
+        assert any("available again" in e["msg"] for e in pool.events), list(pool.events)
         # once text reached the client there is no silent switch
         A.cooldown_until = 0
         try:
@@ -10192,6 +11173,14 @@ def _selftest_multi() -> None:
         A.worker.engine.behave = lambda: (_ for _ in ()).throw(BridgeError("login expired", "login"))
         assert pool.dispatch(R, None, None, lambda: False).result(timeout=5).text == "from B"
         assert A.status == "login_needed" and not A.usable()
+        # a stale failure must not stick to a card after the account works again
+        A.set_status("error", "boom: rate limited")
+        assert A.status_err == "boom: rate limited"
+        A.set_status("ready")                      # recovery clears the message
+        assert A.status_err == ""
+        A.set_status("error", "boom again")
+        pool._succeeded(A)                         # success while still 'error' must NOT resurrect it
+        assert A.status == "error" and A.fail_streak == 0
         A.set_status("ready")
 
         # commands
@@ -10249,6 +11238,46 @@ def _selftest_multi() -> None:
         assert extra.id not in {d["id"] for d in saved.get("accounts", [])}
         usage = json.loads(usage_path.read_text(encoding="utf-8"))
         assert extra.id not in usage.get("accounts", {}) and usage.get("accounts", {}).get("a", {}).get("req") == 2
+
+        # ---- usage persistence race: a counter update that happens during atomic replace
+        # must stay dirty and be written by the next flush, not silently disappear.
+        race_stats = Account({"id": "usage-race", "name": "Usage Race", "enabled": True,
+                              "profile": str(Path(td) / "usage-race")})
+        race_stats.stats.record_tokens(10, 20, 0.01)
+        pool.accounts.append(race_stats)
+        real_replace_usage = os.replace
+        def _replace_usage_race(src, dst):
+            real_replace_usage(src, dst)
+            if Path(dst) == usage_path:
+                race_stats.stats.record_tokens(1, 2, 0.01)
+        os.replace = _replace_usage_race
+        try:
+            pool.save_usage()
+        finally:
+            os.replace = real_replace_usage
+        assert race_stats.stats.dirty, "a concurrent usage update was incorrectly marked persisted"
+        pool.save_usage()
+        assert not race_stats.stats.dirty, "usage remained dirty after the follow-up flush"
+        pool.accounts.remove(race_stats)
+
+        # ---- profile cleanup safety: never remove an instance root itself; legacy profile roots
+        # are cleared in-place so browser data disappears without destroying the root directory.
+        old_accounts_root, old_profile_root = _state().ACCOUNTS_DIR, _state().PROFILE_DIR
+        try:
+            _state().ACCOUNTS_DIR = Path(td) / "accounts-root"
+            _state().PROFILE_DIR = Path(td) / "legacy-profile-root"
+            _state().ACCOUNTS_DIR.mkdir(parents=True)
+            _state().PROFILE_DIR.mkdir(parents=True)
+            root_marker = _state().ACCOUNTS_DIR / "must-survive.txt"
+            root_marker.write_text("keep", encoding="utf-8")
+            Pool._remove_account_profile_path(_state().ACCOUNTS_DIR)
+            assert root_marker.exists() and _state().ACCOUNTS_DIR.exists(), "account root was deleted"
+            legacy_marker = _state().PROFILE_DIR / "must-clear.txt"
+            legacy_marker.write_text("clear", encoding="utf-8")
+            Pool._remove_account_profile_path(_state().PROFILE_DIR)
+            assert not legacy_marker.exists() and _state().PROFILE_DIR.exists(), "legacy profile root was destroyed incorrectly"
+        finally:
+            _state().ACCOUNTS_DIR, _state().PROFILE_DIR = old_accounts_root, old_profile_root
 
         # ---- dashboard over real HTTP (auth, host / origin guard, actions, /ds interception)
         old_b, old_k = _state().BRIDGE, _state().API_KEY
@@ -10372,6 +11401,145 @@ def _selftest_multi() -> None:
         finally:
             _state().CONFIG_PATH = old_cfg
             DeepSeekWeb = real_web                           # type: ignore[misc,assignment]
+    # Startup regression: a transient web-worker error must be recoverable instead of
+    # making main() immediately stop the pool and close the browser/login session.
+    recovery = Account({"id": "startup-recovery", "name": "Startup Recovery", "enabled": True,
+                        "kind": "web", "provider": "deepseek_web"})
+    recovery.set_status("error", "synthetic Playwright startup failure")
+    recovery.worker = types.SimpleNamespace(ok=False, stopping=False, stop=lambda: None)
+    recovery_pool = Pool({"port": 0, "api_key": "k", "hook_key": "h", "accounts": [], "routing": {}},
+                          autostart=False)
+    recovery_pool.accounts = [recovery]
+    recovery_calls: List[str] = []
+    original_restart = recovery_pool.restart_account
+    def _test_recovery_restart(a: Account, force_login: bool = False) -> None:
+        del force_login
+        recovery_calls.append(a.id)
+        a.worker = types.SimpleNamespace(ok=True, stopping=False, stop=lambda: None)
+        a.set_status("ready")
+    recovery_pool.restart_account = _test_recovery_restart  # type: ignore[method-assign]
+    try:
+        assert recovery_pool.wait_selected_ready([recovery.id], 3.0) is True
+        assert recovery_calls == [recovery.id], recovery_calls
+    finally:
+        recovery_pool.restart_account = original_restart  # type: ignore[method-assign]
+        recovery_pool.stop()
+
+    # 5b. Startup/shutdown race: an old browser worker that ignores stop() must never be
+    # overlapped by a second persistent-context worker using the same profile.
+    race = Account({"id": "restart-race", "name": "Restart Race", "enabled": True,
+                    "kind": "web", "provider": "deepseek_web"})
+    class _StuckWorker:
+        ok = False
+        def stop(self):
+            return None
+        def alive(self):
+            return True
+    race.worker = _StuckWorker()
+    race_pool = Pool({"port": 0, "api_key": "k", "hook_key": "h", "accounts": [], "routing": {}}, autostart=False)
+    race_pool.accounts = [race]
+    try:
+        race_pool.restart_account(race)
+        time.sleep(0.35)
+        assert race.status == "error" and "did not stop cleanly" in race.status_err, race.status_err
+        race_pool._stop.set()
+        previous_worker = race.worker
+        previous_status = race.status
+        race_pool.restart_account(race)
+        time.sleep(0.25)
+        assert race.worker is previous_worker and race.status == previous_status, "restart raced with pool shutdown"
+    finally:
+        race_pool._stop.set()
+
+    # 5c. Planner dependency graphs: cycles must fail during parsing, not deadlock the scheduler.
+    try:
+        parse_plan(json.dumps({"tasks": [
+            {"id": "a", "prompt": "A", "depends_on": ["b"]},
+            {"id": "b", "prompt": "B", "depends_on": ["a"]}
+        ]}))
+        raise AssertionError("dependency cycle was accepted")
+    except ValueError as exc:
+        assert "dependency cycle" in str(exc), exc
+    linear = parse_plan(json.dumps({"tasks": [
+        {"id": "a", "prompt": "A"},
+        {"id": "b", "prompt": "B", "depends_on": ["a", "a", "missing"]}
+    ]}))
+    assert linear["tasks"][1]["deps"] == ["a"], linear
+
+    # 5d. Environment hardening: invalid booleans fall back; unsafe numeric values clamp
+    # before they reach token accounting or tight polling loops.
+    _env_test_keys = {"DS_BRIDGE_CHARS_PER_TOKEN": "0", "DS_BRIDGE_POLL_SECONDS": "0",
+                      "DS_BRIDGE_MAX_RETRIES": "-9", "DS_BRIDGE_THINK_MODE": "not-a-bool"}
+    _env_saved = {k: os.environ.get(k) for k in _env_test_keys}
+    try:
+        os.environ.update(_env_test_keys)
+        with tempfile.TemporaryDirectory(prefix="dsb_env_") as _env_td:
+            rst = make_runtime_state(Path(_env_td), "env-test", {})
+            assert rst.CHARS_PER_TOKEN >= 1.0 and rst.POLL_SECONDS >= 0.02 and rst.MAX_RETRIES == 0 and rst.THINK_MODE is False
+    finally:
+        for _k, _v in _env_saved.items():
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+
+    # 5e. Account-profile deletion is retried because Chromium/Windows can release a
+    # profile file handle a fraction later than the Playwright context close returns.
+    # Keep this test entirely inside a temporary root: --self-test must be hermetic.
+    old_accounts_dir = _state().ACCOUNTS_DIR
+    with tempfile.TemporaryDirectory(prefix="dsb_profile_retry_") as _retry_td:
+        _state().ACCOUNTS_DIR = Path(_retry_td)
+        retry_root = _state().ACCOUNTS_DIR
+        retry_root.mkdir(parents=True, exist_ok=True)
+        retry_profile = retry_root / f".test-retry-profile-{secrets.token_hex(3)}"
+        retry_profile.mkdir()
+        (retry_profile / "marker.txt").write_text("x", encoding="utf-8")
+        real_rmtree = shutil.rmtree
+        rmtree_calls = {"n": 0}
+        def _flaky_rmtree(path, ignore_errors=False):
+            rmtree_calls["n"] += 1
+            if rmtree_calls["n"] < 3:
+                raise PermissionError("synthetic transient file lock")
+            return real_rmtree(path, ignore_errors=ignore_errors)
+        shutil.rmtree = _flaky_rmtree
+        try:
+            Pool._remove_account_profile_path(retry_profile)
+            assert not retry_profile.exists() and rmtree_calls["n"] == 3
+        finally:
+            shutil.rmtree = real_rmtree
+            real_rmtree(retry_profile, ignore_errors=True)
+    _state().ACCOUNTS_DIR = old_accounts_dir
+
+    # 5f. Upstream response limits: reject oversized bodies even when Content-Length is absent.
+    class _OversizedResponse:
+        status = 200
+        def __init__(self):
+            self.headers = {}
+            self.remaining = _state().MAX_HTTP_BODY_BYTES + 1
+        def read(self, n=-1):
+            if self.remaining <= 0:
+                return b""
+            chunk = self.remaining if n < 0 else min(n, self.remaining)
+            self.remaining -= chunk
+            return b"x" * chunk
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+    original_opener = globals().get("_opener_for")
+    class _FakeOpener:
+        def open(self, *args, **kwargs): return _OversizedResponse()
+    globals()["_opener_for"] = lambda _url: _FakeOpener()
+    try:
+        try:
+            http_json("GET", "http://127.0.0.1/test", {}, None, 1.0)
+            raise AssertionError("oversized provider response was accepted")
+        except BridgeError as exc:
+            assert exc.kind == "upstream" and "too large" in str(exc), exc
+    finally:
+        globals()["_opener_for"] = original_opener
+
+    print("  [ok] startup/restart lifecycle race protection")
+    print("  [ok] swarm dependency-cycle detection + deterministic dependency cleanup")
+    print("  [ok] environment bounds + bounded upstream HTTP response handling")
     print("  [ok] multi-account: routing, cooldown, fail-over, /ds commands, dashboard API")
 
 
@@ -10394,7 +11562,7 @@ def _selftest_v61() -> None:
     d = tempfile.mkdtemp()
     paths = write_attachments(found, d)
     assert [os.path.basename(p) for p in paths] == ["image-1.png", "image-2.png", "r e p.pdf"], paths
-    assert open(paths[0], "rb").read() == PNG
+    assert Path(paths[0]).read_bytes() == PNG
     cleanup_dir(d)
     assert not os.path.exists(d)
     assert write_attachments([("image", "", "image/png", "!!notbase64!!")], tempfile.mkdtemp()) == []
@@ -10417,7 +11585,7 @@ def _selftest_v61() -> None:
         def session_of(self, p): return None
 
         def exchange(self, page, prompt, cancel=None, on_partial=None, files=None):
-            self.calls.append((prompt, list(files or []), [open(f, "rb").read() for f in (files or [])]))
+            self.calls.append((prompt, list(files or []), [Path(f).read_bytes() for f in (files or [])]))
             return Exchange(text="ok", session_id=None, seconds=0.0)
     cds = _CapDS()
     eng = Engine(cds, None, None)
@@ -10560,6 +11728,29 @@ def _selftest_v61() -> None:
             pool.accounts[0].stats.record_exchange(4000, 400, 1)
             assert call("POST", "/dash/api/reset_usage", {})[0] == 200 and pool.accounts[0].stats.in_tok == 0
             assert call("POST", "/dash/api/bridge", {"action": "stop"})[0] == 400       # inside Claude Code: refused, not killed
+            assert call("POST", "/dash/api/bridge", {"action": "restart"})[0] == 200    # embedded restart is allowed (session survives)
+            s, d = call("POST", "/dash/api/apply_mode", {"mode": "auto", "project": td, "dry": True})
+            j = json.loads(d)
+            assert s == 200 and j["mode"] == "auto" and pool.cfg["permission_mode"] == "auto"  # persists + reports the new window
+            assert call("POST", "/dash/api/apply_mode", {"mode": "bogus"})[0] == 400    # unknown mode rejected before any launch
+            assert call("POST", "/dash/api/bridge", {"action": "bogus"})[0] == 400      # unknown action still rejected
+            # restart_console: refused with no live console, accepted (and flags a respawn) with one
+            assert call("POST", "/dash/api/bridge", {"action": "restart_console", "mode": "auto"})[0] == 400
+            class _FakeProc:
+                def poll(self): return None
+                def terminate(self): pass
+                def wait(self, timeout=None): return 0
+                def kill(self): pass
+            _state().CONSOLE_PROC = _FakeProc()
+            _state().CONSOLE_SESSION = "sid-123"
+            s, d = call("POST", "/dash/api/bridge", {"action": "restart_console", "mode": "auto"})
+            j = json.loads(d)
+            assert s == 200 and j["mode"] == "auto" and j["resume"] is True and j["session"] == "sid-123"
+            assert _state().CONSOLE_RESTART_MODE == "auto"
+            assert _state().CONSOLE_STATE == "restarting"   # set under the lock, closes double-click
+            assert call("POST", "/dash/api/bridge", {"action": "restart_console", "mode": "auto"})[0] == 400  # already restarting
+            _state().CONSOLE_PROC, _state().CONSOLE_RESTART_MODE, _state().CONSOLE_SESSION = None, None, None
+            _state().CONSOLE_STATE = "idle"
             assert call("POST", "/dash/api/task", {"name": "rm -rf"})[0] == 400
             assert pool.run_command("key").startswith("The API key is not shown") and pool.run_command("key", secret=True) == "k"
             assert "usage" in pool.run_command("help") and pool.run_command("usage-reset").startswith("Usage")
@@ -10758,7 +11949,7 @@ def _selftest_api() -> None:
         added = pool.run_command("add-api grok sk-secret grok-4", secret=True)
         assert added.startswith("Added") and any(x.api_key == "sk-secret" and x.provider == "grok" and x.tier == 5 for x in pool.accounts)
         pool.stop()
-    up.shutdown()
+    stop_server(up)
     _state().CONFIG_PATH, _state().ACCOUNT_WAIT_SECONDS = old_cfg, old_wait
     print("  [ok] v6.2: API accounts (OpenAI + Anthropic wire formats), tool calls, tiers, budget, parallel, secrets")
 
@@ -10785,7 +11976,7 @@ if "has CONFLICTS" in prompt:
     for f in re.findall(r"^- (.+)$", prompt.split("CONFLICTED FILES:")[1], re.M):
         t = re.sub(r"^(<<<<<<<|=======|>>>>>>>).*\\n", "", open(f.strip()).read(), flags=re.M)
         write(f.strip(), t.rstrip("\\n"))
-elif "You are the reviewer" in prompt:
+elif "reviewing developer" in prompt.lower():
     write("reviewed-" + base.rsplit("/", 1)[-1].split(".")[-1] + ".txt", "reviewed")
 else:
     pat = "FIX" if "Verification command" in prompt else "WRITE"
@@ -10801,14 +11992,13 @@ def _selftest_swarm() -> None:
     """V6.2: activity feed, /panel + /swarm commands, quality plan parsing, and the parallel swarm itself."""
     import http.client
     import types
-
     # ---- pure helpers
     assert in_scope("api/x/y.py", ["api/**"]) and in_scope("api.py", ["api.py"]) and in_scope("a/b.txt", ["a/"])
     assert not in_scope("ui/x.py", ["api/**", "tests/test_api.py"]) and in_scope("anything", [])
     assert in_scope("src/a/b.js", ["src/**/*.js"]) and not in_scope("src/a/b.ts", ["src/**/*.js"])
-    plan = parse_plan('Sure!\n```json\n{"summary":"s","contracts":"c","tasks":[{"id":"a b","title":"T","prompt":"p","files":["x/**"],"depends_on":["zzz","a1"]},'
+    plan = parse_plan('Sure!\n```json\n{"summary":"s","contracts":"c","tasks":[{"id":"a b","title":"T","prompt":"p","files":["x/**"],"acceptance_criteria":["x exists"],"depends_on":["zzz","a1"]},'
                       '{"id":"a1","prompt":"q"},{"id":"a1","prompt":"dup"},{"title":"empty prompt"}]}\n```')
-    assert [t["id"] for t in plan["tasks"]] == ["ab", "a1", "a1-3"] and plan["tasks"][0]["deps"] == ["a1"]
+    assert [t["id"] for t in plan["tasks"]] == ["ab", "a1", "a1-3"] and plan["tasks"][0]["deps"] == ["a1"] and plan["tasks"][0]["acceptance"] == ["x exists"]
     for bad in ("no json here", '{"tasks": []}', "{broken"):
         try:
             parse_plan(bad)
@@ -10820,6 +12010,22 @@ def _selftest_swarm() -> None:
         assert detect_verify(d0) == ""
         (Path(d0) / "package.json").write_text('{"scripts":{"test":"jest"}}')
         assert detect_verify(d0) == "npm test --silent"
+        assert detect_quality_checks(d0) == [("npm run test --silent", "npm:test")]
+    assert _patterns_overlap("src/**", "src/api/x.py") and not _patterns_overlap("src/api/**", "src/ui/**")
+    try:
+        validate_plan_ownership([{"id": "a", "files": ["src/**"]}, {"id": "b", "files": ["src/api/**"]}])
+        raise AssertionError("overlapping ownership must be rejected")
+    except ValueError:
+        pass
+    with tempfile.TemporaryDirectory() as qd:
+        qroot = Path(qd)
+        (qroot / "x.py").write_text("print('ok')\n")
+        git(["init", "-q", "-b", "main"], qroot)
+        git(["add", "-A"], qroot)
+        git(["-c", "user.email=v@v", "-c", "user.name=v", "commit", "-qm", "init"], qroot)
+        (qroot / "x.py").write_text("print('ok')\n")
+        rep = run_quality_gate(qroot, base="HEAD", level="strict")
+        assert rep["ok"] and not list(qroot.rglob("__pycache__")), rep
     assert fmt_tok(0) == "0"
     mk = lambda msgs, **kw: normalize_anthropic({"model": "claude-sonnet-4", "max_tokens": 50, "messages": msgs, **kw})
     r = mk([{"role": "user", "content": "go"}, {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls -la"}}]},
@@ -10828,12 +12034,16 @@ def _selftest_swarm() -> None:
     assert summarize_last(r) == "↩ Bash: a.txt b.txt" and claude_cwd(r) == tempfile.gettempdir()
     assert _brief_call({"name": "Bash", "arguments": {"description": "d", "command": "git  status"}}) == "Bash: git status"
 
-    if os.name == "nt" or not shutil.which("git"):
+    # The fake `claude` is a `#!`-script, so it needs a POSIX shell to exec. Windows has
+    # one whenever Git for Windows is installed (sh.exe next to git), so gate on the
+    # toolchain actually being present rather than on os.name.
+    shell = shutil.which("sh") or shutil.which("bash")
+    if not shutil.which("git") or not shell:
         print("  [skip] swarm integration test (needs git and a POSIX shell)")
         return
 
     # ---- environment: a git project, a fake `claude` on PATH, a pool whose model returns a plan for the planner
-    old_cfg, old_b, old_k, old_path, old_fix = _state().CONFIG_PATH, _state().BRIDGE, _state().API_KEY, os.environ.get("PATH", ""), _state().SWARM_FIX_ROUNDS
+    old_cfg, old_b, old_k, old_path, old_fix, old_quality, old_dirty = _state().CONFIG_PATH, _state().BRIDGE, _state().API_KEY, os.environ.get("PATH", ""), _state().SWARM_FIX_ROUNDS, _state().SWARM_QUALITY, _state().SWARM_DIRTY_POLICY
     real_open = globals()["open_dashboard"]
     opened: List[Any] = []
     globals()["open_dashboard"] = lambda url, key, page="": opened.append(page)
@@ -10874,6 +12084,24 @@ def _selftest_swarm() -> None:
         pool.accounts[0].set_status("ready")
         pool.accounts[0].worker = _FW()
         _state().BRIDGE, _state().API_KEY = pool, "k"
+        # Repository guard regressions: dirty trees are blocked by default; secrets are never committed.
+        secret_probe = SwarmAgent("sec", "secret", "", ["secret.txt"], [])
+        (proj / "secret.txt").write_text("OPENAI_KEY=sk-abcdefghijklmnopqrstuvwxyz123456\n", encoding="utf-8")
+        try:
+            pool.swarm._prepare_commit(secret_probe, proj, strict=True)
+            raise AssertionError("secret gate must reject high-confidence credentials")
+        except ValueError as exc:
+            assert "secret-like" in str(exc)
+        assert not (proj / "secret.txt").exists() and git(["status", "--porcelain"], proj, check=False).stdout.strip() == ""
+        (proj / "README.md").write_text("user change\n", encoding="utf-8")
+        try:
+            try:
+                pool.swarm.start("must be blocked", str(proj), agents=1, verify="off", review="off")
+                raise AssertionError("dirty repository must be blocked")
+            except ValueError as exc:
+                assert "uncommitted changes" in str(exc)
+        finally:
+            git(["checkout", "--", "README.md"], proj, check=False)
         server = start_server(0)
         pool.cfg["port"] = server.server_address[1]
         port = pool.cfg["port"]
@@ -10921,7 +12149,6 @@ def _selftest_swarm() -> None:
             s, d = call("GET", "/dash/api/swarm")
             sj = json.loads(d)
             assert s == 200 and sj["git"] and sj["claude"] and sj["capacity"] >= 1
-
             # ---- run 1: parallel agents, a dependency, concurrency cap, live resize, live feed labels, apply + cleanup
             plans["next"] = {"summary": "three parts", "contracts": "A is 1, B is 2", "tasks": [
                 {"id": "a1", "title": "API", "prompt": "WRITE api/a.py :: A = 1", "files": ["api/**"], "depends_on": []},
@@ -10955,7 +12182,8 @@ def _selftest_swarm() -> None:
             assert not (proj / SWARM_DIR_NAME / run.id).exists() and "swarm/" not in git(["branch"], proj).stdout.replace("swarm/" + run.id + "/merged", "")
             assert git(["status", "--porcelain"], proj).stdout.strip() == ""
 
-            # ---- run 2: failing check -> automatic fix round, scope violation, merge conflict resolved automatically, reviewer role
+            # ---- run 2: standard quality intentionally permits an out-of-scope change so conflict handling can be tested.
+            _state().SWARM_QUALITY = "standard"
             plans["next"] = {"summary": "quality", "contracts": "", "tasks": [
                 {"id": "b1", "title": "calc", "prompt": "WRITE calc.py :: def add(a, b): return a - b\nFIX calc.py :: def add(a, b): return a + b", "files": ["calc.py"]},
                 {"id": "b2", "title": "notes", "prompt": "WRITE shared.txt :: B2 version\nWRITE notes/n.txt :: n", "files": ["notes/**"]},
@@ -10980,18 +12208,70 @@ def _selftest_swarm() -> None:
                 {"id": "c1", "title": "crash", "prompt": "FAILHARD", "files": ["c1/**"]},
                 {"id": "c2", "title": "needs c1", "prompt": "WRITE c2/x.txt :: x", "files": ["c2/**"], "depends_on": ["c1"]},
                 {"id": "c3", "title": "strict", "prompt": "WRITE x/ok.txt :: ok\nWRITE y/bad.txt :: bad", "files": ["x/**"]}]}
+            _state().SWARM_QUALITY = "strict"
             out = pool.run_command("swarm strict mixed run", ctx={"cwd": str(proj)})
             assert "started on" in out and opened[-1] == "swarm"
             run = pool.swarm.latest()
-            run.opts["strict"] = True
             wait(run, ("done_with_issues", "done"))
-            assert (run.get("c1").status, run.get("c2").status, run.get("c3").status) == ("failed", "skipped", "merged"), [(a.id, a.status, a.note) for a in run.agents]
+            assert (run.get("c1").status, run.get("c2").status, run.get("c3").status) == ("failed", "skipped", "failed"), [(a.id, a.status, a.note) for a in run.agents]
             tree = git(["ls-tree", "-r", "--name-only", run.merged_branch], proj).stdout.split()
-            assert "x/ok.txt" in tree and "y/bad.txt" not in tree and run.status == "done_with_issues" and "c1 failed" in run.summary
+            assert "x/ok.txt" not in tree and "y/bad.txt" not in tree and run.status == "done_with_issues" and "c1 failed" in run.summary
             assert "run" in pool.run_command("swarm status") or run.id in pool.run_command("swarm status")
             pool.swarm.cleanup(run)
+            # ---- run 3b: a wedged worker must be reaped so a stopped run releases its account.
+            # A dead agent thread (or a page left in WAITING_RESPONSE) used to leave the account
+            # 'busy' forever and block the run at running:N. The watchdog must recover it.
+            wedged = Account({"id": "w", "name": "W", "logged_in": True, "profile": td + "/w"})
+            wedged.enabled, wedged.logged_in = True, True
+            class _WedgeWorker:
+                def __init__(self):
+                    self.ok, self.stopping, self._alive = True, False, True
+                def alive(self):
+                    return self._alive
+                def stop(self):
+                    self.stopping = True
+                    self._alive = False
+            wedged.worker = _WedgeWorker()
+            wedged.set_status("busy", "waiting response")
+            wedged.req_started_at = time.time() - max(601.0, float(_state().STALL_TIMEOUT) * 6 + 1.0)
+            pool.accounts.append(wedged)
+            real_start = pool.start_account
+            pool.start_account = lambda a, force_login=False: a.set_status("starting")
+            try:
+                pool._reap_wedged_workers(time.time())
+                deadline = time.time() + 3.0
+                while time.time() < deadline and wedged.status != "starting":
+                    time.sleep(0.02)
+            finally:
+                pool.start_account = real_start
+            assert wedged.status == "starting", wedged.status   # restart_account was called on it
+            pool.accounts.remove(wedged)
+            # a finished/aborted agent must not block the run forever
+            plans["next"] = {"summary": "stuck agent", "contracts": "", "tasks": [
+                {"id": "d1", "title": "stuck", "prompt": "SLEEP 20\nWRITE d.txt :: d", "files": ["d.txt"]}]}
+            run = pool.swarm.start("stuck agent run", str(proj), agents=1, verify="off", review="off", mode="ask")
+            end = time.time() + 30
+            while time.time() < end and not any(a.status == "running" for a in run.agents):
+                time.sleep(0.1)
+            assert run.agents[0].status == "running"
+            run.agents[0].proc.kill()                    # simulate a dead agent thread
+            wait(run, ("done", "done_with_issues"))      # must NOT hang at running:1
+            assert run.agents[0].status == "failed", run.agents[0].status
+            pool.swarm.cleanup(run)
 
+            # ---- audit mode: an independent reviewer is mandatory and its evidence is persisted.
+            _state().SWARM_QUALITY = "audit"
+            plans["next"] = {"summary": "audit", "contracts": "", "tasks": [
+                {"id": "e1", "title": "audit target", "prompt": "WRITE audit.txt :: audited", "files": ["audit.txt"],
+                 "acceptance_criteria": ["audit.txt exists with audited content"]}]}
+            run = pool.swarm.start("independently audit a tiny change", str(proj), agents=1, verify="off", review="off", mode="ask")
+            wait(run, ("done", "done_with_issues"))
+            assert run.quality == "audit" and "audit" in run.quality_report and run.quality_report["audit"].get("skipped") is not True
+            assert run.final_verify.get("ok") is True and run.status == "done", (run.status, run.final_verify, run.quality_report)
+            assert show(run.merged_branch, "audit.txt").returncode == 0
+            pool.swarm.cleanup(run)
             # ---- run 4: unusable planner output -> one agent does everything; stop kills the process
+            _state().SWARM_QUALITY = "strict"
             plans["next"] = None
             run = pool.swarm.start("SLEEP 30\nWRITE slow.txt :: s", str(proj), agents="auto", verify="off", review="off", mode="ask")
             end = time.time() + 30
@@ -11021,7 +12301,7 @@ def _selftest_swarm() -> None:
             stop_server(server)
             globals()["open_dashboard"] = real_open
             os.environ["PATH"] = old_path
-            _state().CONFIG_PATH, _state().BRIDGE, _state().API_KEY, _state().SWARM_FIX_ROUNDS = old_cfg, old_b, old_k, old_fix
+            _state().CONFIG_PATH, _state().BRIDGE, _state().API_KEY, _state().SWARM_FIX_ROUNDS, _state().SWARM_QUALITY, _state().SWARM_DIRTY_POLICY = old_cfg, old_b, old_k, old_fix, old_quality, old_dirty
     print("  [ok] v6.2: live feed, /panel + /swarm, parallel git-worktree swarm (deps, cap, verify-fix, conflicts, strict scope, stop, apply)")
 
 
@@ -11252,6 +12532,11 @@ def _sanitize_claude_hook_event(data: Dict[str, Any]) -> Dict[str, Any]:
 def ingest_claude_hook(pool: Any, data: Dict[str, Any]) -> Dict[str, Any]:
     payload = _sanitize_claude_hook_event(data)
     payload["project"] = str((data.get("cwd") or pool.cfg.get("project_dir") or SCRIPT_DIR))
+    sid = payload.get("session_id")
+    if sid:
+        state = _state()
+        with state.CONSOLE_LOCK:
+            state.CONSOLE_SESSION = str(sid)
     emit_dash_event("claude", payload)
     return {"ok": True}
 
@@ -11294,7 +12579,8 @@ prog = os.path.join(cwd, "PROGRESS.md")
 if not os.path.isfile(prog):
     sys.exit(0)
 try:
-    head = open(prog, encoding="utf-8", errors="replace").read()[:3000]
+    with open(prog, encoding="utf-8", errors="replace") as f:
+        head = f.read(3000)
 except Exception:
     sys.exit(0)
 if MARK in head:
@@ -11302,12 +12588,14 @@ if MARK in head:
 sid = "".join(ch for ch in str(d.get("session_id") or "x") if ch.isalnum() or ch in "-_")[:60]
 cf = os.path.join(tempfile.gettempdir(), "ds_bridge_keepgoing_" + sid + ".count")
 try:
-    n = int(open(cf).read().strip())
+    with open(cf, encoding="utf-8") as f:
+        n = int(f.read().strip())
 except Exception:
     n = 0
 n += 1
 try:
-    open(cf, "w").write(str(n))
+    with open(cf, "w", encoding="utf-8") as f:
+        f.write(str(n))
 except Exception:
     pass
 if n > LIMIT:
@@ -11410,20 +12698,69 @@ def claude_env(cfg: Dict[str, Any], url: str) -> Dict[str, str]:
     return env
 
 
+def _claude_cmd(cfg: Dict[str, Any], project: Path, extra: List[str], mode: str,
+                resume: Optional[str] = None) -> List[str]:
+    exe = shutil.which("claude") or "claude"
+    cmd = [exe, *permission_args(mode, extra)]
+    if resume:
+        cmd += ["--resume", resume]
+    cmd += extra
+    return cmd
+
+
 def launch_claude(cfg: Dict[str, Any], url: str, project: Path, extra: List[str],
                   mode: str = DEFAULT_MODE) -> int:
-    exe = shutil.which("claude")
-    if not exe:
+    """Run Claude Code under supervision so the bridge outlives the console.
+
+    The child's exit no longer ends the bridge: a `restart_console` request makes this loop
+    reap the current child and respawn it with the requested mode, resuming the same session.
+    """
+    if not shutil.which("claude"):
         print(C.red("[error] 'claude' was not found in PATH."))
         print("Install it with:  npm install -g @anthropic-ai/claude-code")
         return 127
+    if getattr(_state(), "ENGINEERING_GUARD", True) and ENGINEERING_EXECUTION_PROTOCOL not in "\n".join(extra):
+        extra = [f"Before making coding changes, follow this engineering protocol exactly:\n{ENGINEERING_EXECUTION_PROTOCOL}"] + list(extra)
     install_claude_commands(getattr(_state(), "CLAUDE_COMMANDS_DIR", None), getattr(_state(), "FORCE_CLAUDE_COMMANDS", False))
-    cmd = [exe, *permission_args(mode, extra), *extra]
+    state = _state()
     old = signal.signal(signal.SIGINT, signal.SIG_IGN)   # Ctrl+C belongs to Claude Code
     try:
-        return subprocess.call(cmd, cwd=str(project), env=claude_env(cfg, url))
+        cur_mode, resume = mode, None
+        while True:
+            cmd = _claude_cmd(cfg, project, extra, cur_mode, resume)
+            with state.CONSOLE_LOCK:
+                state.CONSOLE_STATE = "running"
+            proc = subprocess.Popen(cmd, cwd=str(project), env=claude_env(cfg, url))
+            with state.CONSOLE_LOCK:
+                state.CONSOLE_PROC = proc
+            try:
+                code = proc.wait()
+            finally:
+                # Read the restart flag *before* clearing CONSOLE_PROC: otherwise a restart
+                # arriving in this window sees proc is None and refuses to respawn.
+                with state.CONSOLE_LOCK:
+                    pending = state.CONSOLE_RESTART_MODE
+                    state.CONSOLE_PROC = None
+                    if pending is None:
+                        state.CONSOLE_STATE = "idle"   # console exited; do not claim it is running
+                    else:
+                        state.CONSOLE_RESTART_MODE = None
+                        state.CONSOLE_STATE = "restarting"
+                        resume = state.CONSOLE_SESSION or None
+            if pending is None:
+                return code
+            cur_mode = pending
+            _log_console(state, f"restarting Claude Code in mode '{cur_mode}'" +
+                         (f" (resume {resume})" if resume else " (new session)"))
     finally:
         signal.signal(signal.SIGINT, old)
+
+
+def _log_console(state: Any, msg: str) -> None:
+    try:
+        state.BRIDGE.event("info", msg)
+    except Exception:
+        pass
 
 
 def permission_mode_text(mode: str, source: str, extra: List[str]) -> str:
@@ -12256,11 +13593,12 @@ def main() -> int:
         else:
             names = [state.BRIDGE.get_by_id(aid).name for aid in selected_ids if state.BRIDGE.get_by_id(aid)]
             log(f"[main] starting selected AI account(s): {', '.join(names) or 'none'}", C.dim)
-            state.BRIDGE.start_selected(selected_ids)
-            if not state.BRIDGE.wait_selected_ready(selected_ids, state.LOGIN_WAIT_SECONDS + 120):
-                log("[error] no selected AI account could be started / logged in.", C.red)
-                state.BRIDGE.stop()
-                return 1
+        # In panel/terminal mode the dashboard must be reachable even while a browser login is
+        # pending - otherwise a fresh instance blocks for up to LOGIN_WAIT_SECONDS before the user
+        # can open the very page that lets them log in. Start the server first, then bring the
+        # accounts up in the background. The Claude Code console path still waits (it needs a
+        # ready account before launching).
+        panel_like = bool(args.terminal or args.panel)
 
         try:
             server = start_server(resolved_port, state)
@@ -12282,6 +13620,29 @@ def main() -> int:
             return 1
 
         url = f"http://127.0.0.1:{resolved_port}"
+        if selected_ids and startup_choice.get("mode") != "dashboard":
+            if panel_like:
+                state.BRIDGE.start_selected(selected_ids)
+
+                def _bring_up() -> None:
+                    ok = state.BRIDGE.wait_selected_ready(selected_ids, state.LOGIN_WAIT_SECONDS + 120)
+                    if not ok:
+                        log("[startup] no selected AI account became ready - log in from the dashboard "
+                            "or /ds use another account.", C.yellow)
+
+                state_thread(target=_bring_up, daemon=True).start()
+            elif not state.BRIDGE.wait_selected_ready(selected_ids, state.LOGIN_WAIT_SECONDS + 120):
+                selected = [state.BRIDGE.get_by_id(aid) for aid in selected_ids]
+                details = "; ".join(
+                    f"{a.name}: {a.status}{(' - ' + a.status_err) if a.status_err else ''}"
+                    for a in selected if a is not None
+                ) or "no selected account remained available"
+                log(f"[error] no selected AI account could be started / logged in. {details}", C.red)
+                # Do not silently hide the real reason. A failed startup has already
+                # exhausted its bounded recovery attempts; preserve the diagnostic in
+                # the log before shutting down this non-panel/Claude startup path.
+                state.BRIDGE.stop()
+                return 1
         if state.DASH_AUTOOPEN and not args.no_open:
             open_dashboard(url, cfg["api_key"])
         try:
