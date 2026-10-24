@@ -80,7 +80,7 @@ TEXT-FIRST SUBMISSION, SIGNATURES, WINDOW BUDGET (7.8)
   7.20: group O step 16 (mock only; no real site or browser run): O19 browser identity of the owner's own login (UA, Accept*, sec-ch-ua*, sec-fetch-*, language order) stored as data in
   site_modules/<host>/identity.py (AST allow-list, hash pin, manifest, last-known-good) and replayed with the same header set and order via protocol.build_headers; never invented, mixed, rotated or randomised.
   7.16: group O steps 9-12 (real headless Chromium + a local mock site; no real site): O4 credential-free capture (CDP) with a hard model boundary, O22 total network analysis,
-  O21 per-site source analysis (acorn via a local, pinned, consented toolchain; low-confidence path without it), O23 other surfaces, analysis/<host>/report.md, --analyze.
+  O21 per-site source analysis (acorn via an automatically bootstrapped, local, pinned toolchain; low-confidence path if setup cannot complete), O23 other surfaces, analysis/<host>/report.md, --analyze.
   7.15: group O steps 5-8 (mock only; no real site or browser run): O2 add-account input normalised (normalize_site_input; POST /api/sites/normalize; hint + live preview), O10 portable data folder (MANIFEST.json,
   per-account session check valid/expired/looks IP-device-bound/needs_login via ONE cheap non-consuming probe, --doctor, --export-bundle/--import-bundle, 0700/0600), O3 login accepted only on >= 2 of 4 signals held twice
   (or the owner's 'I'm done'; LoginWatcher) + clean abort when the window is closed early, O7 CAPTCHA/verification/MFA => needs_human (routing skips at once; the owner solves it; never solved by the bridge).
@@ -150,7 +150,6 @@ import textwrap
 import threading
 import time
 import traceback
-import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -164,7 +163,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.46"
+VERSION = "7.47"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -849,7 +848,7 @@ class Config:
         "analysis_ai_assist": True,          # O5: after a login+learn session, ask the site's OWN model (through its UI, 1 counted request, credentials removed) where the prompt/conversation/model/refresh values live; pointers are checked against the recorded traffic
         "analysis_enabled": True,            # O4/O22: record the owner's own login/learn session (CDP, credential-free at rest) and analyse it offline; no model request, no site request
         "capture_max_body_kb": 256,          # O22: per-body cap in the stored capture (head + tail kept)
-        "toolchain_consent": False,          # O21: the owner agreed (once, in the dashboard) that the bridge may install the pinned analysis tools into tools/ (never system-wide)
+        "toolchain_consent": False,          # legacy O21 setting; toolchain bootstrap is now automatic and app-local
         "js_parser_module": "",              # O21: path of an acorn-compatible module the owner already has (otherwise tools/node_modules/acorn); BRIDGE_JS_PARSER overrides
         "node_flags": "",                    # O21: extra flags for the node process that runs the analyzer
         "paste_discover_chars": 20000,       # E6: size of the long probe prompts (measured, benign filler)
@@ -11186,6 +11185,8 @@ def o9_repair_tick(store: "Store", host: str, account: Dict[str, Any], relearn: 
 # path that finds literal call sites only and reports everything else as `unknown`. Nothing is guessed.
 # ============================================================================
 TOOLCHAIN_PLAN = {"acorn": "8.11.3"}            # pinned; the registry integrity is recorded at install time (it is not known offline) and re-checked on every use
+TOOLCHAIN_BOOTSTRAP: Dict[str, Any] = {"state": "idle", "message": "startup check pending", "updated": 0.0}
+TOOLCHAIN_BOOTSTRAP_LOCK = threading.Lock()
 
 JS_ANALYZER = r"""
 const fs = require('fs');
@@ -11287,17 +11288,12 @@ process.stdout.write(JSON.stringify({results: input.scripts.map(run)}));
 
 
 class Toolchain:
-    """O21: the local, pinned toolchain in `tools/` (never system-wide). acorn is found in this order: config `js_parser_module` / env BRIDGE_JS_PARSER (an acorn-compatible module the owner already has),
-    then `tools/node_modules/acorn`. Installing needs the owner's one-time consent (config `toolchain_consent`), node + npm, official registry only, `--ignore-scripts`, a pinned version, and the
-    installed package's hash is recorded in tools/toolchain.json and re-checked on every use. Offline analysis never installs anything."""
+    """O21: automatically bootstrap the pinned analyzer and its Node runtime inside the app data folder only.
+    Existing configured parsers remain supported; npm lifecycle scripts are disabled, official registries are used, and the parser tree is hash-checked on every use."""
 
     def __init__(self, store: "Store", cfg: "Config"):
         self.store, self.cfg = store, cfg
         self.dir = store.path("tools")
-
-    def _node(self) -> str:
-        import shutil
-        return shutil.which("node") or ""
 
     def parser_path(self) -> str:
         p = os.environ.get("BRIDGE_JS_PARSER") or str(self.cfg.data.get("js_parser_module", "") or "")
@@ -11345,7 +11341,9 @@ class Toolchain:
     def status(self) -> Dict[str, Any]:
         rec = self.store.read("tools/toolchain.json", {}) or {}
         pp = self.parser_path()
-        out: Dict[str, Any] = {"node": self._node() or None, "pinned": TOOLCHAIN_PLAN, "consent": bool(self.cfg.data.get("toolchain_consent", False)), "parser": None, "integrity": "n/a"}
+        with TOOLCHAIN_BOOTSTRAP_LOCK:
+            bootstrap = dict(TOOLCHAIN_BOOTSTRAP)
+        out: Dict[str, Any] = {"node": self._node() or None, "pinned": TOOLCHAIN_PLAN, "consent": True, "automatic": True, "parser": None, "integrity": "n/a", "bootstrap": bootstrap}
         if pp:
             ver = ""
             try:
@@ -11358,7 +11356,7 @@ class Toolchain:
             broken = self._parser_files_ok(pp)
             out["parser"] = {"path": pp, "version": ver or "unknown", "tree_sha256": h[:16]}
             if broken:
-                out["integrity"] = "incomplete install (" + broken + ") - press Install again"
+                out["integrity"] = "incomplete install (" + broken + ") - automatic repair pending"
                 out["usable"] = False
             else:
                 out["integrity"] = "matches the recorded hash" if known == h else ("no hash recorded (not installed by the bridge)" if not known else "CHANGED since install - refused")
@@ -11368,24 +11366,30 @@ class Toolchain:
         return out
 
     def install(self) -> Dict[str, Any]:
-        """Only with consent. Official registry, pinned, no install scripts, local folder; records the hash. Returns what happened - a failure is reported, never hidden.
-        A half-written or quarantined install (Windows antivirus, interrupted npm) is removed and tried once more before it is reported."""
-        if not self.cfg.data.get("toolchain_consent", False):
-            raise BridgeError("the owner has not agreed to install the analysis tools (shown once in the dashboard)", "client", 403)
-        if not self._node():
-            raise BridgeError("node is not installed; the source analysis stays on its low-confidence path", "setup", 409)
+        """Install the pinned analyzer in the app data folder; never changes the system Python/Node installation."""
         self.dir.mkdir(parents=True, exist_ok=True)
         pkgs = [f"{n}@{v}" for n, v in TOOLCHAIN_PLAN.items()]
         import shutil
-        npm = shutil.which("npm") or shutil.which("npm.cmd")          # on Windows npm is npm.cmd: a bare "npm" is not found by CreateProcess (WinError 2)
-        if not npm:
-            raise BridgeError("npm was not found on PATH. Install Node.js LTS from https://nodejs.org (it includes npm), close and reopen the bridge window so PATH is refreshed, then press Install again", "setup", 409)
+        node = self._node()
+        if not node:
+            raise BridgeError("no compatible Node.js runtime is available; automatic setup could not complete", "setup", 409)
+        managed = self._managed_node_dir()
+        npm_cli = (managed / "node_modules" / "npm" / "bin" / "npm-cli.js") if managed else None
+        npm = shutil.which("npm") or shutil.which("npm.cmd")
+        command = [node, str(npm_cli)] if npm_cli and npm_cli.is_file() else ([npm] if npm else [])
+        if not command and not (managed and npm_cli and npm_cli.is_file()):
+            node = self._install_node_runtime()
+            managed = self._managed_node_dir()
+            npm_cli = managed / "node_modules" / "npm" / "bin" / "npm-cli.js" if managed else None
+            command = [node, str(npm_cli)] if npm_cli and npm_cli.is_file() else []
+        if not command:
+            raise BridgeError("npm is unavailable for the detected Node.js runtime", "setup", 409)
         broken = ""
         for attempt in (1, 2):
             if attempt == 2:
                 shutil.rmtree(self.dir / "node_modules", ignore_errors=True)         # start clean: a partial tree is what made the first attempt fail
             try:
-                r = subprocess.run([npm, "install", "--prefix", str(self.dir), "--ignore-scripts", "--no-audit", "--no-fund", "--registry", "https://registry.npmjs.org/"] + pkgs, capture_output=True, text=True, timeout=300)
+                r = subprocess.run(command + ["install", "--prefix", str(self.dir), "--ignore-scripts", "--no-audit", "--no-fund", "--registry", "https://registry.npmjs.org/"] + pkgs, capture_output=True, text=True, timeout=300)
             except subprocess.TimeoutExpired:
                 raise BridgeError("npm did not finish within 5 minutes (network?)", "setup", 504)
             except OSError as e:
@@ -11397,10 +11401,141 @@ class Toolchain:
             if not broken:
                 break
         if broken:
-            raise BridgeError("npm reported success but the parser is incomplete (" + broken + "). Usually an antivirus is quarantining files in " + str(self.dir)
-                              + " - add that folder to its exclusions (or set BRIDGE_JS_PARSER to an acorn folder you already have) and press Install again", "setup", 500)
+            raise BridgeError("npm reported success but the parser is incomplete (" + broken + "). The automatic setup will retry on the next launch; inspect the application log for details.", "setup", 500)
         self.store.write("tools/toolchain.json", {"acorn": {"version": TOOLCHAIN_PLAN["acorn"], "tree_sha256": self._tree_hash(pp), "hash_v": 2, "installed": round(now(), 3), "registry": "https://registry.npmjs.org/"}})
         return self.status()
+
+    def _managed_node_dir(self) -> Optional[Path]:
+        import platform
+        machine = platform.machine().lower()
+        arch = {"amd64": "x64", "x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"}.get(machine)
+        if not arch:
+            return None
+        os_name = {"win32": "win", "linux": "linux", "darwin": "darwin"}.get(sys.platform)
+        if not os_name:
+            return None
+        return self.dir / "runtime" / f"node-v24.22.1-{os_name}-{arch}"
+
+    def _node(self) -> str:
+        import shutil
+        managed = self._managed_node_dir()
+        if managed:
+            binary = managed / ("node.exe" if sys.platform == "win32" else "bin/node")
+            if binary.is_file():
+                return str(binary)
+        return shutil.which("node") or shutil.which("node.exe") or ""
+
+    def _install_node_runtime(self) -> str:
+        """Fetch the official, version-pinned Node archive and verify its published SHA-256 before extracting app-locally."""
+        import platform, shutil, tarfile, tempfile, zipfile
+        root = self._managed_node_dir()
+        if root is None:
+            raise BridgeError(f"automatic Node.js setup is unsupported on {sys.platform}/{platform.machine()}; install a compatible runtime or use the low-confidence analyzer", "setup", 409)
+        binary = root / ("node.exe" if sys.platform == "win32" else "bin/node")
+        if binary.is_file():
+            return str(binary)
+        os_name = {"win32": "win", "linux": "linux", "darwin": "darwin"}[sys.platform]
+        ext = "zip" if os_name == "win" else ("tar.gz" if os_name == "darwin" else "tar.xz")
+        filename = f"node-v24.22.1-{os_name}-{root.name.rsplit('-', 1)[-1]}.{ext}"
+        base = "https://nodejs.org/dist/v24.22.1/"
+        def fetch(url: str, limit: int) -> bytes:
+            req = urllib.request.Request(url, headers={"User-Agent": "AI-Web-Bridge/7.47 dependency-bootstrap"})
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = response.read(limit + 1)
+            if len(data) > limit:
+                raise BridgeError("official runtime download exceeded its safety limit", "setup", 502)
+            return data
+        try:
+            sums = fetch(base + "SHASUMS256.txt", 1_000_000).decode("ascii")
+            expected = next((line.split()[0].lower() for line in sums.splitlines() if line.split()[-1:] == [filename]), "")
+            if not re.fullmatch(r"[0-9a-f]{64}", expected):
+                raise BridgeError("official Node.js checksum list did not contain the selected archive", "setup", 502)
+            payload = fetch(base + filename, 120_000_000)
+        except BridgeError:
+            raise
+        except Exception as e:
+            raise BridgeError("automatic Node.js download failed: " + redact_evidence(str(e), 180), "setup", 502)
+        if hashlib.sha256(payload).hexdigest() != expected:
+            raise BridgeError("official Node.js archive failed SHA-256 verification", "setup", 502)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        temp = Path(tempfile.mkdtemp(prefix="node-bootstrap-", dir=str(self.dir)))
+        try:
+            archive = temp / ("runtime." + ext)
+            archive.write_bytes(payload)
+            unpack = temp / "unpack"
+            unpack.mkdir()
+            if ext == "zip":
+                with zipfile.ZipFile(archive) as zf:
+                    members = zf.infolist()
+                    if len(members) > 20000 or any(Path(m.filename).is_absolute() or ".." in Path(m.filename).parts for m in members):
+                        raise BridgeError("Node.js archive contains unsafe paths", "setup", 502)
+                    zf.extractall(unpack)
+            else:
+                with tarfile.open(archive, "r:*") as tf:
+                    members = tf.getmembers()
+                    if len(members) > 20000 or any(Path(m.name).is_absolute() or ".." in Path(m.name).parts for m in members):
+                        raise BridgeError("Node.js archive contains unsafe paths", "setup", 502)
+                    for member in members:
+                        if member.issym() or member.islnk():
+                            parent = Path(member.name).parent
+                            target = (parent / member.linkname)
+                            if target.is_absolute() or ".." in target.parts:
+                                raise BridgeError("Node.js archive contains an unsafe link", "setup", 502)
+                    tf.extractall(unpack)
+            expected_dir = unpack / root.name
+            if not expected_dir.is_dir() or not (expected_dir / ("node.exe" if sys.platform == "win32" else "bin/node")).is_file():
+                raise BridgeError("official Node.js archive has an unexpected layout", "setup", 502)
+            root.parent.mkdir(parents=True, exist_ok=True)
+            if root.exists():
+                shutil.rmtree(root, ignore_errors=True)
+            shutil.move(str(expected_dir), str(root))
+        except BridgeError:
+            raise
+        except Exception as e:
+            raise BridgeError("could not unpack the verified Node.js runtime: " + redact_evidence(str(e), 180), "setup", 500)
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
+        return str(binary)
+
+    def ensure(self) -> Dict[str, Any]:
+        """Idempotent startup bootstrap. Failures remain visible and do not prevent the bridge serving its fallback path."""
+        st = self.status()
+        if st.get("usable"):
+            return st
+        if self.parser_path():
+            if not self._node():
+                self._install_node_runtime()
+            return st
+        if not self._node():
+            self._install_node_runtime()
+        return self.install()
+
+
+def bootstrap_toolchain(store: "Store", cfg: "Config") -> None:
+    """Run optional source-analysis dependency setup without blocking dashboard startup or the classic fallback."""
+    with TOOLCHAIN_BOOTSTRAP_LOCK:
+        if TOOLCHAIN_BOOTSTRAP.get("state") in ("checking", "installing"):
+            return
+        TOOLCHAIN_BOOTSTRAP.update(state="checking", message="checking app-local analysis tools", updated=now())
+    try:
+        tc = Toolchain(store, cfg)
+        if tc.status().get("usable"):
+            result = tc.status()
+        else:
+            with TOOLCHAIN_BOOTSTRAP_LOCK:
+                TOOLCHAIN_BOOTSTRAP.update(state="installing", message="installing pinned analysis tools in the app data folder", updated=now())
+            result = tc.ensure()
+        if result.get("usable"):
+            with TOOLCHAIN_BOOTSTRAP_LOCK:
+                TOOLCHAIN_BOOTSTRAP.update(state="ready", message="pinned analysis tools are ready", updated=now())
+            log("automatic tool setup complete: pinned local JavaScript analysis is ready", "ok")
+        else:
+            raise BridgeError("installed parser is not trusted: " + str(result.get("integrity")), "setup", 409)
+    except Exception as e:
+        message = str(e)[:300]
+        with TOOLCHAIN_BOOTSTRAP_LOCK:
+            TOOLCHAIN_BOOTSTRAP.update(state="failed", message=message, updated=now())
+        log("automatic tool setup did not complete; the bridge remains available on its documented fallback: " + message, "warn")
 
     def run_acorn(self, scripts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         st = self.status()
@@ -18085,12 +18220,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False, "error": str(e_), "hint": SITE_INPUT_HINT})
         if parts == ["doctor"] and method == "POST":                      # O10: explicit session check (one cheap probe per account; no model request)
             return self._json(200, acc.validate_sessions())
-        if parts and parts[0] == "toolchain":                              # O21: the local analysis tools (consent is the owner's, shown once in the dashboard)
+        if parts and parts[0] == "toolchain":                              # O21: app-local tools bootstrap automatically at startup
             tc_ = Toolchain(app.store, cfg)
             if len(parts) == 1 and method == "GET":
                 return self._json(200, tc_.status())
             if parts == ["toolchain", "consent"] and method == "POST":
-                cfg.set("toolchain_consent", bool(self._body().get("agree")))
+                cfg.set("toolchain_consent", True)                         # compatibility for older dashboards; no click is required
                 return self._json(200, tc_.status())
             if parts == ["toolchain", "install"] and method == "POST":
                 return self._json(200, tc_.install())
@@ -18475,8 +18610,8 @@ ol.steps li.bad i{background:var(--bad);border-color:var(--bad);color:#fff}ol.st
 
 <div class="view" id="v_adv">
 <div class="card" id="toolcard"><h2>Site analysis &amp; tools</h2>
-<p class="mut" style="margin:0 0 8px" data-i="adv_hint"></p><div id="tool_state" class="mut ltr"></div>
-<label class="f"><input type="checkbox" id="tool_consent"> <span data-i="tool_consent"></span></label><button id="tool_install" class="sm" data-i="tool_install"></button>
+<p class="mut" style="margin:0 0 14px" data-i="adv_hint"></p>
+<div id="tool_state" class="ltr" style="display:flex;align-items:center;gap:10px;padding:14px 16px;border:1px solid var(--line);border-radius:12px;background:var(--card);min-height:42px"><span id="tool_dot" aria-hidden="true" style="width:10px;height:10px;flex:0 0 10px;border-radius:50%;background:#98a2b3;box-shadow:0 0 0 4px #98a2b322"></span><span><strong id="tool_title" style="display:block"></strong><span id="tool_detail" class="mut" style="display:block;margin-top:3px"></span></span></div>
 <div class="row"><input id="rep_host" class="ltr" placeholder="chat.example.com"><button id="rep_show" class="sm" data-i="rep_show"></button></div><pre id="rep_out" class="mut" style="display:none"></pre></div>
 <div class="card" id="dircard"><h2>Site directory</h2><div id="dir_meta" class="mut"></div>
 <div class="row"><input id="dir_q" placeholder="search" oninput="renderDir()"><select id="dir_cat" onchange="renderDir()"><option value="">all categories</option></select></div>
@@ -18511,7 +18646,7 @@ api_title:'…or add an official API account instead',api_btn:'Add API account',
 connect_title:'Connect your tools',key_used:'key used in the snippet',key_create:'Create key',klabel_ph:'label e.g. cursor',key_pin:'Pin a key to an account to force that provider for the tool using it.',
 th_site:'Site',th_tier:'Mode',th_mem:'Chat memory',import:'Import recipe',
 s_cont:"Reuse the site's own chat memory (send only new messages)",s_sum:'Summarize old history with the model instead of cutting it',s_tool:'Tool description limit (chars)',s_sys:'System prompt limit (chars)',s_res:'Tool result limit (chars)',s_his:'History limit (chars)',s_hc:'Health check every (min, 0 = off)',s_cache:'Cache identical requests (s, 0 = off)',s_idle:'Close idle browser after (s)',
-adv_hint:"While you log in, your own browser traffic is recorded locally with credentials removed and analysed offline. Reading scripts needs a small pinned parser (acorn).",tool_consent:'I agree that the bridge may install the pinned analysis parser into its own tools folder',tool_install:'Install now',rep_show:'Show analysis report',
+adv_hint:"The bridge checks for its pinned analysis tools at startup and installs missing components into its own data folder. No manual setup is needed; site captures are analysed locally.",tool_auto:'Automatic setup',tool_ready:'Analysis tools are ready',tool_checking:'Checking analysis tools…',tool_installing:'Preparing analysis tools…',tool_failed:'Analysis tools could not be prepared',tool_detail_ready:'Node.js and pinned Acorn are available locally. Setup never changes system-wide packages.',tool_detail_work:'Missing components are being installed locally. The dashboard and fallback modes remain available during setup.',tool_detail_failed:'The app can continue with its lower-confidence fallback. Details: ',rep_show:'Show analysis report',
 disc_hint:'Spends exactly 3 real requests on the chosen account to find the response field in which the site reports turning long text into an attachment. Nothing is sent until you confirm.',disc_btn:'Discover signal (3 real requests)',hide_tech:'Hide technical lines (DEBUG / tracebacks)',log_cp:'Copy diagnostic report',log_dl:'Download full log file',log_hint:'The report holds the version, account states, Chrome-extension state and the latest log lines (no keys, no message text). Paste it into the chat instead of describing the page.',log_copied:'Copied. Paste it into the chat.',log_failed:'Could not copy automatically; the report was downloaded instead.',
 s_ready:'Ready',s_learning:'Working',s_needs_you:'Needs you',s_needs_login:'Login needed',s_failed:'Failed',s_cooling:'Cooling down',
 m_direct:'direct (fast)',m_page:'via browser page',m_ui:'via browser typing (slow)',
@@ -18536,7 +18671,7 @@ api_title:'…یا به‌جای آن یک حساب API رسمی اضافه کن
 connect_title:'اتصال ابزارهای شما',key_used:'کلیدی که در دستور استفاده می‌شود',key_create:'ساخت کلید',klabel_ph:'برچسب، مثلا cursor',key_pin:'کلید را به یک حساب وصل کنید تا ابزار فقط از همان سرویس استفاده کند.',
 th_site:'سایت',th_tier:'حالت',th_mem:'حافظه‌ی چت',import:'وارد کردن recipe',
 s_cont:'استفاده از حافظه‌ی خود سایت (فقط پیام‌های جدید ارسال شود)',s_sum:'خلاصه‌کردن تاریخچه‌ی قدیمی با مدل به‌جای بریدن',s_tool:'حد توضیح ابزار (حرف)',s_sys:'حد پرامپت سیستم (حرف)',s_res:'حد نتیجه‌ی ابزار (حرف)',s_his:'حد تاریخچه (حرف)',s_hc:'بررسی سلامت هر (دقیقه، 0 = خاموش)',s_cache:'کش درخواست‌های یکسان (ثانیه، 0 = خاموش)',s_idle:'بستن مرورگر بی‌کار بعد از (ثانیه)',
-adv_hint:'هنگام ورود، ترافیک مرورگر شما به‌صورت محلی و بدون اطلاعات محرمانه ضبط و آفلاین تحلیل می‌شود. خواندن اسکریپت‌ها به یک پارسر کوچک (acorn) نیاز دارد.',tool_consent:'اجازه می‌دهم پارسر تحلیل داخل پوشه‌ی tools برنامه نصب شود',tool_install:'نصب',rep_show:'نمایش گزارش تحلیل',
+adv_hint:'برنامه هنگام اجرا ابزارهای تحلیلِ نسخه‌ثابت را بررسی و در پوشه‌ی داده‌ی خودش نصب می‌کند؛ نصب دستی لازم نیست و بسته‌ی سیستمی تغییری نمی‌کند.',tool_auto:'راه‌اندازی خودکار',tool_ready:'ابزارهای تحلیل آماده‌اند',tool_checking:'در حال بررسی ابزارهای تحلیل…',tool_installing:'در حال آماده‌سازی ابزارهای تحلیل…',tool_failed:'آماده‌سازی ابزارهای تحلیل انجام نشد',tool_detail_ready:'Node.js و Acorn نسخه‌ثابت به‌صورت محلی آماده‌اند.',tool_detail_work:'اجزای لازم در پوشه‌ی برنامه نصب می‌شوند. داشبورد و مسیرهای جایگزین در دسترس می‌مانند.',tool_detail_failed:'برنامه با مسیر جایگزین کم‌اطمینان‌تر ادامه می‌دهد. جزئیات: ',rep_show:'نمایش گزارش تحلیل',
 disc_hint:'دقیقا ۳ درخواست واقعی روی حساب انتخابی مصرف می‌کند. تا تایید نکنید چیزی ارسال نمی‌شود.',disc_btn:'کشف سیگنال (۳ درخواست واقعی)',hide_tech:'پنهان‌کردن خطوط فنی (DEBUG و traceback)',log_cp:'کپی گزارش تشخیصی',log_dl:'دانلود کامل فایل لاگ',log_hint:'گزارش شامل نسخه، وضعیت حساب‌ها، وضعیت افزونه‌ی کروم و آخرین خطوط لاگ است (بدون کلید و بدون متن پیام‌ها). به جای توضیح صفحه، همین را در چت بگذارید.',log_copied:'کپی شد. در چت بگذارید.',log_failed:'کپی خودکار نشد؛ گزارش دانلود شد.',
 s_ready:'آماده',s_learning:'در حال کار',s_needs_you:'نیاز به شما',s_needs_login:'نیاز به ورود',s_failed:'ناموفق',s_cooling:'در حال استراحت',
 m_direct:'مستقیم (سریع)',m_page:'از طریق صفحه‌ی مرورگر',m_ui:'تایپ در مرورگر (کند)',
@@ -18602,11 +18737,10 @@ $('tabs').innerHTML=Object.keys(names).map(x=>`<button class="sm ${x==tab?'p':''
 $('snip').textContent=snippets($('keysel').value||(S.keys[0]||{}).key||'',S.port)[tab];
 const s=S.settings;if(document.activeElement.tagName!='INPUT'){$('s_cont').checked=s.continuity;$('s_tool').value=s.tool_desc_limit;$('s_sys').value=s.system_limit;$('s_res').value=s.result_limit;$('s_his').value=s.history_limit;$('s_idle').value=s.headless_idle_seconds;$('s_sum').checked=s.summarize_history;$('s_hc').value=s.health_interval_min;$('s_cache').value=s.cache_seconds}
 $('home').textContent='Data folder: '+S.home}
-async function loadTools(){try{const x=await api('toolchain');$('tool_consent').checked=!!x.consent;$('tool_state').textContent='node: '+(x.node||'not found')+' · parser: '+(x.parser?('acorn '+x.parser.version+' ('+x.integrity+')'):'not installed')+' · pinned: '+JSON.stringify(x.pinned)}catch(e){$('tool_state').textContent='unavailable: '+errMsg(e)}}
-$('tool_consent').onchange=async()=>{await api('toolchain/consent','POST',{agree:$('tool_consent').checked});loadTools()};
-$('tool_install').onclick=async()=>{const b=$('tool_install');b.disabled=true;$('tool_state').textContent='installing (npm, up to a few minutes)...';try{await api('toolchain/install','POST',{})}catch(e){$('tool_state').textContent='✘ '+errMsg(e);b.disabled=false;return}b.disabled=false;loadTools()};
+async function loadTools(){try{const x=await api('toolchain'),b=x.bootstrap||{},ready=!!x.usable&&b.state==='ready',failed=b.state==='failed';$('tool_title').textContent=t(ready?'tool_ready':failed?'tool_failed':b.state==='installing'?'tool_installing':'tool_checking');$('tool_title').style.color=ready?'var(--ok)':failed?'var(--warn)':'var(--tx)';$('tool_dot').style.background=ready?'var(--ok)':failed?'var(--warn)':'var(--acc)';$('tool_dot').style.boxShadow='0 0 0 4px '+(ready?'#4ade8033':failed?'#fbbf2433':'#6ea8fe33');$('tool_detail').textContent=ready?(t('tool_detail_ready')+' · '+(x.node||'Node.js')+' · Acorn '+(x.parser||{}).version):failed?(t('tool_detail_failed')+(b.message||x.integrity)):(t('tool_detail_work')+' '+(b.message||''))}catch(e){$('tool_title').textContent=t('tool_failed');$('tool_detail').textContent=errMsg(e);$('tool_dot').style.background='var(--warn)'}}
 $('rep_show').onclick=async()=>{const h=$('rep_host').value.trim();if(!h)return;$('rep_out').style.display='block';try{const r=await api('analysis/'+encodeURIComponent(h)+'/report');$('rep_out').textContent=r.markdown||'no report yet for this site'}catch(e){$('rep_out').textContent='✘ '+e.message}};
 loadTools();
+setInterval(()=>{if($('v_adv').classList.contains('on'))loadTools()},5000);
 const kindB=k=>k=='measured'?'ready':(k=='estimated'?'learning':'direct');
 let D=null,DE='';
 async function loadDir(){try{D=await api('directory');DE=''}catch(e){DE=errMsg(e)}renderDir()}
@@ -18816,6 +18950,7 @@ def main() -> int:
     cfg.set("port", port)
     if args.autonomous:
         cfg.set("autonomous", True)
+    threading.Thread(target=bootstrap_toolchain, args=(store, cfg), daemon=True, name="tool-bootstrap").start()
     app = App(store, cfg)
     app.acc.start_health_loop()
     if cfg["o9_supervisor_seconds"]:
@@ -23218,7 +23353,7 @@ def run_selftest(quick: bool = False) -> int:
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
 
-        def test_o21_without_a_parser_the_analysis_says_unknown_and_the_toolchain_needs_consent(self) -> None:
+        def test_o21_without_a_parser_uses_fallback_and_reports_automatic_tool_setup(self) -> None:
             tmp, store, cfg, _app = mk_env()
             try:
                 cfg.data["js_parser_module"] = ""
@@ -23232,9 +23367,9 @@ def run_selftest(quick: bool = False) -> int:
                 self.assertEqual(rep["engine"], "low-confidence")
                 c = rep["call_sites"][0]
                 self.assertEqual((c["url"], c["headers"], c["body_class"]), ('"/v2/chat"', [], "unknown"))      # a literal URL only; headers/bodies/signatures stay unknown
-                with self.assertRaises(BridgeError) as cm:
-                    tc.install()
-                self.assertEqual(cm.exception.status, 403)                                                    # nothing is installed without the owner's consent
+                st = tc.status()
+                self.assertTrue(st["automatic"])
+                self.assertTrue(st["consent"])                                                    # legacy field means setup is automatic, with no dashboard click
                 m = SiteManifest("z.test")
                 m.unknown("token_algorithm", "no parser")
                 self.assertEqual((m.tier(), m.report()["direct_allowed"]), ("page", False))                   # an unextractable element keeps the site on the page tier
@@ -23342,7 +23477,7 @@ def run_selftest(quick: bool = False) -> int:
                 self.assertNotIn(site.token.encode(), body)
                 self.assertEqual(call(srv.port, "POST", f"/api/analysis/{urllib.parse.quote(host)}/run", {}, H)[0], 200)
                 self.assertEqual(call(srv.port, "GET", "/api/analysis/..%2f..%2fetc/report", None, H)[0], 400)
-                self.assertFalse(json.loads(call(srv.port, "GET", "/api/toolchain", None, H)[2])["consent"])
+                self.assertTrue(json.loads(call(srv.port, "GET", "/api/toolchain", None, H)[2])["automatic"])
                 self.assertTrue(json.loads(call(srv.port, "POST", "/api/toolchain/consent", {"agree": True}, H)[2])["consent"])
             finally:
                 srv.close()
