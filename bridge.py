@@ -164,7 +164,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.38"
+VERSION = "7.39"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -13421,6 +13421,10 @@ class Accounts:
             if st == "stable_direct":
                 return publish("promoted", "O8 accepted the required independent validation runs", **common,
                                validation=(self.store.read(f"site_modules/{hd}/validation.json", {}) or {}).get("promoted"))
+            if st != "validating":
+                why = str(row.get("skipped") or row.get("error") or "O8 did not enter its validation state")
+                status = "native_unavailable" if row.get("skipped") else "validation_failed"
+                return publish(status, "O8 could not start or complete validation: " + why, **common, supervisor=row)
             return publish("validating", "modules are installed; O8 still requires independent passing runs", **common, supervisor=row)
         except Exception as e:
             reason = redact_evidence(f"{type(e).__name__}: {e}", 180)
@@ -25456,6 +25460,38 @@ def run_selftest(quick: bool = False) -> int:
             self.store.write(f"recipes/{self.HOST}.json", {"host": self.HOST, "continuity": True, "tier": "page", "version": 1})
             p, why = self.acc.o8_parts(a)
             self.assertEqual((p, "cannot supply" in why), (None, True))
+
+        def test_o29_reports_native_unavailable_instead_of_validating_when_o8_skips(self) -> None:
+            a = self.account()
+            exs = json.loads(json.dumps(self.o8.exs))
+            scripts = self.o8.f.scripts()
+            for i, ex in enumerate(exs):
+                if ex.get("method") == "POST" and str(ex.get("url", "")).endswith("/api/chat"):
+                    ex.setdefault("req_headers", []).append(["x-unexplained", f"value-{i}"])
+            CaptureStore(self.store, self.HOST).add_run("login+learn", exs)
+            store_served(self.store, self.HOST, scripts)
+            analysis = o17_analyze(exs, self.HOST, scripts, endpoint="POST /api/chat", input_locs=("body.$.prompt", "body.$.conversation_id"))
+            self.store.write(f"analysis/{safe_host_dir(self.HOST)}/o17.json", analysis, private=True)
+            originals = (o26_investigate, o27_author, o28_review, o27_commit)
+
+            class SkippedSupervisor:
+                def tick(inner_self) -> List[Dict[str, Any]]:
+                    return [{"id": "a1", "skipped": "native descriptor is missing", "state": "degraded_fallback"}]
+
+            try:
+                def fake_author(_brain: Any, _result: Dict[str, Any], _exs: Any, _scripts: Any, _host: str, endpoint: str, *_args: Any, **_kwargs: Any) -> Dict[str, Any]:
+                    return {"outcome": "modules", "requests": 1, "drafts": 1, "files": {"tokens.py": "validated fixture"}, "endpoint": endpoint}
+                self.acc.brain_for = lambda *_args, **_kwargs: object()  # type: ignore[assignment]
+                self.acc.o9_supervisor = lambda: SkippedSupervisor()  # type: ignore[assignment]
+                globals()["o26_investigate"] = lambda *_args, **_kwargs: {"outcome": "spec", "specs": [{"loc": "header.x-unexplained"}], "requests": 1, "rounds": 1, "experiments": 0}
+                globals()["o27_author"] = fake_author
+                globals()["o28_review"] = lambda *_args, **_kwargs: {"outcome": "reviewed", "requests": 1, "verdict": "ok", "confirmed_defects": 0}
+                globals()["o27_commit"] = lambda *_args, **_kwargs: {"written": "modules"}
+                result = self.acc.o29_after_learn("a1")
+                self.assertEqual(result["status"], "native_unavailable", result)
+                self.assertIn("native descriptor is missing", result["reason"])
+            finally:
+                globals()["o26_investigate"], globals()["o27_author"], globals()["o28_review"], globals()["o27_commit"] = originals
 
         def test_two_supervisor_ticks_move_a_fallback_account_to_stable_direct_through_a_validation_id(self) -> None:
             a = self.account()
