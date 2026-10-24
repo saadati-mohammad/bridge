@@ -123,6 +123,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import codecs
 import dataclasses
 import email.utils
 import gzip
@@ -163,7 +164,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.36"
+VERSION = "7.37"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -1028,7 +1029,8 @@ class StreamDecoder:
     """Incremental decoder for sse / ndjson / json / text bodies -> list of events."""
 
     def __init__(self, fmt: str):
-        self.fmt, self.buf, self.text_buf = fmt, b"", []
+        self.fmt, self.buf = fmt, b""
+        self.text_decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
     def _line(self, line: str) -> List[Any]:
         line = line.strip("\r")
@@ -1047,12 +1049,13 @@ class StreamDecoder:
 
     def feed(self, chunk: Any) -> List[Any]:
         if isinstance(chunk, str):
-            chunk = chunk.encode("utf-8")
+            chunk = chunk.encode("utf-8", "replace")
         if self.fmt == "json":
             self.buf += chunk
             return []
         if self.fmt == "text":
-            return [chunk.decode("utf-8", "replace")] if chunk else []
+            text = self.text_decoder.decode(chunk, final=False)
+            return [text] if text else []
         self.buf += chunk
         out: List[Any] = []
         while b"\n" in self.buf:
@@ -1061,6 +1064,9 @@ class StreamDecoder:
         return out
 
     def close(self) -> List[Any]:
+        if self.fmt == "text":
+            tail_text = self.text_decoder.decode(b"", final=True)
+            return [tail_text] if tail_text else []
         if self.fmt == "json":
             try:
                 return [json.loads(self.buf.decode("utf-8", "replace"))]
@@ -7127,11 +7133,12 @@ def o26_investigate(brain: "Brain", exchanges: List[Dict[str, Any]], scripts: Li
     Only `spec` carries specs, and they are already validated (provenance + literal check + byte-identical on every capture). `experiment(kind, params) -> {accepted: bool}` runs a real
     replay (the caller enforces O16: only a normal chat turn); without it experiments are refused. Never raises."""
     start = brain.requests
+    n_exp = 0
     out: Dict[str, Any] = {"outcome": "", "reason": "", "specs": [], "rounds": 0, "requests": 0, "log": [], "refuted": [], "hypotheses": []}
     red = Redactor([x for x in (secrets_ or []) if isinstance(x, str) and len(x) >= 8])
 
     def done(outcome: str, reason: str) -> Dict[str, Any]:
-        out.update(outcome=outcome, reason=neutralise(str(reason))[:300], requests=brain.requests - start)
+        out.update(outcome=outcome, reason=neutralise(str(reason))[:300], requests=brain.requests - start, experiments=n_exp)
         log(f"o26 {host}: outcome={outcome} rounds={out['rounds']} requests={out['requests']}", "debug")
         return out
     try:
@@ -7158,7 +7165,7 @@ def o26_investigate(brain: "Brain", exchanges: List[Dict[str, Any]], scripts: Li
         found: List[str] = []
         hyp: Dict[str, Dict[str, Any]] = {}
         solved: Dict[str, Dict[str, Any]] = {}
-        last, bad, n_exp = "none yet", 0, 0
+        last, bad = "none yet", 0
 
         def note(rnd: int, action: str, ok: bool, text: str) -> None:
             out["log"].append({"round": rnd, "action": action[:20], "ok": ok, "note": text[:140]})
@@ -7733,7 +7740,7 @@ def o27_author(brain: "Brain", o26_result: Dict[str, Any], exchanges: List[Dict[
             failing = [f for _, fl in fails for f in fl]
             out["gate_log"].append({"draft": out["drafts"], "gates": [{"gate": g, "ok": not fl, "rules": sorted({f["rule"] for f in fl})[:12], "lines": [f["line"] for f in fl][:12]} for g, fl in fails]})
             if not failing:
-                out.update(files=files, test_file=o27_test_text(host, cases), cases=cases, draft="")
+                out.update(files=files, test_file=o27_test_text(host, cases), cases=cases, draft="", endpoint=ep)
                 return done("modules", "every gate passed; nothing is written or promoted (O8 battery next)")
             feedback = _o27_feedback(failing)
         out["draft"] = red.text(draft)[:O27_MAX_SOURCE_CHARS]
@@ -7748,10 +7755,29 @@ def o27_commit(store: "Store", host: str, result: Dict[str, Any], scripts: List[
     """Write an `o27_author` result. `modules` -> `o18_write` (validated set + last-known-good) and `test_tokens.py` beside it (not part of the runtime manifest). Anything else -> the failed draft
     only under `site_modules/<host>/drafts/o27/` for inspection; the live set is never touched. Promotion to `stable_direct` stays with the O8 battery (O29)."""
     hd = safe_host_dir(host)
+    if result.get("outcome") == "modules" and str(result.get("endpoint") or "") != str(endpoint):
+        return {"written": "refused", "reason": "the accepted module endpoint does not match the requested commit endpoint"}
     if review:
         store.write(f"site_modules/{hd}/review.json", {k: review.get(k) for k in ("outcome", "verdict", "findings", "confirmed_defects", "requests")}, private=True)      # O28: advisory, never read by the runtime
     if result.get("outcome") == "modules" and result.get("files"):
-        man = o18_write(store, host, result["files"], {"ok": True, **(result.get("validation") or {})}, scripts, specs, endpoint)
+        files = dict(result["files"])
+        # O27 authors tokens.py, while native.json is independently derived from the
+        # captured transport by O18. Replacing the whole module set without carrying
+        # that validated data forward silently disables NativeClient/O8 promotion.
+        # Preserve it only from a currently valid, same-endpoint module set and only
+        # when it still agrees with the newly authored protocol's input locations.
+        old = o18_load(store, host, scripts)
+        old_man = old.get("manifest") or {}
+        native = old.get("native")
+        if native and str(old_man.get("endpoint") or "") == str(endpoint):
+            try:
+                proto = o18_load_source(files["protocol.py"], "protocol")
+                clean, _why = o18_native_clean(native, proto.get("INPUTS"))
+                if clean is not None:
+                    files[O18_NATIVE_FILE] = json.dumps(clean, sort_keys=True, indent=1)
+            except (BridgeError, KeyError, ImportError, TypeError, ValueError):
+                pass  # a stale/incompatible native descriptor is never copied
+        man = o18_write(store, host, files, {"ok": True, **(result.get("validation") or {})}, scripts, specs, endpoint)
         store._atomic(store.path("site_modules", hd, "test_tokens.py"), str(result.get("test_file") or "").encode("utf-8"), True)
         return {"written": "modules", "manifest": man}
     if result.get("draft"):
@@ -12361,6 +12387,124 @@ class NativeBackend:
         return fb.upload_text(conv["fb"], text, cancel)
 
 
+def o29_safe_experiment(recipe: Dict[str, Any], session: Dict[str, Any], kind: str, params: Dict[str, Any], host: str, endpoint: str,
+                        allowed_hosts: Iterable[str], transport: Any = None, guard: Optional[Callable[[str], str]] = None,
+                        allow_private: bool = False) -> Dict[str, Any]:
+    """Run at most one harmless synthetic chat turn after one captured request part is omitted/changed.
+
+    Setup flows, model-selection calls, uploads, non-captured hosts, and URL changes are refused. The original prompt and
+    response are never reused or returned. A site acceptance is a non-empty answer; typed errors mean rejection.
+    """
+    try:
+        if not isinstance(recipe, dict) or not isinstance(session, dict) or recipe.get("pre"):
+            return {"accepted": False, "requests": 0, "reason": "setup requests are not allowed in a one-turn experiment"}
+        if (recipe.get("model_select") or {}).get("kind") == "set_call" or (recipe.get("chat") or {}).get("method", "").upper() != "POST":
+            return {"accepted": False, "requests": 0, "reason": "the captured chat is not a single POST turn"}
+        if kind not in O26_EXPERIMENTS:
+            return {"accepted": False, "requests": 0, "reason": "unsupported experiment kind"}
+        loc = str(params.get("loc") or "")
+        if not loc:
+            return {"accepted": False, "requests": 0, "reason": "missing captured location"}
+
+        candidate = json.loads(json.dumps(recipe))
+        sess = json.loads(json.dumps(session))
+        chat = candidate["chat"]
+        expected = params.get("expected")
+        changed = False
+        if kind in ("omit_header", "change_value") and loc.startswith("header."):
+            name = loc[7:].lower()
+            headers = chat.setdefault("headers", {})
+            key = next((k for k in headers if str(k).lower() == name), None)
+            if kind == "omit_header":
+                if key is not None:
+                    del headers[key]
+                    changed = True
+                for k in list((candidate.get("auth") or {})):
+                    if str(k).lower() == name:
+                        candidate["auth"].pop(k, None)
+                # A dynamic header absent from the learned template is precisely the value being omitted.
+            elif key is not None and isinstance(expected, (str, int, float, bool)):
+                if str(render(headers[key], {"prompt": "", "conv": {}, "state": {}, "turn": 0, "model": "", "uploads": [], "upload": ""})) == str(expected):
+                    headers[key] = "bridge-o29-invalid"
+                    changed = True
+                    for k in list((candidate.get("auth") or {})):
+                        if str(k).lower() == name:
+                            candidate["auth"].pop(k, None)
+        elif kind in ("omit_cookie", "change_value") and loc.startswith("cookie."):
+            name = loc[7:].lower()
+            cookies = list(sess.get("cookies") or [])
+            hit = next((c for c in cookies if str(c.get("name") or "").lower() == name), None)
+            if hit is not None:
+                if kind == "omit_cookie":
+                    sess["cookies"] = [c for c in cookies if c is not hit]
+                    changed = True
+                elif isinstance(expected, (str, int, float, bool)) and str(hit.get("value")) == str(expected):
+                    hit["value"] = "bridge-o29-invalid"
+                    sess["cookies"] = cookies
+                    changed = True
+        elif kind == "change_value" and loc.startswith("query."):
+            name = loc[6:]
+            u = urllib.parse.urlsplit(str(chat.get("url") or ""))
+            pairs = urllib.parse.parse_qsl(u.query, keep_blank_values=True)
+            for i, (k, v) in enumerate(pairs):
+                if k == name and isinstance(expected, (str, int, float, bool)) and v == str(expected):
+                    pairs[i] = (k, "bridge-o29-invalid")
+                    chat["url"] = urllib.parse.urlunsplit((u.scheme, u.netloc, u.path, urllib.parse.urlencode(pairs), u.fragment))
+                    changed = True
+                    break
+        elif kind == "change_value" and loc.startswith("body.") and chat.get("body_kind") == "json":
+            # Only replace a literal leaf that exactly matches the captured value; never replace a template or the probe prompt.
+            raw_path = loc[5:]
+            if raw_path not in ("$.prompt", "prompt", "$.messages[0].content"):
+                bits = re.finditer(r"([^\.\[\]]+)|\[(\d+)\]", raw_path)
+                path: List[Any] = []
+                for b in bits:
+                    token = b.group(1) or b.group(2)
+                    if token and token != "$":
+                        path.append(int(token) if token.isdigit() else token)
+                obj = chat.get("body")
+                try:
+                    cur = obj
+                    for bit in path:
+                        cur = cur[bit]
+                    if path and isinstance(cur, (str, int, float, bool)) and "{{" not in str(cur) and isinstance(expected, (str, int, float, bool)) and str(cur) == str(expected):
+                        set_path(obj, tuple(path), "bridge-o29-invalid")
+                        changed = True
+                except (KeyError, IndexError, TypeError):
+                    pass
+        if kind == "change_value" and not changed:
+            return {"accepted": False, "requests": 0, "reason": "the captured value is not a literal in the learned request template"}
+
+        captured = {str(x).split(":", 1)[0].lower() for x in allowed_hosts if x}
+        base_guard = guard or (lambda u: url_guard(u, allow_private))
+
+        class SingleRequestTransport:
+            skip_headers: set = set()
+            calls = 0
+
+            def request(inner_self, method: str, url: str, headers: Dict[str, str], body: Optional[bytes], timeout: float = 180):
+                if inner_self.calls >= 1:
+                    raise BridgeError("an O29 experiment may send only one request", "client", 400)
+                if endpoint_key({"method": method, "url": url}) != endpoint:
+                    raise BridgeError("the experimental request does not match the captured endpoint", "client", 400)
+                target = (urllib.parse.urlsplit(url).hostname or "").lower()
+                if target not in captured or registrable(target) != registrable(host.lower().split(":", 1)[0]):
+                    raise BridgeError("the experimental request is outside the captured first-party host", "client", 400)
+                base_guard(url)
+                inner_self.calls += 1
+                tx = transport or DirectTransport(sess)
+                return tx.request(method, url, headers, body, min(float(timeout), 60.0))
+
+        tx = SingleRequestTransport()
+        client = RecipeClient(candidate, tx, sess)
+        conv = client.new_conv()
+        answer = "".join(client.ask(conv, "Reply with exactly the word OK."))
+        return {"accepted": bool(answer.strip()), "requests": tx.calls, "reason": "one synthetic turn completed" if answer.strip() else "the site returned no answer"}
+    except Exception as e:
+        return {"accepted": False, "requests": int(locals().get("tx").calls) if locals().get("tx") else 0,
+                "reason": f"experiment failed ({type(e).__name__})"}
+
+
 class Accounts:
     def __init__(self, store: Store, cfg: Config):
         self.store, self.cfg = store, cfg
@@ -12542,6 +12686,9 @@ class Accounts:
             if a.get("type") != "api":
                 p = self.profile(a["host"])
                 d["profile"] = {"status": p.status, "reason": p.status_reason}
+                progress = self.store.read(f"analysis/{safe_host_dir(a['host'])}/o29.json", None)
+                if isinstance(progress, dict):
+                    d["native_learning"] = {k: progress[k] for k in ("status", "reason", "rounds", "requests", "budget", "updated_at") if k in progress}
             out.append(d)
         return out
 
@@ -13160,6 +13307,115 @@ class Accounts:
         """Re-run the offline analysis from the stored captures and served scripts (no browser, no network)."""
         acct = next((a for a in self.items if a.get("host") == host and a.get("type") != "api"), None)
         return run_site_analysis(self.store, self.cfg, host, host, session=self.session(acct["id"]) if acct else None)
+
+    def o29_after_learn(self, aid: str) -> Dict[str, Any]:
+        """O29: connect accepted O17/O18 data, the bounded Brain loop, O27/O28, and the existing O8/O9 promotion gate.
+
+        This method never promotes directly. It writes only redacted progress, leaves the classic tier available on every
+        refusal, and lets O8 alone authorize stable_direct. O26 may run a budget-counted one-turn perturbation using a
+        fixed synthetic prompt and only the captured first-party chat endpoint.
+        """
+        a = self.get(aid)
+        if a is None or a.get("type") == "api" or not a.get("host"):
+            return {"status": "skipped", "reason": "no learned browser account"}
+        host, hd = str(a["host"]), safe_host_dir(str(a["host"]))
+        rel = f"analysis/{hd}/o29.json"
+
+        def publish(status: str, reason: str = "", **fields: Any) -> Dict[str, Any]:
+            safe = {"schema": 1, "host": host, "status": status, "reason": redact_evidence(reason, 220),
+                    "updated_at": round(now(), 3), **fields}
+            # Public progress contains only counts, gate names, and bounded redacted reasons.
+            self.store.write(rel, safe, private=True)
+            with self.lock:
+                cur = self.get(aid)
+                if cur is not None:
+                    cur["native_learning"] = {k: safe[k] for k in ("status", "reason", "rounds", "requests", "budget", "updated_at") if k in safe}
+                    self.save()
+            return safe
+
+        try:
+            exs = CaptureStore(self.store, host).load_all()
+            scripts = load_served(self.store, host)
+            recipe = self.recipe(host) or {}
+            o17 = self.store.read(f"analysis/{hd}/o17.json", {}) or {}
+            endpoint = str(o17.get("endpoint") or "")
+            if not exs or not endpoint:
+                return publish("needs_more_capture", "the stored captures do not identify a reproducible chat endpoint")
+
+            # O18 is the deterministic path and should be used without spending any Brain requests when complete.
+            loaded = o18_load(self.store, host, scripts)
+            if loaded.get("use") and loaded.get("native"):
+                publish("native_ready", "validated native modules are available; the independent O8 battery decides promotion")
+                rows = self.o9_supervisor().tick()
+                row = next((r for r in rows if r.get("id") == aid), {})
+                st = lc_state(self.get(aid) or a)
+                if st == "stable_direct":
+                    return publish("promoted", "O8 accepted the required independent validation runs", validation=(self.store.read(f"site_modules/{hd}/validation.json", {}) or {}).get("promoted"))
+                return publish("validating", "native path is installed; O8 still requires independent passing runs", supervisor=row)
+
+            source = self.store.read(f"analysis/{hd}/source.json", None)
+            specs, _notes = o21_specs(source, exs, scripts, endpoint)
+            # If deterministic extraction already explains every dynamic value but native data is unavailable,
+            # do not ask a model to invent a transport descriptor. Keep the exact blocker visible.
+            base = o17_analyze(exs, host, scripts, specs or None, endpoint=endpoint, input_locs=recipe_input_locs(recipe))
+            if base.get("verdict") == "direct_candidate":
+                return publish("native_unavailable", "the token recipe is deterministic, but validated native transport data is incomplete; the classic tier remains active",
+                               rounds=0, requests=0, budget=int(self.cfg["brain_budget_requests"]))
+
+            prior = self.store.read(rel, {}) or {}
+            capture_key = hashlib.sha256(jdump({"ids": [str(e.get("id")) for e in exs],
+                                                "scripts": sorted(o17_script_hash(str(s.get("text") or "")) for s in scripts)}).encode()).hexdigest()
+            if prior.get("capture_key") == capture_key and prior.get("status") in ("give_up", "needs_human", "budget", "refused", "native_unavailable"):
+                return prior  # don't repeatedly spend the account's budget on unchanged evidence
+            publish("investigating", "the captured protocol has unexplained parts; starting the bounded Brain investigation",
+                    capture_key=capture_key, rounds=0, requests=0, budget=int(self.cfg["brain_budget_requests"]))
+            brain = self.brain_for(aid, backend=self._classic_backend(a))
+            session = self.session(aid)
+            endpoint_exs = [e for e in exs if endpoint_key(e) == endpoint]
+            allowed_hosts = {host_of(e) for e in endpoint_exs if host_of(e)}
+            def experiment(kind: str, params: Dict[str, Any]) -> Dict[str, Any]:
+                loc = str(params.get("loc") or "")
+                expected = next((dict(request_locations(e)).get(loc) for e in reversed(endpoint_exs)
+                                 if loc in dict(request_locations(e))), None)
+                return o29_safe_experiment(recipe, session, kind, {**params, "expected": expected}, host, endpoint,
+                                           allowed_hosts, guard=self.native_guard,
+                                           allow_private=bool(a.get("private_ok")))
+            investigation = o26_investigate(brain, exs, scripts, host, endpoint, recipe_input_locs(recipe), experiment,
+                                            secrets_=secret_values_of(session), max_rounds=int(self.cfg["brain_max_rounds"]),
+                                            max_experiments=int(self.cfg["brain_max_experiments"]))
+            common = {"capture_key": capture_key, "rounds": int(investigation.get("rounds") or 0),
+                      "requests": int(investigation.get("requests") or 0), "experiments": int(investigation.get("experiments") or 0), "budget": int(self.cfg["brain_budget_requests"]),
+                      "investigation": str(investigation.get("outcome") or "")[:40]}
+            if investigation.get("outcome") != "spec" or not investigation.get("specs"):
+                status = str(investigation.get("outcome") or "give_up")
+                return publish(status, investigation.get("reason") or "investigation produced no validated spec", **common)
+
+            authored = o27_author(brain, investigation, exs, scripts, host, endpoint, recipe_input_locs(recipe))
+            common["requests"] += int(authored.get("requests") or 0)
+            common["drafts"] = int(authored.get("drafts") or 0)
+            if authored.get("outcome") != "modules":
+                o27_commit(self.store, host, authored, scripts, investigation["specs"], endpoint)
+                return publish(str(authored.get("outcome") or "refused"), authored.get("reason") or "module authoring was refused by its gates", **common)
+
+            review = o28_review(brain, authored, scripts, investigation["specs"], host)
+            common["requests"] += int(review.get("requests") or 0)
+            committed = o27_commit(self.store, host, authored, scripts, investigation["specs"], endpoint, review)
+            if committed.get("written") != "modules":
+                return publish("refused", "accepted modules were not committed", **common)
+            publish("modules_ready", "O27 gates passed; O8 alone decides whether direct serving is safe", **common,
+                    gates=[g.get("gate") for g in (authored.get("gate_log") or [{}])[-1].get("gates", [])][:12],
+                    review={"outcome": str(review.get("outcome") or "")[:40], "confirmed_defects": int(review.get("confirmed_defects") or 0)})
+            rows = self.o9_supervisor().tick()
+            row = next((r for r in rows if r.get("id") == aid), {})
+            st = lc_state(self.get(aid) or a)
+            if st == "stable_direct":
+                return publish("promoted", "O8 accepted the required independent validation runs", **common,
+                               validation=(self.store.read(f"site_modules/{hd}/validation.json", {}) or {}).get("promoted"))
+            return publish("validating", "modules are installed; O8 still requires independent passing runs", **common, supervisor=row)
+        except Exception as e:
+            reason = redact_evidence(f"{type(e).__name__}: {e}", 180)
+            log(f"o29 {aid} ({host}): {reason}", "warn")
+            return publish("failed", reason)
 
     def _safe_learned(self, aid: str) -> None:
         try:
@@ -17345,11 +17601,19 @@ class App:
         migrate(store, cfg, self.acc)
         self.engine = RoutingEngine(store, cfg, self.acc)
         self.router = Router(self.acc, cfg, self.engine)
-        self.acc.on_learned = lambda aid: self.router.discover_paste_signal(aid)      # no-op unless paste_discover is on
+        self.acc.on_learned = self._after_learn
         self.started = now()
         want = str(cfg["tokenizer"])
         if set_tokenizer(want) != want:                          # E3: an unknown plugin name is not fatal; the conservative built-in is used and the choice is visible in /api/context
             log(f"tokenizer '{want}' is not registered; using chars3", "warn")
+
+    def _after_learn(self, aid: str) -> None:
+        """Run opt-in paste discovery and O29 after the login job has released its browser profile."""
+        try:
+            self.router.discover_paste_signal(aid)
+        except Exception as e:
+            log(f"post-learn paste discovery skipped: {type(e).__name__}", "debug")
+        self.acc.o29_after_learn(aid)
 
 
 def pc_api_status() -> Dict[str, Any]:
@@ -18270,6 +18534,7 @@ else if(a.last_error&&a.state!=='ready'&&!run)h+=`<div class="err"><div class="m
 const det=[];if(j&&j.lines&&j.lines.length)det.push(`<div class="mut">${esc(t('last_lines'))}</div><pre class="mini">${esc(j.lines.slice(-8).join('\n'))}</pre>`);
 if(a.lifecycle)det.push(`<div class="ltr"><b>${esc(a.lifecycle.state)}</b> <span class="mut">${esc(a.lifecycle.reason)} · ${esc(new Date((a.lifecycle.at||0)*1000).toLocaleString())}</span></div>`);
 if(a.learn_budget)det.push(`<div class="mut ltr">learning used ${esc(a.learn_budget.used)}/${esc(a.learn_budget.limit)} requests`+(a.learn_budget.owner_explicit?` (+${esc(a.learn_budget.owner_explicit)} you ran by hand)`:'')+`</div>`);
+if(a.native_learning){const n=a.native_learning;det.push(`<div class="mut ltr">native path: ${esc(n.status||'unknown')}${n.rounds!=null?` · rounds ${esc(n.rounds)}`:''}${n.requests!=null?` · Brain requests ${esc(n.requests)}/${esc(n.budget??'?')}`:''}${n.reason?` · ${esc(n.reason)}`:''}</div>`)}
 det.push(`<div class="mut ltr">${a.requests||0}${a.inflight?' ('+a.inflight+' live)':''} ${esc(t('req'))} · ${a.fail||0} ${esc(t('fails'))}${a.ema_ms?' · '+(a.ema_ms/1000).toFixed(1)+'s avg':''}${a.health?(a.health.ok?' · '+esc(t('healthy')):' · '+esc(t('unhealthy'))):''}</div>`);
 h+=`<details data-id="${esc(a.id)}" ${openDet.has(a.id)?'open':''} ontoggle="togDet(this)"><summary>${esc(t('details'))}</summary>${det.join('')}</details>`;
 h+=`<div class="acts">`+(a.type=='api'?'':`<button class="sm" onclick="act(${escJ(a.id)},'relogin')">${esc(t('b_relogin'))}</button><button class="sm" onclick="act(${escJ(a.id)},'relearn')">${esc(t('b_relearn'))}</button>`+(a.tier=='direct'?'':`<button class="sm" onclick="recheckDirect(${escJ(a.id)})">${esc(t('b_recheck'))}</button>`))+
@@ -18786,6 +19051,38 @@ def run_selftest(quick: bool = False) -> int:
                 _, calls, _ = parse_tool_calls(txt, tools, "s")
                 self.assertEqual([c["name"] for c in calls], want, txt)
             self.assertEqual(parse_tool_calls("<tool_call>x</tool_call>", {}, "s")[1], [])                  # no tools -> text untouched
+
+    class TestStreamDecoder(unittest.TestCase):
+        def test_every_single_byte_split_matches_the_unsplit_stream(self) -> None:
+            samples = {
+                "sse": 'data: {"choices":[{"delta":{"content":"\u0633\u0644\u0627\u0645 \U0001F642"}}]}\r\n\r\ndata: [DONE]\n\n',
+                "ndjson": '{"text":"\u0633\u0644\u0627\u0645 \U0001F642"}\r\n{"text":"next"}',
+                "json": '{"text":"\u0633\u0644\u0627\u0645 \U0001F642","items":[1,2]}',
+                "text": "print('\u0633\u0644\u0627\u0645 \U0001F642')\r\n",
+            }
+            for fmt, sample in samples.items():
+                wire = sample.encode("utf-8")
+                expected = parse_events(fmt, sample)
+                for cut in range(len(wire) + 1):
+                    decoder = StreamDecoder(fmt)
+                    got = decoder.feed(wire[:cut]) + decoder.feed(wire[cut:]) + decoder.close()
+                    if fmt == "text":
+                        self.assertEqual("".join(got), sample, (fmt, cut))
+                    else:
+                        self.assertEqual(got, expected, (fmt, cut))
+
+        def test_one_byte_reads_preserve_utf8_and_flush_the_final_line(self) -> None:
+            for fmt, text in (("text", "\u067e\u0627\u0633\u062e\U0001F642"), ("sse", 'data: {"text":"\u067e\u0627\u0633\u062e\U0001F642"}')):
+                wire = text.encode("utf-8")
+                decoder = StreamDecoder(fmt)
+                events: List[Any] = []
+                for byte in wire:
+                    events.extend(decoder.feed(bytes([byte])))
+                events.extend(decoder.close())
+                if fmt == "text":
+                    self.assertEqual("".join(events), text)
+                else:
+                    self.assertEqual(events, [{"text": "\u067e\u0627\u0633\u062e\U0001F642"}])
 
     class TestRouterCore(unittest.TestCase):
         def setUp(self) -> None:
@@ -24389,6 +24686,43 @@ def run_selftest(quick: bool = False) -> int:
             self.n[0] += 1
             return f"bm{self.n[0]:08x}"
 
+        def test_o29_experiment_sends_one_synthetic_turn_with_only_the_requested_part_changed(self) -> None:
+            class Tx:
+                skip_headers: set = set()
+                def __init__(self) -> None: self.calls = []
+                def request(self, method: str, url: str, headers: Dict[str, str], body: Optional[bytes], timeout: float = 60):
+                    self.calls.append((method, url, dict(headers), body))
+                    return 200, {"content-type": "text/event-stream"}, iter([b'data: {"delta":"OK"}\\n\\n'])
+            recipe = {"chat": {"method": "POST", "url": "https://mock17.test/api/chat", "headers": {"x-proof": "observed"},
+                               "body_kind": "json", "body": {"prompt": "{{prompt}}", "proof": "captured"}},
+                      "stream": {"format": "sse", "text_paths": ["delta"], "cumulative": False, "ignore_values": []}}
+            tx = Tx()
+            result = o29_safe_experiment(recipe, {"cookies": [], "auth": {}}, "change_value",
+                {"loc": "body.$.proof", "expected": "captured"}, self.HOST, "POST /api/chat", {"mock17.test"},
+                transport=tx, guard=lambda u: u)
+            self.assertTrue(result["accepted"], result)
+            self.assertEqual(result["requests"], 1)
+            self.assertEqual(len(tx.calls), 1)
+            sent = json.loads(tx.calls[0][3].decode())
+            self.assertEqual(sent, {"prompt": "Reply with exactly the word OK.", "proof": "bridge-o29-invalid"})
+            self.assertNotIn("captured", tx.calls[0][3].decode())
+
+        def test_o29_experiment_refuses_setup_and_uncaptured_hosts_without_sending(self) -> None:
+            class Tx:
+                skip_headers: set = set()
+                calls = 0
+                def request(self, *args: Any, **kwargs: Any): self.calls += 1; raise AssertionError("must not send")
+            base = {"chat": {"method": "POST", "url": "https://mock17.test/api/chat", "headers": {}, "body_kind": "json", "body": {"prompt": "{{prompt}}"}},
+                    "stream": {"format": "sse", "text_paths": ["delta"], "cumulative": False, "ignore_values": []}}
+            tx = Tx()
+            setup = o29_safe_experiment(dict(base, pre=[{}]), {}, "omit_header", {"loc": "header.x"}, self.HOST,
+                "POST /api/chat", {"mock17.test"}, transport=tx, guard=lambda u: u)
+            self.assertFalse(setup["accepted"])
+            other = o29_safe_experiment(base, {}, "omit_header", {"loc": "header.x"}, self.HOST,
+                "POST /api/chat", {"other.test"}, transport=tx, guard=lambda u: u)
+            self.assertFalse(other["accepted"])
+            self.assertEqual(tx.calls, 0)
+
         def client(self, site: "TestGroupO8.Site", **kw: Any) -> NativeClient:
             return NativeClient(self.loaded, "POST /api/chat", self.STREAM, "body.$.prompt", conv_loc="body.$.conversation_id", conv_path="conv", http=site.http, guard=lambda u: u, clock=self.tick, **kw)
 
@@ -25071,6 +25405,30 @@ def run_selftest(quick: bool = False) -> int:
             self.assertIsInstance(p["refresher"], O9Refresher)
             self.assertTrue(callable(p["relearn"]))
             self.assertIs(self.acc.o8_parts(a)[0], p)                                               # cached: the refresher keeps its expiry between ticks
+
+        def test_o29_after_learn_starts_the_o8_gate_and_publishes_bounded_progress(self) -> None:
+            a = self.account()
+            exs, scripts = self.o8.exs, self.o8.f.scripts()
+            CaptureStore(self.store, self.HOST).add_run("login+learn", json.loads(json.dumps(exs)))
+            store_served(self.store, self.HOST, scripts)
+            analysis = o17_analyze(exs, self.HOST, scripts, [self.o8.f.sig_spec(), self.o8.f.pow_spec()],
+                                   endpoint="POST /api/chat", input_locs=("body.$.prompt", "body.$.conversation_id"))
+            self.store.write(f"analysis/{safe_host_dir(self.HOST)}/o17.json", analysis, private=True)
+            self.modules()
+            calls: List[str] = []
+
+            class Supervisor:
+                def tick(inner_self) -> List[Dict[str, Any]]:
+                    calls.append("tick")
+                    return [{"id": "a1", "state": "validating", "did": ["o8:pending"]}]
+
+            self.acc.o9_supervisor = lambda: Supervisor()                                # type: ignore[assignment]
+            result = self.acc.o29_after_learn("a1")
+            self.assertEqual((result["status"], calls), ("validating", ["tick"]))
+            self.assertEqual(result["supervisor"]["did"], ["o8:pending"])
+            public = next(x for x in self.acc.public() if x["id"] == "a1")
+            self.assertEqual(public["native_learning"]["status"], "validating")
+            self.assertNotIn("token", json.dumps(public["native_learning"]).lower())
             self.store.write(f"recipes/{self.HOST}.json", {"host": self.HOST, "continuity": True, "tier": "page", "version": 1, "unresolved": ["y"]})
             self.assertIsNone(self.acc.o8_parts(a)[0])
             self.modules(native={**self.NATIVE, "conv_loc": "", "conv_path": ""})                     # the protocol needs the conversation input but the native data has none
@@ -26309,6 +26667,37 @@ setTimeout(() => process.exit(0), 60000);
             ctx = dict(request_locations(self.exs[1]))
             self.assertEqual(ld["tokens"]["header.x-sig"]({k: v for k, v in ctx.items() if k != "header.x-sig"}), ctx["header.x-sig"])
 
+        def test_o27_commit_preserves_compatible_native_data_for_the_o8_battery(self) -> None:
+            br, _ = self.brain({"o27_author": {"tokens_py": self.good()}})
+            result = self.go(br)
+            self.tmp, store, _, _ = mk_env()
+            native = {"stream": {"format": "sse", "text_paths": ["$.choices.0.delta.content"]},
+                      "prompt_loc": "body.$.prompt", "conv_loc": "", "conv_path": ""}
+            seeded = o18_run(store, self.h.HOST, self.exs, self.scripts, [self.o26["specs"][0]],
+                             ("body.$.prompt",), "POST /api/chat", native=native)
+            self.assertTrue(seeded["ok"], seeded)
+            self.assertTrue(o18_load(store, self.h.HOST, self.scripts).get("native"))
+            saved = o27_commit(store, self.h.HOST, result, self.scripts, self.o26["specs"], "POST /api/chat")
+            self.assertEqual(saved["written"], "modules")
+            loaded = o18_load(store, self.h.HOST, self.scripts)
+            self.assertTrue(loaded["use"], loaded)
+            self.assertEqual((loaded["native"]["prompt_loc"], loaded["native"]["stream"]["format"]), (native["prompt_loc"], "sse"))
+
+        def test_o27_commit_rejects_endpoint_mismatch_without_replacing_the_live_set(self) -> None:
+            br, _ = self.brain({"o27_author": {"tokens_py": self.good()}})
+            result = self.go(br)
+            self.tmp, store, _, _ = mk_env()
+            native = {"stream": {"format": "sse", "text_paths": ["$.choices.0.delta.content"]},
+                      "prompt_loc": "body.$.prompt", "conv_loc": "", "conv_path": ""}
+            self.assertTrue(o18_run(store, self.h.HOST, self.exs, self.scripts, [self.o26["specs"][0]],
+                                    ("body.$.prompt",), "POST /api/chat", native=native)["ok"])
+            refused = o27_commit(store, self.h.HOST, result, self.scripts, self.o26["specs"], "POST /api/other")
+            self.assertEqual(refused["written"], "refused")
+            loaded = o18_load(store, self.h.HOST, self.scripts)
+            self.assertTrue(loaded["use"], loaded)
+            self.assertEqual(loaded["manifest"]["endpoint"], "POST /api/chat")
+            self.assertTrue(loaded["native"])
+
         def test_o27_quality_rules_each_have_a_stable_name(self) -> None:
             cases = {
                 "bare-except": 'def run_it(ctx: dict[str, str]) -> str:\n    """Doc."""\n    try:\n        return ctx["a"]\n    except:\n        raise ValueError("x")\n',
@@ -27231,7 +27620,7 @@ setTimeout(() => process.exit(0), 60000);
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
 
-    all_cases = (TestFixes725, TestResolver, TestHashing, TestRouterCore, TestHTTP, TestPersistence, TestSecurityHelpers, TestApiBackend, TestCatalog, TestRouting, TestResolutionCatalog,
+    all_cases = (TestFixes725, TestResolver, TestHashing, TestStreamDecoder, TestRouterCore, TestHTTP, TestPersistence, TestSecurityHelpers, TestApiBackend, TestCatalog, TestRouting, TestResolutionCatalog,
                  TestErrorsAndLimits, TestTaskStateAndFailover, TestContextEngine, TestSubmission, TestGroupO, TestGroupOSetup, TestGroupOCapture, TestGroupO5, TestGroupO17, TestGroupO18, TestGroupO19, TestGroupO8, TestGroupO9, TestGroupO9Supervisor, TestGroupO827, TestGroupO827b, TestGroupO21Link, TestGroupO14, TestGroupO13, TestGroupO15, TestGroupO25, TestGroupO26, TestGroupO27, TestGroupO28, TestReportInSync, TestFixes732, TestGroupO12Dash, TestGroupO11, TestLogFile, TestAccessAndDashboardLog, TestPersonalChrome, TestQuickSmoke)
     only = os.environ.get("BRIDGE_SELFTEST_ONLY", "")             # lean workflow (section 0A): BRIDGE_SELFTEST_ONLY=TestSubmission,TestContextEngine runs just those classes
     for case in ((TestQuickSmoke,) if quick else tuple(c for c in all_cases if not only or c.__name__ in only.split(","))):
