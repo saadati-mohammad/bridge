@@ -163,7 +163,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.48"
+VERSION = "7.49"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -24025,8 +24025,20 @@ def run_selftest(quick: bool = False) -> int:
                     import_bundle(out / "enc.bin", out / "enc_none")
                 self.assertGreater(import_bundle(out / "enc.bin", out / "enc_ok", "correct horse")["files"], 0)
             else:
-                with self.assertRaises(BridgeError):                                         # no home-made crypto: a passphrase is refused without the vetted library
-                    export_bundle(self.tmp, out / "enc.bin", "pw")
+                from unittest import mock
+                old_home = globals()["HOME"]
+                isolated_home = out / "app-home"
+                globals()["HOME"] = isolated_home
+                try:
+                    with mock.patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "offline")) as installer:
+                        with self.assertRaises(BridgeError) as cm:
+                            export_bundle(self.tmp, out / "enc.bin", "pw")
+                    self.assertEqual(cm.exception.kind, "setup")                       # auto-install is attempted locally and fails closed when offline
+                    cmd = installer.call_args.args[0]
+                    self.assertIn("--target", cmd)
+                    self.assertEqual(cmd[cmd.index("--target") + 1], str(isolated_home / "tools" / "python"))
+                finally:
+                    globals()["HOME"] = old_home
 
         def test_o10_doctor_command_prints_a_line_per_account_and_changes_nothing(self) -> None:
             import contextlib, io
