@@ -163,7 +163,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.50"
+VERSION = "7.51"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -18205,6 +18205,27 @@ class Handler(BaseHTTPRequestHandler):
         parts = path.split("/")[2:]
         if path == "/api/personal-chrome" and method == "GET":
             return self._json(200, pc_api_status())
+        if path == "/api/personal-chrome/setup" and method == "POST":
+            hub_ = pc_hub(app.store.home)
+            ext_ = pc_extract(hub_.root)["path"]
+            code_ = hub_.new_pairing()
+            chrome_opened_ = folder_opened_ = False
+            try:
+                chrome_opened_ = bool(webbrowser.open_new_tab("chrome://extensions"))
+            except Exception as e:
+                log(f"personal chrome setup: could not open extensions page: {type(e).__name__}", "warn")
+            try:
+                if os.name == "nt":
+                    os.startfile(str(ext_))  # type: ignore[attr-defined]
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", str(ext_)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    subprocess.Popen(["xdg-open", str(ext_)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                folder_opened_ = True
+            except Exception as e:
+                log(f"personal chrome setup: could not open extension folder: {type(e).__name__}", "warn")
+            return self._json(200, {"code": code_, "port": hub_.port, "valid_seconds": 600, "extension_dir": str(ext_),
+                                    "chrome_page_opened": chrome_opened_, "folder_opened": folder_opened_, "instructions": pc_instructions(hub_)})
         if path == "/api/personal-chrome/pair" and method == "POST":                     # a new one-time code; the existing pairing stays valid until a new one succeeds
             hub_ = pc_hub(app.store.home)
             return self._json(200, {"code": hub_.new_pairing(), "port": hub_.port, "valid_seconds": 600, "instructions": pc_instructions(hub_)})
@@ -18620,6 +18641,11 @@ ol.steps li.bad i{background:var(--bad);border-color:var(--bad);color:#fff}ol.st
 <nav id="nav"></nav>
 <main>
 <div class="view on" id="v_accounts">
+<div class="card" id="pcsetup"><h2 data-i="pc_title"></h2><p class="mut" data-i="pc_intro"></p>
+<div class="row" style="margin-top:8px"><button class="p" id="pc_start" onclick="startPcSetup()" data-i="pc_start"></button><span id="pc_state" class="mut"></span></div>
+<div id="pc_steps" hidden><ol class="steps"><li class="done"><i>1</i><br><span data-i="pc_step1"></span></li><li><i>2</i><br><span data-i="pc_step2"></span></li><li><i>3</i><br><span data-i="pc_step3"></span></li></ol>
+<div class="att"><b data-i="pc_code_label"></b> <code class="ltr" id="pc_code"></code> <button class="sm" onclick="copyPcCode()" data-i="pc_copy"></button><br><span class="mut" data-i="pc_code_note"></span></div>
+<p class="mut"><span data-i="pc_port_label"></span> <code class="ltr" id="pc_port"></code></p><p class="mut"><span data-i="pc_folder_label"></span> <code class="ltr" id="pc_folder"></code></p><p class="mut" data-i="pc_security"></p><a href="chrome://extensions" target="_blank" rel="noreferrer" data-i="pc_open_link"></a></div></div>
 <div class="card"><h2 data-i="add_title"></h2>
 <div class="row" style="margin-top:0"><select id="preset"></select><input id="url" class="ltr" data-ph="url_ph" oninput="urlPrev()"><input id="label" data-ph="label_ph"><button class="p" onclick="addAcc()" data-i="add_btn"></button></div>
 <p class="mut" id="urlprev" style="margin:6px 0 0"></p><p class="mut" id="urlhint" style="margin:6px 0 0" data-i="add_hint"></p>
@@ -18680,6 +18706,7 @@ const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>
 const L={en:{
 accounts:'Accounts',connect:'Connect tools',keys:'API keys',sites:'Learned sites',settings:'Settings',advanced:'Advanced',log:'Log',
 add_title:'Add an account',add_btn:'Add account (opens browser)',url_ph:'chat.example.com',label_ph:'name (optional)',preset:'Choose a site…',
+pc_title:'Connect your own Chrome (one-time setup)',pc_intro:'Make the bridge work with your normal Chrome profile. This guided setup opens the extension page and the extension folder, then gives you a one-time pairing code.',pc_start:'Set up Chrome connection',pc_step1:'Enable Developer mode and choose “Load unpacked”.',pc_step2:'Select the opened “extension” folder.',pc_step3:'Open the extension toolbar icon and enter the port and code.',pc_code_label:'One-time pairing code:',pc_code_note:'Valid for 10 minutes. Keep it private; it can only pair this local bridge.',pc_copy:'Copy code',pc_port_label:'Bridge port:',pc_folder_label:'Extension folder:',pc_security:'Chrome requires you to approve loading this local extension yourself. The bridge cannot silently install extensions into a personal Chrome profile.',pc_open_link:'Open Chrome extensions page again',pc_opening:'Preparing the extension and opening the setup windows…',pc_ready:'Setup is ready. Complete the three steps above in Chrome.',pc_error:'Could not prepare setup: ',pc_copied:'Copied.',
 add_hint:'A browser window opens once so YOU can log in. The bridge then learns how the site works. Keep that window open until the card turns Ready.',
 api_title:'…or add an official API account instead',api_btn:'Add API account',no_acc:'No accounts yet - add one above.',
 connect_title:'Connect your tools',key_used:'key used in the snippet',key_create:'Create key',klabel_ph:'label e.g. cursor',key_pin:'Pin a key to an account to force that provider for the tool using it.',
@@ -18704,6 +18731,7 @@ c_copy:'Copy',c_revoke:'Revoke',docs:'Docs',tool:'Tool',export:'Export',forget:'
 cf_rm:'Remove this account and its browser profile?',cf_forget:'Forget the learned recipe for this site? It will be re-learned on next login.'
 },fa:{
 accounts:'حساب‌ها',connect:'اتصال ابزارها',keys:'کلیدهای API',sites:'سایت‌های یادگرفته‌شده',settings:'تنظیمات',advanced:'پیشرفته',log:'گزارش',
+pc_title:'اتصال Chrome شخصی (راه‌اندازی یک‌باره)',pc_intro:'برنامه را به پروفایل معمول Chrome شما وصل می‌کند. این راهنما صفحه‌ی افزونه‌ها و پوشه‌ی افزونه را باز می‌کند و کد یک‌بارمصرف اتصال را می‌دهد.',pc_start:'راه‌اندازی اتصال Chrome',pc_step1:'Developer mode را روشن کنید و «Load unpacked» را بزنید.',pc_step2:'پوشه‌ی بازشده‌ی «extension» را انتخاب کنید.',pc_step3:'آیکن افزونه در نوار Chrome را باز و پورت و کد را وارد کنید.',pc_code_label:'کد یک‌بارمصرف اتصال:',pc_code_note:'۱۰ دقیقه اعتبار دارد. آن را خصوصی نگه دارید؛ فقط برای اتصال همین bridge محلی است.',pc_copy:'کپی کد',pc_port_label:'درگاه اتصال برنامه:',pc_folder_label:'پوشه‌ی افزونه:',pc_security:'Chrome لازم می‌داند بارگذاری این افزونه‌ی محلی را خودتان تأیید کنید. برنامه نمی‌تواند افزونه را بی‌صدا در پروفایل شخصی نصب کند.',pc_open_link:'باز کردن دوباره‌ی صفحه‌ی افزونه‌های Chrome',pc_opening:'در حال آماده‌سازی افزونه و باز کردن پنجره‌های راه‌اندازی…',pc_ready:'راه‌اندازی آماده است. سه مرحله‌ی بالا را در Chrome انجام دهید.',pc_error:'آماده‌سازی راه‌اندازی انجام نشد: ',pc_copied:'کپی شد.',
 add_title:'افزودن حساب',add_btn:'افزودن حساب (مرورگر باز می‌شود)',url_ph:'chat.example.com',label_ph:'نام (اختیاری)',preset:'انتخاب سایت…',
 add_hint:'یک پنجره‌ی مرورگر باز می‌شود تا خودتان وارد شوید. سپس برنامه روش کار سایت را یاد می‌گیرد. تا وقتی کارت «آماده» نشده پنجره را نبندید.',
 api_title:'…یا به‌جای آن یک حساب API رسمی اضافه کنید',api_btn:'افزودن حساب API',no_acc:'هنوز حسابی نیست؛ از بالا اضافه کنید.',
@@ -18818,6 +18846,8 @@ if(!$('preset').options.length){$('preset').innerHTML='<option value="">'+esc(t(
 if(view=='log'||!$('log').textContent){const lg=await api('log');const hide=$('hidetech').checked;let ls=lg.lines;if(hide)ls=ls.filter(l=>!/ DEBUG /.test(l)).map(l=>String(l).split('\n')[0]);const el=$('log'),atEnd=el.scrollTop+el.clientHeight>=el.scrollHeight-20;el.textContent=(lg.file?'Log file: '+lg.file+'\n':'')+ls.join('\n');if(atEnd)el.scrollTop=el.scrollHeight}
 render();renderCtx();renderO12()}catch(e){$('st').textContent='disconnected'}finally{busy=false}}
 async function addAcc(){const url=$('url').value.trim();if(!url)return alert(t('url_ph'));try{await api('accounts','POST',{url,label:$('label').value.trim()});$('url').value='';$('label').value='';$('urlprev').textContent='';tick()}catch(e){alert(errMsg(e))}}
+async function startPcSetup(){const b=$('pc_start'),s=$('pc_state');b.disabled=true;s.textContent=t('pc_opening');try{const r=await api('personal-chrome/setup','POST',{});$('pc_code').textContent=r.code;$('pc_port').textContent=r.port;$('pc_folder').textContent=r.extension_dir;$('pc_steps').hidden=false;s.textContent=t('pc_ready')+(r.chrome_page_opened&&r.folder_opened?'':' · '+(r.chrome_page_opened?'':'Chrome page did not open automatically; use the link.'))}catch(e){s.textContent=t('pc_error')+errMsg(e)}finally{b.disabled=false}}
+async function copyPcCode(){try{await navigator.clipboard.writeText($('pc_code').textContent);$('pc_state').textContent=t('pc_copied')}catch(e){$('pc_state').textContent=$('pc_code').textContent}}
 let _up=0;async function urlPrev(){const v=$('url').value.trim(),el=$('urlprev'),my=++_up;if(!v){el.textContent='';return}try{const r=await api('sites/normalize','POST',{input:v});if(my===_up)el.textContent='→ '+r.open_url+'  ·  '+r.identity_host+(r.notes.length?'  ·  '+r.notes.join('; '):'')}catch(e){if(my===_up)el.textContent='✘ '+errMsg(e)}}
 function errMsg(e){let m=e.message;try{const j=JSON.parse(m);const x=j.error;m=typeof x==='string'?x:((x&&x.message)||m)}catch(_){}return m}
 async function jobDone(id){await api('jobs/'+id+'/done','POST');tick()}
@@ -27827,6 +27857,19 @@ setTimeout(() => process.exit(0), 60000);
                 st, _h, b = call(port, "POST", "/api/personal-chrome/pair", body={}, headers=H)
                 self.assertEqual(st, 200)
                 self.assertEqual(len(json.loads(b)["code"]), 8)
+                from unittest import mock
+                with mock.patch("webbrowser.open_new_tab", return_value=True) as open_page, mock.patch("os.startfile", create=True) as open_folder:
+                    st, _h, b = call(port, "POST", "/api/personal-chrome/setup", body={}, headers=H)
+                setup = json.loads(b)
+                self.assertEqual(st, 200)
+                self.assertEqual(len(setup["code"]), 8)
+                self.assertTrue(setup["chrome_page_opened"] and setup["folder_opened"])
+                self.assertTrue(Path(setup["extension_dir"], "manifest.json").is_file())
+                open_page.assert_called_once_with("chrome://extensions")
+                open_folder.assert_called_once_with(setup["extension_dir"])
+                self.assertNotIn(setup["code"], json.dumps(pc_api_status()))
+                self.assertIn("pc_start", DASHBOARD_HTML)
+                self.assertIn("pc_security", DASHBOARD_HTML)
             finally:
                 globals()["PC_HUB"] = old_hub
                 srv.shutdown()
