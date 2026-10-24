@@ -164,7 +164,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.39"
+VERSION = "7.40"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -12097,6 +12097,39 @@ def native_data_from_recipe(recipe: Any, exs: Optional[List[Dict[str, Any]]] = N
     return nat, tuple(x for x in (locs[0], conv_loc) if x), ""
 
 
+def o18_attach_native_from_recipe(store: "Store", host: str, recipe: Any, exs: List[Dict[str, Any]], scripts: List[Dict[str, Any]],
+                                  session: Optional[Dict[str, Any]], endpoint: str, specs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Attach independently derived transport data to a validated module set; never guess or rewrite token code."""
+    if validate_recipe(recipe) is not None or (recipe.get("host") and recipe.get("host") != host):
+        return {"ok": False, "reason": "the stored classic recipe is invalid or belongs to another host"}
+    loaded = o18_load(store, host, scripts)
+    if not loaded.get("use") or loaded.get("source") != "current":
+        return {"ok": False, "reason": "the committed module set is not current and hash-validated"}
+    manifest = loaded.get("manifest") or {}
+    if str(manifest.get("endpoint") or "") != str(endpoint):
+        return {"ok": False, "reason": "the committed module endpoint does not match the learned chat endpoint"}
+    if not manifest.get("validated_at"):
+        return {"ok": False, "reason": "the committed modules have no successful validation record"}
+    native, _locs, why = native_data_from_recipe(recipe, exs, session)
+    if native is None:
+        return {"ok": False, "reason": why or "native transport data could not be derived from the recipe"}
+    proto = loaded.get("protocol") or {}
+    clean, why = o18_native_clean(native, proto.get("INPUTS"))
+    if clean is None:
+        return {"ok": False, "reason": why}
+    current = _o18_read_set(store, f"site_modules/{safe_host_dir(host)}")
+    if not current or current.get("error") or current.get("man") != manifest:
+        return {"ok": False, "reason": "the validated module files changed while native data was being attached"}
+    files = dict(current["files"])
+    files[O18_NATIVE_FILE] = json.dumps(clean, sort_keys=True, indent=1)
+    scenarios = manifest.get("scenarios") or {}
+    o18_write(store, host, files, {"ok": True, "scenarios": scenarios.get("captures", 0), "passed": scenarios.get("passed", 0)}, scripts, specs, endpoint)
+    verified = o18_load(store, host, scripts)
+    if not verified.get("use") or not verified.get("native"):
+        return {"ok": False, "reason": verified.get("native_problem") or "the attached native descriptor did not pass reload validation"}
+    return {"ok": True, "reason": "native transport descriptor derived from the validated classic recipe"}
+
+
 def o18_from_analysis(store: "Store", host: str, exs: List[Dict[str, Any]], scripts: List[Dict[str, Any]], endpoint: Optional[str], o17: Dict[str, Any], session: Optional[Dict[str, Any]], specs: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """7.27: the live link O17 -> O18: only when O17 says `direct_candidate` and the recipe carries the native data, the module set is generated, validated on the captures and written together with
     `native.json`. Deterministic, no model, no site request; never raises. The result is NOT stable_direct (O8 decides that)."""
@@ -13412,6 +13445,11 @@ class Accounts:
             committed = o27_commit(self.store, host, authored, scripts, investigation["specs"], endpoint, review)
             if committed.get("written") != "modules":
                 return publish("refused", "accepted modules were not committed", **common)
+            current = o18_load(self.store, host, scripts)
+            if not (current.get("use") and current.get("native")):
+                attached = o18_attach_native_from_recipe(self.store, host, recipe, exs, scripts, session, endpoint, investigation["specs"])
+                if not attached.get("ok"):
+                    return publish("native_unavailable", attached.get("reason") or "native transport data is unavailable", **common)
             publish("modules_ready", "O27 gates passed; O8 alone decides whether direct serving is safe", **common,
                     gates=[g.get("gate") for g in (authored.get("gate_log") or [{}])[-1].get("gates", [])][:12],
                     review={"outcome": str(review.get("outcome") or "")[:40], "confirmed_defects": int(review.get("confirmed_defects") or 0)})
@@ -25463,6 +25501,11 @@ def run_selftest(quick: bool = False) -> int:
 
         def test_o29_reports_native_unavailable_instead_of_validating_when_o8_skips(self) -> None:
             a = self.account()
+            recipe = {"host": self.HOST, "tier": "page", "continuity": False, "version": 1,
+                      "chat": {"method": "POST", "url": "https://mock17.test/api/chat", "body_kind": "json", "body": {"prompt": "{{prompt}}", "model": "m-fast"}},
+                      "stream": TestGroupO8.STREAM}
+            self.store.write(f"recipes/{self.HOST}.json", recipe)
+            self.modules(native=None)
             exs = json.loads(json.dumps(self.o8.exs))
             scripts = self.o8.f.scripts()
             for i, ex in enumerate(exs):
@@ -25623,6 +25666,28 @@ def run_selftest(quick: bool = False) -> int:
             r2 = run_site_analysis(store, cfg, "signed.mock5.test", "mock5.test", scripts=[], storages=[])
             self.assertEqual(r2["o18_status"], "skipped")                                           # a signed header stays on the page tier: no modules, no native data
             self.assertFalse(o18_load(store, "signed.mock5.test")["use"])
+
+        def test_validated_brain_modules_can_receive_only_recipe_derived_native_transport_data(self) -> None:
+            tmp, store, _cfg, _app = mk_env()
+            self.addCleanup(shutil.rmtree, tmp, True)
+            o5 = TestGroupO5("test_o5_static_site_reaches_direct_candidate")
+            exs = o5.site_static()
+            endpoint, locs = "POST /api/chat", ("body.$.prompt",)
+            generated = o18_run(store, self.HOST, exs, [], [], locs, endpoint, native=None)
+            self.assertTrue(generated.get("ok"), generated)
+            store.write(f"recipes/{self.HOST}.json", self.RECIPE)
+            before = o18_load(store, self.HOST, [])
+            self.assertTrue(before.get("use"), before)
+            self.assertIsNone(before.get("native"))
+            attached = o18_attach_native_from_recipe(store, self.HOST, self.RECIPE, exs, [], {"cookies": [], "auth": {}, "ua": ""}, endpoint, [])
+            self.assertTrue(attached.get("ok"), attached)
+            after = o18_load(store, self.HOST, [])
+            self.assertTrue(after.get("use"), after)
+            self.assertEqual((after["native"]["prompt_loc"], after["native"]["stream"]["format"]), ("body.$.prompt", "sse"))
+            self.assertIn(O18_NATIVE_FILE, after["manifest"]["modules"])
+            mismatch = o18_attach_native_from_recipe(store, self.HOST, self.RECIPE, exs, [], None, "POST /api/other", [])
+            self.assertFalse(mismatch["ok"])
+            self.assertIn("endpoint", mismatch["reason"])
 
         def test_the_refresh_spec_comes_from_the_captured_renewal_and_stores_placeholders_only(self) -> None:
             ex = {"id": "r1", "method": "POST", "url": "https://mock5.test/auth/refresh", "status": 200, "req_headers": [], "resp_headers": [], "set_cookies": [],
