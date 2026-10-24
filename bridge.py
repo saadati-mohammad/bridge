@@ -163,7 +163,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.47"
+VERSION = "7.48"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -3658,11 +3658,24 @@ def ensure_playwright() -> None:
 
 
 def _ensure_playwright_legacy() -> None:
+    # Explicit legacy opt-in only. Keep Python packages and downloaded browsers app-local.
+    tool_root = HOME / "tools" / "python"
+    browser_root = HOME / "tools" / "playwright-browsers"
+    tool_root.mkdir(parents=True, exist_ok=True)
+    browser_root.mkdir(parents=True, exist_ok=True)
+    if str(tool_root) not in sys.path:
+        sys.path.insert(0, str(tool_root))
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browser_root)
     try:
         __import__("playwright.sync_api")
     except ImportError:
-        log("installing playwright (one time)...", "warn")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "playwright"])
+        log("preparing the optional Playwright runtime in the application data folder", "info")
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-warn-script-location", "--target", str(tool_root), "playwright==1.64.1"], capture_output=True, text=True, timeout=600)
+        if r.returncode:
+            raise BridgeError("could not prepare the app-local Playwright runtime: " + redact_evidence(r.stderr, 300), "setup", 502)
+        import importlib
+        importlib.invalidate_caches()
+        __import__("playwright.sync_api")
     # make sure a browser exists (system Chrome/Edge is preferred, otherwise download Chromium once)
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
@@ -3674,7 +3687,10 @@ def _ensure_playwright_legacy() -> None:
             except Exception:
                 continue
     log("downloading Chromium (one time)...", "warn")
-    subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+    # Browser downloads are app-local and version-coupled to the pinned Python package.
+    r = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], capture_output=True, text=True, timeout=900, env=dict(os.environ, PYTHONPATH=str(tool_root)))
+    if r.returncode:
+        raise BridgeError("could not prepare the app-local Playwright Chromium runtime: " + redact_evidence(r.stderr, 300), "setup", 502)
 
 
 class AccountBrowser:
@@ -6214,15 +6230,39 @@ def _bundle_skip(rel: str, include_profiles: bool) -> bool:
     return top == "backups" or rel.endswith(".tmp") or ".corrupt-" in rel or (top == "profiles" and not include_profiles)
 
 
+def _ensure_local_python_package(import_name: str, requirement: str, timeout: int = 600) -> Path:
+    """Load an exact-pinned optional package from bridge_data; never mutate system site-packages."""
+    import importlib
+    target = HOME / "tools" / "python"
+    target.mkdir(parents=True, exist_ok=True)
+    if str(target) not in sys.path:
+        sys.path.insert(0, str(target))
+    importlib.invalidate_caches()
+    try:
+        importlib.import_module(import_name)
+        return target
+    except ImportError:
+        pass
+    log(f"preparing optional dependency {requirement} in the application data folder", "info")
+    try:
+        proc = subprocess.run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-warn-script-location", "--target", str(target), requirement], capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise BridgeError(f"automatic local setup of {requirement} failed: {type(e).__name__}", "setup", 502)
+    if proc.returncode:
+        raise BridgeError(f"automatic local setup of {requirement} failed: " + redact_evidence(proc.stderr, 300), "setup", 502)
+    importlib.invalidate_caches()
+    try:
+        importlib.import_module(import_name)
+    except ImportError as e:
+        raise BridgeError(f"{requirement} was downloaded but cannot be loaded: {type(e).__name__}", "setup", 502)
+    return target
+
+
 def export_bundle(home: Path, dest: Path, passphrase: str = "", include_profiles: bool = True) -> Dict[str, Any]:
-    """O10: the data folder as one file. It holds secrets (sessions, cookies). With a passphrase it is encrypted by a vetted library (`cryptography`, Fernet + PBKDF2) if installed;
-    if the library is missing a passphrase is REFUSED - the bridge never invents its own crypto - and an unencrypted bundle must be kept private by the owner."""
+    """O10: the data folder as one file. Encrypted bundles use vetted, exact-pinned cryptography installed locally on first use."""
     import io, zipfile
     if passphrase:
-        try:
-            import cryptography  # noqa: F401
-        except ImportError:
-            raise BridgeError("encryption needs the 'cryptography' package (pip install cryptography). Without it the bundle can only be exported UNENCRYPTED: keep it private.", "client", 400)
+        _ensure_local_python_package("cryptography", "cryptography==50.0.2")
     buf = io.BytesIO()
     n = 0
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -6256,12 +6296,13 @@ def import_bundle(bundle: Path, dest: Path, passphrase: str = "") -> Dict[str, A
         if not passphrase:
             raise BridgeError("this bundle is encrypted; a passphrase is needed", "client", 400)
         try:
+            _ensure_local_python_package("cryptography", "cryptography==50.0.2")
             import base64
             from cryptography.fernet import Fernet, InvalidToken
             from cryptography.hazmat.primitives import hashes
             from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
         except ImportError:
-            raise BridgeError("this bundle is encrypted and the 'cryptography' package is not installed", "client", 400)
+            raise BridgeError("the encrypted bundle dependency could not be loaded after automatic local setup", "setup", 502)
         salt, tok = raw[len(BUNDLE_MAGIC):len(BUNDLE_MAGIC) + 16], raw[len(BUNDLE_MAGIC) + 16:]
         key = base64.urlsafe_b64encode(PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600000).derive(passphrase.encode("utf-8")))
         try:
@@ -18609,9 +18650,7 @@ ol.steps li.bad i{background:var(--bad);border-color:var(--bad);color:#fff}ol.st
 <p class="mut ltr" id="home"></p></div></div>
 
 <div class="view" id="v_adv">
-<div class="card" id="toolcard"><h2>Site analysis &amp; tools</h2>
-<p class="mut" style="margin:0 0 14px" data-i="adv_hint"></p>
-<div id="tool_state" class="ltr" style="display:flex;align-items:center;gap:10px;padding:14px 16px;border:1px solid var(--line);border-radius:12px;background:var(--card);min-height:42px"><span id="tool_dot" aria-hidden="true" style="width:10px;height:10px;flex:0 0 10px;border-radius:50%;background:#98a2b3;box-shadow:0 0 0 4px #98a2b322"></span><span><strong id="tool_title" style="display:block"></strong><span id="tool_detail" class="mut" style="display:block;margin-top:3px"></span></span></div>
+<div class="card" id="analysiscard"><h2>Site analysis</h2>
 <div class="row"><input id="rep_host" class="ltr" placeholder="chat.example.com"><button id="rep_show" class="sm" data-i="rep_show"></button></div><pre id="rep_out" class="mut" style="display:none"></pre></div>
 <div class="card" id="dircard"><h2>Site directory</h2><div id="dir_meta" class="mut"></div>
 <div class="row"><input id="dir_q" placeholder="search" oninput="renderDir()"><select id="dir_cat" onchange="renderDir()"><option value="">all categories</option></select></div>
@@ -18646,7 +18685,7 @@ api_title:'…or add an official API account instead',api_btn:'Add API account',
 connect_title:'Connect your tools',key_used:'key used in the snippet',key_create:'Create key',klabel_ph:'label e.g. cursor',key_pin:'Pin a key to an account to force that provider for the tool using it.',
 th_site:'Site',th_tier:'Mode',th_mem:'Chat memory',import:'Import recipe',
 s_cont:"Reuse the site's own chat memory (send only new messages)",s_sum:'Summarize old history with the model instead of cutting it',s_tool:'Tool description limit (chars)',s_sys:'System prompt limit (chars)',s_res:'Tool result limit (chars)',s_his:'History limit (chars)',s_hc:'Health check every (min, 0 = off)',s_cache:'Cache identical requests (s, 0 = off)',s_idle:'Close idle browser after (s)',
-adv_hint:"The bridge checks for its pinned analysis tools at startup and installs missing components into its own data folder. No manual setup is needed; site captures are analysed locally.",tool_auto:'Automatic setup',tool_ready:'Analysis tools are ready',tool_checking:'Checking analysis tools…',tool_installing:'Preparing analysis tools…',tool_failed:'Analysis tools could not be prepared',tool_detail_ready:'Node.js and pinned Acorn are available locally. Setup never changes system-wide packages.',tool_detail_work:'Missing components are being installed locally. The dashboard and fallback modes remain available during setup.',tool_detail_failed:'The app can continue with its lower-confidence fallback. Details: ',rep_show:'Show analysis report',
+rep_show:'Show analysis report',
 disc_hint:'Spends exactly 3 real requests on the chosen account to find the response field in which the site reports turning long text into an attachment. Nothing is sent until you confirm.',disc_btn:'Discover signal (3 real requests)',hide_tech:'Hide technical lines (DEBUG / tracebacks)',log_cp:'Copy diagnostic report',log_dl:'Download full log file',log_hint:'The report holds the version, account states, Chrome-extension state and the latest log lines (no keys, no message text). Paste it into the chat instead of describing the page.',log_copied:'Copied. Paste it into the chat.',log_failed:'Could not copy automatically; the report was downloaded instead.',
 s_ready:'Ready',s_learning:'Working',s_needs_you:'Needs you',s_needs_login:'Login needed',s_failed:'Failed',s_cooling:'Cooling down',
 m_direct:'direct (fast)',m_page:'via browser page',m_ui:'via browser typing (slow)',
@@ -18671,7 +18710,7 @@ api_title:'…یا به‌جای آن یک حساب API رسمی اضافه کن
 connect_title:'اتصال ابزارهای شما',key_used:'کلیدی که در دستور استفاده می‌شود',key_create:'ساخت کلید',klabel_ph:'برچسب، مثلا cursor',key_pin:'کلید را به یک حساب وصل کنید تا ابزار فقط از همان سرویس استفاده کند.',
 th_site:'سایت',th_tier:'حالت',th_mem:'حافظه‌ی چت',import:'وارد کردن recipe',
 s_cont:'استفاده از حافظه‌ی خود سایت (فقط پیام‌های جدید ارسال شود)',s_sum:'خلاصه‌کردن تاریخچه‌ی قدیمی با مدل به‌جای بریدن',s_tool:'حد توضیح ابزار (حرف)',s_sys:'حد پرامپت سیستم (حرف)',s_res:'حد نتیجه‌ی ابزار (حرف)',s_his:'حد تاریخچه (حرف)',s_hc:'بررسی سلامت هر (دقیقه، 0 = خاموش)',s_cache:'کش درخواست‌های یکسان (ثانیه، 0 = خاموش)',s_idle:'بستن مرورگر بی‌کار بعد از (ثانیه)',
-adv_hint:'برنامه هنگام اجرا ابزارهای تحلیلِ نسخه‌ثابت را بررسی و در پوشه‌ی داده‌ی خودش نصب می‌کند؛ نصب دستی لازم نیست و بسته‌ی سیستمی تغییری نمی‌کند.',tool_auto:'راه‌اندازی خودکار',tool_ready:'ابزارهای تحلیل آماده‌اند',tool_checking:'در حال بررسی ابزارهای تحلیل…',tool_installing:'در حال آماده‌سازی ابزارهای تحلیل…',tool_failed:'آماده‌سازی ابزارهای تحلیل انجام نشد',tool_detail_ready:'Node.js و Acorn نسخه‌ثابت به‌صورت محلی آماده‌اند.',tool_detail_work:'اجزای لازم در پوشه‌ی برنامه نصب می‌شوند. داشبورد و مسیرهای جایگزین در دسترس می‌مانند.',tool_detail_failed:'برنامه با مسیر جایگزین کم‌اطمینان‌تر ادامه می‌دهد. جزئیات: ',rep_show:'نمایش گزارش تحلیل',
+rep_show:'نمایش گزارش تحلیل',
 disc_hint:'دقیقا ۳ درخواست واقعی روی حساب انتخابی مصرف می‌کند. تا تایید نکنید چیزی ارسال نمی‌شود.',disc_btn:'کشف سیگنال (۳ درخواست واقعی)',hide_tech:'پنهان‌کردن خطوط فنی (DEBUG و traceback)',log_cp:'کپی گزارش تشخیصی',log_dl:'دانلود کامل فایل لاگ',log_hint:'گزارش شامل نسخه، وضعیت حساب‌ها، وضعیت افزونه‌ی کروم و آخرین خطوط لاگ است (بدون کلید و بدون متن پیام‌ها). به جای توضیح صفحه، همین را در چت بگذارید.',log_copied:'کپی شد. در چت بگذارید.',log_failed:'کپی خودکار نشد؛ گزارش دانلود شد.',
 s_ready:'آماده',s_learning:'در حال کار',s_needs_you:'نیاز به شما',s_needs_login:'نیاز به ورود',s_failed:'ناموفق',s_cooling:'در حال استراحت',
 m_direct:'مستقیم (سریع)',m_page:'از طریق صفحه‌ی مرورگر',m_ui:'تایپ در مرورگر (کند)',
@@ -18737,10 +18776,7 @@ $('tabs').innerHTML=Object.keys(names).map(x=>`<button class="sm ${x==tab?'p':''
 $('snip').textContent=snippets($('keysel').value||(S.keys[0]||{}).key||'',S.port)[tab];
 const s=S.settings;if(document.activeElement.tagName!='INPUT'){$('s_cont').checked=s.continuity;$('s_tool').value=s.tool_desc_limit;$('s_sys').value=s.system_limit;$('s_res').value=s.result_limit;$('s_his').value=s.history_limit;$('s_idle').value=s.headless_idle_seconds;$('s_sum').checked=s.summarize_history;$('s_hc').value=s.health_interval_min;$('s_cache').value=s.cache_seconds}
 $('home').textContent='Data folder: '+S.home}
-async function loadTools(){try{const x=await api('toolchain'),b=x.bootstrap||{},ready=!!x.usable&&b.state==='ready',failed=b.state==='failed';$('tool_title').textContent=t(ready?'tool_ready':failed?'tool_failed':b.state==='installing'?'tool_installing':'tool_checking');$('tool_title').style.color=ready?'var(--ok)':failed?'var(--warn)':'var(--tx)';$('tool_dot').style.background=ready?'var(--ok)':failed?'var(--warn)':'var(--acc)';$('tool_dot').style.boxShadow='0 0 0 4px '+(ready?'#4ade8033':failed?'#fbbf2433':'#6ea8fe33');$('tool_detail').textContent=ready?(t('tool_detail_ready')+' · '+(x.node||'Node.js')+' · Acorn '+(x.parser||{}).version):failed?(t('tool_detail_failed')+(b.message||x.integrity)):(t('tool_detail_work')+' '+(b.message||''))}catch(e){$('tool_title').textContent=t('tool_failed');$('tool_detail').textContent=errMsg(e);$('tool_dot').style.background='var(--warn)'}}
 $('rep_show').onclick=async()=>{const h=$('rep_host').value.trim();if(!h)return;$('rep_out').style.display='block';try{const r=await api('analysis/'+encodeURIComponent(h)+'/report');$('rep_out').textContent=r.markdown||'no report yet for this site'}catch(e){$('rep_out').textContent='✘ '+e.message}};
-loadTools();
-setInterval(()=>{if($('v_adv').classList.contains('on'))loadTools()},5000);
 const kindB=k=>k=='measured'?'ready':(k=='estimated'?'learning':'direct');
 let D=null,DE='';
 async function loadDir(){try{D=await api('directory');DE=''}catch(e){DE=errMsg(e)}renderDir()}
@@ -26709,6 +26745,24 @@ setTimeout(() => process.exit(0), 60000);
             for name in ("chatgpt", "openai", "gemini", "claude", "anthropic", "deepseek", "kimi", "qwen", "grok", "perplexity", "mistral", "copilot"):
                 self.assertNotIn(name, body)
 
+    class TestAutomaticDependencySetup(unittest.TestCase):
+        def test_optional_installs_are_app_local_and_version_pinned(self) -> None:
+            src = Path(__file__).read_text(encoding="utf-8")
+            a, b = src.index("def _ensure_playwright_legacy"), src.index("class AccountBrowser", src.index("def _ensure_playwright_legacy"))
+            body = src[a:b]
+            self.assertIn('"--target", str(tool_root)', body)
+            self.assertIn('"playwright==1.64.1"', body)
+            self.assertIn('"PLAYWRIGHT_BROWSERS_PATH"', body)
+            self.assertIn('"--target", str(target)', src[src.index("def _ensure_local_python_package"):src.index("def export_bundle")])
+            self.assertIn('cryptography==50.0.2', src[src.index("def export_bundle"):src.index("def import_bundle")])
+
+        def test_toolchain_state_is_not_rendered_in_dashboard(self) -> None:
+            src = Path(__file__).read_text(encoding="utf-8")
+            dashboard = src[src.index('<div class="view" id="v_adv">'):src.index("const L={en:")]
+            for forbidden in ('id="toolcard"', 'id="tool_state"', 'id="tool_title"', 'id="tool_detail"'):
+                self.assertNotIn(forbidden, dashboard)
+            self.assertNotIn("async function loadTools()", src)
+
     class TestReportInSync(unittest.TestCase):
         """7.35 (owner rule): the hand-off report must match the code and the ledger. Skipped only when the report file is not next to bridge.py."""
 
@@ -27993,7 +28047,7 @@ setTimeout(() => process.exit(0), 60000);
                 shutil.rmtree(tmp, ignore_errors=True)
 
     all_cases = (TestFixes725, TestResolver, TestHashing, TestStreamDecoder, TestRouterCore, TestHTTP, TestPersistence, TestSecurityHelpers, TestApiBackend, TestCatalog, TestRouting, TestResolutionCatalog,
-                 TestErrorsAndLimits, TestTaskStateAndFailover, TestContextEngine, TestSubmission, TestGroupO, TestGroupOSetup, TestGroupOCapture, TestGroupO5, TestGroupO17, TestGroupO18, TestGroupO19, TestGroupO8, TestGroupO9, TestGroupO9Supervisor, TestGroupO827, TestGroupO827b, TestGroupO21Link, TestGroupO14, TestGroupO13, TestGroupO15, TestGroupO25, TestGroupO26, TestGroupO27, TestGroupO28, TestReportInSync, TestFixes732, TestGroupO12Dash, TestGroupO11, TestLogFile, TestAccessAndDashboardLog, TestPersonalChrome, TestQuickSmoke)
+                 TestErrorsAndLimits, TestTaskStateAndFailover, TestContextEngine, TestSubmission, TestGroupO, TestGroupOSetup, TestGroupOCapture, TestGroupO5, TestGroupO17, TestGroupO18, TestGroupO19, TestGroupO8, TestGroupO9, TestGroupO9Supervisor, TestGroupO827, TestGroupO827b, TestGroupO21Link, TestGroupO14, TestGroupO13, TestGroupO15, TestGroupO25, TestGroupO26, TestGroupO27, TestGroupO28, TestAutomaticDependencySetup, TestReportInSync, TestFixes732, TestGroupO12Dash, TestGroupO11, TestLogFile, TestAccessAndDashboardLog, TestPersonalChrome, TestQuickSmoke)
     only = os.environ.get("BRIDGE_SELFTEST_ONLY", "")             # lean workflow (section 0A): BRIDGE_SELFTEST_ONLY=TestSubmission,TestContextEngine runs just those classes
     for case in ((TestQuickSmoke,) if quick else tuple(c for c in all_cases if not only or c.__name__ in only.split(","))):
         suite.addTests(ld.loadTestsFromTestCase(case))
