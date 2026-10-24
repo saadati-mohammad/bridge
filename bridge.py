@@ -164,7 +164,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.44"
+VERSION = "7.45"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -25584,6 +25584,32 @@ def run_selftest(quick: bool = False) -> int:
             self.assertIn(O18_NATIVE_FILE, loaded["manifest"]["modules"])
             self.assertEqual([re.match(r"BRAIN_TASK ([A-Za-z0-9_.-]+)", p).group(1) for p in fake.prompts],
                              ["o26_round", "o26_round", "o27_author", "o28_review"])
+
+        def test_o29_native_ready_runs_real_o8_battery_then_serves_continued_chat_without_browser(self) -> None:
+            a = self.account()
+            self.modules()
+            exs, scripts = self.o8.exs, self.o8.f.scripts()
+            CaptureStore(self.store, self.HOST).add_run("login+learn", json.loads(json.dumps(exs)))
+            store_served(self.store, self.HOST, scripts)
+            analysis = o17_analyze(exs, self.HOST, scripts, [self.o8.f.sig_spec(), self.o8.f.pow_spec()],
+                                   endpoint="POST /api/chat", input_locs=("body.$.prompt", "body.$.conversation_id"))
+            self.store.write(f"analysis/{safe_host_dir(self.HOST)}/o17.json", analysis, private=True)
+            sup = self.sup()
+            self.acc.o9_supervisor = lambda: sup  # type: ignore[assignment]
+            self.t[0] = 1000.0
+            first = self.acc.o29_after_learn("a1")
+            self.assertEqual(first["status"], "validating", first)
+            self.t[0] = 1400.0
+            second = self.acc.o29_after_learn("a1")
+            self.assertEqual(second["status"], "promoted", second)
+            backend = self.acc.backend(a)
+            self.assertIsInstance(backend, NativeBackend)
+            classic_calls = len(self.classic.asked)
+            conv = backend.new_conv()
+            self.assertEqual("".join(backend.ask(conv, "Remember the code zz9.")), "OK")
+            self.assertEqual("".join(backend.ask(conv, "What was the code?")), "zz9")
+            self.assertEqual(len(self.classic.asked), classic_calls)
+            self.assertFalse(self.acc.browsers)
 
         def test_two_supervisor_ticks_move_a_fallback_account_to_stable_direct_through_a_validation_id(self) -> None:
             a = self.account()
