@@ -11505,6 +11505,7 @@ class Toolchain:
         if self.parser_path():
             if not self._node():
                 self._install_node_runtime()
+                return self.status()
             return st
         if not self._node():
             self._install_node_runtime()
@@ -23372,6 +23373,36 @@ def run_selftest(quick: bool = False) -> int:
                 m = SiteManifest("z.test")
                 m.unknown("token_algorithm", "no parser")
                 self.assertEqual((m.tier(), m.report()["direct_allowed"]), ("page", False))                   # an unextractable element keeps the site on the page tier
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        def test_o21_installs_pinned_parser_locally_without_a_consent_click(self) -> None:
+            from unittest import mock
+            tmp, store, cfg, _app = mk_env()
+            try:
+                cfg.data["js_parser_module"] = ""
+                cfg.data["toolchain_consent"] = False
+                tc = Toolchain(store, cfg)
+                old = os.environ.pop("BRIDGE_JS_PARSER", None)
+                def fake_npm(argv: List[str], **_kw: Any) -> subprocess.CompletedProcess:
+                    parser = tc.dir / "node_modules" / "acorn"
+                    (parser / "dist").mkdir(parents=True)
+                    (parser / "package.json").write_text(json.dumps({"name": "acorn", "version": TOOLCHAIN_PLAN["acorn"], "main": "dist/acorn.js"}), "utf-8")
+                    (parser / "dist" / "acorn.js").write_text("module.exports = {};", "utf-8")
+                    (parser / "dist" / "acorn.mjs").write_text("export default {};", "utf-8")
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                try:
+                    with mock.patch.object(tc, "_node", return_value="mock-node"), mock.patch("shutil.which", return_value="npm"), mock.patch("subprocess.run", side_effect=fake_npm) as run:
+                        result = tc.ensure()
+                    argv = run.call_args.args[0]
+                    self.assertIn("--ignore-scripts", argv)
+                    self.assertIn("acorn@" + TOOLCHAIN_PLAN["acorn"], argv)
+                    self.assertTrue(result["usable"])
+                    self.assertEqual(result["integrity"], "matches the recorded hash")
+                    self.assertTrue(Path(result["parser"]["path"]).is_relative_to(tc.dir))
+                finally:
+                    if old:
+                        os.environ["BRIDGE_JS_PARSER"] = old
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
 
