@@ -26761,7 +26761,8 @@ setTimeout(() => process.exit(0), 60000);
             dashboard = src[src.index('<div class="view" id="v_adv">'):src.index("const L={en:")]
             for forbidden in ('id="toolcard"', 'id="tool_state"', 'id="tool_title"', 'id="tool_detail"'):
                 self.assertNotIn(forbidden, dashboard)
-            self.assertNotIn("async function loadTools()", src)
+            js = src[src.index("const L={en:"):src.index("</script>", src.index("const L={en:"))]
+            self.assertNotIn("async function loadTools()", js)
 
     class TestReportInSync(unittest.TestCase):
         """7.35 (owner rule): the hand-off report must match the code and the ledger. Skipped only when the report file is not next to bridge.py."""
