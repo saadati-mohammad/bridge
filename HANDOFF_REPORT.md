@@ -177,7 +177,7 @@ Rules:
 | 7.28 | dashboard card "Direct path & validation" (`/api/o12`) | 352 | mock | O12 remaining controls |
 | 7.27 | native.json, `o8_parts`, `NativeBackend` serving, `_o8_relearn`, `o21_specs` | 346 | mock | PRODUCE native data from a real site's live learning (see below) |
 
-### Status in one table (7.38 ledger counts retained; 7.44 verification passed; full ledger audit pending; full ledger audit not performed this turn)
+### Status in one table (ledger counts remain 32 DONE / 83 PARTIAL / 59 TODO; 7.46 verification passed; full ledger audit not performed this turn)
 | Status | Count | Percent |
 |---|---|---|
 | DONE | 32 | 18.4% |
