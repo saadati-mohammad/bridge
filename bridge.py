@@ -24692,7 +24692,7 @@ def run_selftest(quick: bool = False) -> int:
                 def __init__(self) -> None: self.calls = []
                 def request(self, method: str, url: str, headers: Dict[str, str], body: Optional[bytes], timeout: float = 60):
                     self.calls.append((method, url, dict(headers), body))
-                    return 200, {"content-type": "text/event-stream"}, iter([b'data: {"delta":"OK"}\\n\\n'])
+                    return 200, {"content-type": "text/event-stream"}, iter([b'data: {"delta":"OK"}\n\n'])
             recipe = {"chat": {"method": "POST", "url": "https://mock17.test/api/chat", "headers": {"x-proof": "observed"},
                                "body_kind": "json", "body": {"prompt": "{{prompt}}", "proof": "captured"}},
                       "stream": {"format": "sse", "text_paths": ["delta"], "cumulative": False, "ignore_values": []}}
