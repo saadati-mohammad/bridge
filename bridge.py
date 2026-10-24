@@ -164,7 +164,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.37"
+VERSION = "7.38"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -12505,6 +12505,15 @@ def o29_safe_experiment(recipe: Dict[str, Any], session: Dict[str, Any], kind: s
                 "reason": f"experiment failed ({type(e).__name__})"}
 
 
+def o29_evidence_key(exchanges: List[Dict[str, Any]], scripts: List[Dict[str, Any]]) -> str:
+    """Fingerprint all O29 evidence so cached decisions expire when a capture is revised in place."""
+    payload = {
+        "exchanges": exchanges,
+        "scripts": sorted(o17_script_hash(str(s.get("text") or "")) for s in scripts),
+    }
+    return hashlib.sha256(jdump(payload).encode("utf-8")).hexdigest()
+
+
 class Accounts:
     def __init__(self, store: Store, cfg: Config):
         self.store, self.cfg = store, cfg
@@ -13363,8 +13372,9 @@ class Accounts:
                                rounds=0, requests=0, budget=int(self.cfg["brain_budget_requests"]))
 
             prior = self.store.read(rel, {}) or {}
-            capture_key = hashlib.sha256(jdump({"ids": [str(e.get("id")) for e in exs],
-                                                "scripts": sorted(o17_script_hash(str(s.get("text") or "")) for s in scripts)}).encode()).hexdigest()
+            # Capture IDs may be reused by imports or refreshed evidence. Include the private exchange contents
+            # in the digest (never in the public progress record) so stale give-up decisions cannot mask new evidence.
+            capture_key = o29_evidence_key(exs, scripts)
             if prior.get("capture_key") == capture_key and prior.get("status") in ("give_up", "needs_human", "budget", "refused", "native_unavailable"):
                 return prior  # don't repeatedly spend the account's budget on unchanged evidence
             publish("investigating", "the captured protocol has unexplained parts; starting the bounded Brain investigation",
@@ -25356,6 +25366,16 @@ def run_selftest(quick: bool = False) -> int:
             self.t[0] = 1400.0
             sup.tick()
             return sup
+
+        def test_o29_cache_key_changes_when_capture_contents_change_under_the_same_id(self) -> None:
+            secret = "private-captured-token-8391"
+            first = [{"id": "same-id", "request": {"body": "prompt-one", "authorization": secret}}]
+            revised = [{"id": "same-id", "request": {"body": "prompt-two", "authorization": secret}}]
+            scripts = [{"text": "function send() { return 1; }"}]
+            key = o29_evidence_key(first, scripts)
+            self.assertEqual(key, o29_evidence_key(json.loads(json.dumps(first)), scripts))
+            self.assertNotEqual(key, o29_evidence_key(revised, scripts))
+            self.assertNotIn(secret, key)
 
         def test_native_data_is_saved_hash_pinned_and_reloaded_identically_and_bad_data_is_refused(self) -> None:
             self.store = self.acc.store
