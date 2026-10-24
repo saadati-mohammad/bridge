@@ -164,7 +164,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.42"
+VERSION = "7.43"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -13371,7 +13371,7 @@ class Accounts:
             with self.lock:
                 cur = self.get(aid)
                 if cur is not None:
-                    cur["native_learning"] = {k: safe[k] for k in ("status", "reason", "rounds", "requests", "budget", "updated_at") if k in safe}
+                    cur["native_learning"] = {k: safe[k] for k in ("status", "reason", "rounds", "requests", "budget", "gates", "review", "updated_at") if k in safe}
                     self.save()
             return safe
 
@@ -13445,25 +13445,25 @@ class Accounts:
             committed = o27_commit(self.store, host, authored, scripts, investigation["specs"], endpoint, review)
             if committed.get("written") != "modules":
                 return publish("refused", "accepted modules were not committed", **common)
+            pipeline = {"gates": [g.get("gate") for g in (authored.get("gate_log") or [{}])[-1].get("gates", [])][:12],
+                        "review": {"outcome": str(review.get("outcome") or "")[:40], "confirmed_defects": int(review.get("confirmed_defects") or 0)}}
             current = o18_load(self.store, host, scripts)
             if not (current.get("use") and current.get("native")):
                 attached = o18_attach_native_from_recipe(self.store, host, recipe, exs, scripts, session, endpoint, investigation["specs"])
                 if not attached.get("ok"):
-                    return publish("native_unavailable", attached.get("reason") or "native transport data is unavailable", **common)
-            publish("modules_ready", "O27 gates passed; O8 alone decides whether direct serving is safe", **common,
-                    gates=[g.get("gate") for g in (authored.get("gate_log") or [{}])[-1].get("gates", [])][:12],
-                    review={"outcome": str(review.get("outcome") or "")[:40], "confirmed_defects": int(review.get("confirmed_defects") or 0)})
+                    return publish("native_unavailable", attached.get("reason") or "native transport data is unavailable", **common, **pipeline)
+            publish("modules_ready", "O27 gates passed; O8 alone decides whether direct serving is safe", **common, **pipeline)
             rows = self.o9_supervisor().tick()
             row = next((r for r in rows if r.get("id") == aid), {})
             st = lc_state(self.get(aid) or a)
             if st == "stable_direct":
-                return publish("promoted", "O8 accepted the required independent validation runs", **common,
+                return publish("promoted", "O8 accepted the required independent validation runs", **common, **pipeline,
                                validation=(self.store.read(f"site_modules/{hd}/validation.json", {}) or {}).get("promoted"))
             if st != "validating":
                 why = str(row.get("skipped") or row.get("error") or "O8 did not enter its validation state")
                 status = "native_unavailable" if row.get("skipped") else "validation_failed"
-                return publish(status, "O8 could not start or complete validation: " + why, **common, supervisor=row)
-            return publish("validating", "modules are installed; O8 still requires independent passing runs", **common, supervisor=row)
+                return publish(status, "O8 could not start or complete validation: " + why, **common, **pipeline, supervisor=row)
+            return publish("validating", "modules are installed; O8 still requires independent passing runs", **common, **pipeline, supervisor=row)
         except Exception as e:
             reason = redact_evidence(f"{type(e).__name__}: {e}", 180)
             log(f"o29 {aid} ({host}): {reason}", "warn")
@@ -25575,6 +25575,9 @@ def run_selftest(quick: bool = False) -> int:
             self.assertEqual(result["status"], "validating", result)
             self.assertEqual(result["review"]["outcome"], "reviewed")
             self.assertEqual(result["supervisor"]["did"], ["o8:pending"])
+            public = next(x for x in self.acc.public() if x["id"] == "brain1")
+            self.assertEqual(public["native_learning"]["review"]["outcome"], "reviewed")
+            self.assertIn("differential", public["native_learning"]["gates"])
             loaded = o18_load(self.store, h.HOST, scripts)
             self.assertTrue(loaded.get("use"), loaded)
             self.assertIsNotNone(loaded.get("native"), loaded)
