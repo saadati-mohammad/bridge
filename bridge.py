@@ -164,7 +164,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.41"
+VERSION = "7.42"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -25556,6 +25556,7 @@ def run_selftest(quick: bool = False) -> int:
             action_view = {"action": "view_script", "params": {"sha256": o17_script_hash(h.APP), "lines": [1, 7]}, "reason": "inspect the client"}
             action_spec = {"action": "spec", "params": {k: sig[k] for k in ("loc", "name", "provenance", "expr")}, "reason": "the source explains the header"}
             author_fixture = TestGroupO27("test_o27_a_correct_draft_passes_every_gate_and_the_generated_test_file_runs_for_real")
+            author_fixture.setUp()
             fake = FakeBrain({"o26_round": [action_view, action_spec],
                               "o27_author": {"tokens_py": author_fixture.good(), "notes": "ported from the cited script"},
                               "o28_review": {"verdict": "matches the cited source", "findings": []}})
