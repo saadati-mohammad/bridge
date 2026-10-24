@@ -163,7 +163,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.51"
+VERSION = "7.52"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -2058,7 +2058,7 @@ def build_evidence(probes: List[Dict[str, Any]], storage: Dict[str, Any], secret
 # The user's own Chrome is the browser. A Manifest-V3 extension (embedded below, extracted at run time) executes commands that the bridge sends over an
 # authenticated loopback channel; a small Playwright-shaped compatibility layer (PCContext / PCPage / PCLocator / PCCdpSession) keeps every existing call site working.
 # ============================================================================
-PC_VERSION = "1.0.0"
+PC_VERSION = "1.1.0"
 
 PC_BACKGROUND_JS = r"""'use strict';
 // AI Web Bridge - Personal Chrome extension (service worker). Talks ONLY to http://127.0.0.1:<port>/pc/* with a bearer token obtained by one-time pairing.
@@ -2076,7 +2076,7 @@ async function owned() { const s = await chrome.storage.session.get('owned'); re
 async function setOwned(set) { await chrome.storage.session.set({owned: [...set]}); }
 async function consented() { const s = await chrome.storage.session.get('consent'); return new Set(s.consent || []); }
 async function setConsent(set) { await chrome.storage.session.set({consent: [...set]}); }
-function badge() { chrome.action.setBadgeText({text: attached.size ? String(attached.size) : ''}); chrome.action.setBadgeBackgroundColor({color: attached.size ? '#c0392b' : '#2e7d32'}); chrome.action.setTitle({title: attached.size ? 'AI Web Bridge: inspecting ' + attached.size + ' tab(s)' : 'AI Web Bridge: idle'}); }
+function badge() { chrome.action.setBadgeText({text: attached.size ? String(attached.size) : ''}); chrome.action.setBadgeBackgroundColor({color: attached.size ? '#806be8' : '#2e7d32'}); chrome.action.setTitle({title: attached.size ? 'AI Web Bridge: inspecting ' + attached.size + ' tab(s)' : 'AI Web Bridge: idle'}); }
 
 async function api(path, body, signal) {
   const c = await loadCfg(); if (!c) throw new Error('not paired');
@@ -2171,7 +2171,7 @@ chrome.runtime.onMessage.addListener((msg, sender, send) => {
         await chrome.storage.local.set({port: msg.port, token: j.token}); cfg = null; pollLoop(); send({ok: true});
       } catch (e) { send({ok: false, error: String(e.message || e)}); }
     } else if (msg.type === 'status') {
-      const c = await loadCfg(); send({paired: !!c, port: c && c.port, attached: [...attached.keys()], lastError, lastOk, polling});
+      const c = await loadCfg(), o = await owned(), allow = await consented(); send({paired: !!c, port: c && c.port, attached: [...attached.keys()], ownedTabs: [...o], allowedTabs: [...new Set([...o, ...allow])], lastError, lastOk, polling});
     } else if (msg.type === 'allow_tab') {
       const c = await consented(); c.add(msg.tab); await setConsent(c); send({ok: true});
     } else if (msg.type === 'revoke_tab') {
@@ -2190,59 +2190,133 @@ chrome.runtime.onInstalled.addListener(() => { badge(); pollLoop(); });
 badge(); rebuildAttached().then(() => pollLoop());
 """
 
-PC_POPUP_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="ext.css"><title>AI Web Bridge</title></head><body>
-<h1>AI Web Bridge</h1><div id="state" class="box">...</div>
-<div id="pairbox" class="box" hidden><label>Port <input id="port" value="18765" size="6"></label><label>Pairing code <input id="code" size="12" autocomplete="off"></label><button id="pair">Pair</button>
-<p class="small">The code is shown in the bridge's console / dashboard and works once, for ten minutes.</p></div>
-<div id="tabbox" class="box"><button id="allow">Allow the bridge to inspect THIS tab</button><button id="revoke">Stop inspecting this tab</button>
-<p class="small">The bridge only touches tabs it opened itself and tabs you allow here. While a tab is inspected Chrome shows its own "is debugging this browser" bar and the toolbar badge is red.</p></div>
-<button id="unpair" class="small">Disconnect from the bridge</button><script src="popup.js"></script></body></html>"""
+PC_POPUP_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="ext.css"><title>AI Web Bridge</title></head><body class="popup">
+<header class="brand"><img src="icons/icon48.png" alt=""><div><h1>Bridge</h1><p data-i="tagline">Your browser, with permission.</p></div><span class="sparkle">✦</span></header>
+<section class="status-card"><div class="status-line"><i id="dot" class="dot"></i><div><strong id="state-title">Checking connection…</strong><p id="state-detail" class="muted"></p></div></div>
+<div class="metrics"><div><b id="tab-count">0</b><span data-i="tabs_shared">tabs shared</span></div><div><b id="port-value">—</b><span data-i="local_port">local port</span></div></div></section>
+<section id="pairbox" class="panel" hidden><h2 data-i="pair_title">Connect to your bridge</h2><p class="muted" data-i="pair_hint">Enter the one-time code shown in the Bridge dashboard.</p>
+<label class="field"><span data-i="port_label">Port</span><input id="port" inputmode="numeric" value="18765" maxlength="5"></label><label class="field"><span data-i="code_label">One-time code</span><input id="code" autocomplete="one-time-code" maxlength="8" placeholder="8 characters"></label><button id="pair" class="primary" data-i="connect">Connect securely</button><p id="pair-error" class="error" hidden></p></section>
+<section id="tabbox" class="panel" hidden><div class="section-heading"><h2 data-i="this_tab">This tab</h2><span id="tab-badge" class="tag"></span></div><p id="tab-title" class="tab-title"></p><p id="tab-host" class="muted ltr"></p><p id="tab-note" class="muted note"></p>
+<button id="allow" class="primary" data-i="allow">Allow this tab</button><button id="revoke" class="secondary" data-i="revoke">Stop sharing</button></section>
+<details class="privacy"><summary data-i="privacy_title">A small privacy promise</summary><p data-i="privacy_body">Only tabs opened by Bridge or tabs you allow here can be inspected. The link stays on this computer. Chrome shows its own notice while a tab is being inspected.</p></details>
+<footer><span class="local-mark"><i></i><span data-i="local_only">Private · this computer only</span></span><button id="unpair" class="link-button" data-i="disconnect" hidden>Disconnect</button></footer><script src="popup.js"></script></body></html>"""
 
 PC_POPUP_JS = r"""const $ = id => document.getElementById(id);
-const send = m => new Promise(r => chrome.runtime.sendMessage(m, r));
-async function refresh() {
-  const s = await send({type: 'status'});
-  $('state').textContent = s.paired ? ('paired - port ' + s.port + (s.polling ? ' - connected' : ' - waiting') + (s.lastError ? ' - ' + s.lastError : '') + ' - inspecting tabs: ' + s.attached.length) : 'not paired yet';
-  $('pairbox').hidden = !!s.paired; $('tabbox').hidden = !s.paired; $('unpair').hidden = !s.paired;
-}
-$('pair').onclick = async () => { const r = await send({type: 'pair', port: parseInt($('port').value, 10), code: $('code').value.trim()}); $('state').textContent = r.ok ? 'paired' : ('pairing failed: ' + r.error); setTimeout(refresh, 600); };
-$('allow').onclick = async () => { const [t] = await chrome.tabs.query({active: true, currentWindow: true}); if (t) await send({type: 'allow_tab', tab: t.id}); refresh(); };
-$('revoke').onclick = async () => { const [t] = await chrome.tabs.query({active: true, currentWindow: true}); if (t) await send({type: 'revoke_tab', tab: t.id}); refresh(); };
-$('unpair').onclick = async () => { await send({type: 'unpair'}); refresh(); };
-refresh();"""
+const send = m => new Promise((resolve, reject) => chrome.runtime.sendMessage(m, r => { if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message)); else resolve(r || {}); }));
+const words = {en:{tagline:'Your browser, with permission.',tabs_shared:'tabs shared',local_port:'local port',pair_title:'Connect to your bridge',pair_hint:'Enter the one-time code shown in the Bridge dashboard.',port_label:'Port',code_label:'One-time code',connect:'Connect securely',this_tab:'This tab',allow:'Allow this tab',revoke:'Stop sharing',privacy_title:'A small privacy promise',privacy_body:'Only tabs opened by Bridge or tabs you allow here can be inspected. The link stays on this computer. Chrome shows its own notice while a tab is being inspected.',local_only:'Private · this computer only',disconnect:'Disconnect',checking:'Checking connection…',not_paired:'Not connected yet',connect_hint:'Use the one-time code from the Bridge dashboard.',connected:'Connected',waiting:'Bridge is reconnecting',waiting_hint:'Keep the Bridge app running on this computer.',tab_owned:'Bridge opened this tab',tab_allowed:'You allowed this tab',tab_not_shared:'Only you can see this tab',internal:'Chrome does not allow extensions to inspect this page.',tab_hint:'Bridge can use this tab only after you allow it.',allow_done:'This tab is shared with Bridge.',revoke_done:'Bridge no longer has access to this tab.',bad_pair:'Could not connect: ',pair_ok:'Connected securely.',pair_invalid:'Enter a valid port and 8-character code.',disconnect_confirm:'Disconnect this browser from Bridge?',disconnected:'Disconnected.',error:'Something went wrong. Try again.'},fa:{tagline:'مرورگر خودت، با اجازه‌ی خودت.',tabs_shared:'زبانه‌ی در دسترس',local_port:'درگاه محلی',pair_title:'اتصال به Bridge',pair_hint:'کد یک‌بارمصرف را از داشبورد Bridge وارد کن.',port_label:'درگاه',code_label:'کد یک‌بارمصرف',connect:'اتصال امن',this_tab:'این زبانه',allow:'اجازه‌ی دسترسی',revoke:'قطع دسترسی',privacy_title:'قول کوچک حریم خصوصی',privacy_body:'فقط زبانه‌هایی که Bridge باز کرده یا خودت اجازه داده‌ای قابل بررسی‌اند. ارتباط فقط روی همین کامپیوتر است. هنگام بررسی زبانه، Chrome اعلان خودش را نشان می‌دهد.',local_only:'خصوصی · فقط همین کامپیوتر',disconnect:'قطع اتصال',checking:'در حال بررسی اتصال…',not_paired:'هنوز متصل نشده',connect_hint:'کد یک‌بارمصرف را از داشبورد Bridge بردار.',connected:'متصل است',waiting:'Bridge در حال اتصال دوباره است',waiting_hint:'برنامه‌ی Bridge را روی همین کامپیوتر باز نگه دار.',tab_owned:'Bridge این زبانه را باز کرده',tab_allowed:'خودت اجازه داده‌ای',tab_not_shared:'فقط خودت به این زبانه دسترسی داری',internal:'افزونه‌ها اجازه‌ی بررسی این صفحه‌ی داخلی Chrome را ندارند.',tab_hint:'Bridge فقط پس از اجازه‌ی تو می‌تواند از این زبانه استفاده کند.',allow_done:'این زبانه با Bridge به‌اشتراک گذاشته شد.',revoke_done:'دسترسی Bridge به این زبانه قطع شد.',bad_pair:'اتصال برقرار نشد: ',pair_ok:'اتصال امن برقرار شد.',pair_invalid:'درگاه معتبر و کد ۸ حرفی را وارد کن.',disconnect_confirm:'اتصال این مرورگر با Bridge قطع شود؟',disconnected:'اتصال قطع شد.',error:'مشکلی پیش آمد. دوباره تلاش کن.'}};
+const lang=(navigator.language||'en').toLowerCase().startsWith('fa')?'fa':'en', t=k=>(words[lang]||words.en)[k]||words.en[k]||k;
+document.documentElement.lang=lang;document.documentElement.dir=lang==='fa'?'rtl':'ltr';document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));
+let currentTab=null, busy=false;const isInternal=url=>/^(chrome|edge|about|devtools|chrome-extension):/.test(url||'')||/chromewebstore\.google\.com/.test(url||'');
+async function refresh(){if(busy)return;try{const [s]=await Promise.all([send({type:'status'})]);const [tab]=await chrome.tabs.query({active:true,currentWindow:true});currentTab=tab||null;
+  const paired=!!s.paired,recent=!!s.lastOk&&Date.now()-s.lastOk<45000,connected=paired&&recent; $('dot').className='dot '+(connected?'good':paired?'warm':'');
+  $('state-title').textContent=paired?(connected?t('connected'):t('waiting')):t('not_paired');$('state-detail').textContent=paired?(connected?'':t('waiting_hint')):t('connect_hint');
+  $('tab-count').textContent=(s.attached||[]).length;$('port-value').textContent=paired?s.port:'—';$('pairbox').hidden=paired;$('tabbox').hidden=!paired;$('unpair').hidden=!paired;
+  if(paired)$('port').value=s.port;
+  const id=currentTab&&currentTab.id, url=currentTab&&currentTab.url||'', internal=isInternal(url), owned=(s.ownedTabs||[]).includes(id), allowed=(s.allowedTabs||[]).includes(id), attached=(s.attached||[]).includes(id);
+  $('tab-title').textContent=(currentTab&&currentTab.title)||url||'—';$('tab-host').textContent=(()=>{try{return new URL(url).hostname}catch(_){return ''}})();
+  $('tab-badge').textContent=internal?'':owned?t('tab_owned'):allowed?t('tab_allowed'):t('tab_not_shared');$('tab-badge').className='tag '+(owned||allowed?'tag-on':'');
+  $('tab-note').textContent=internal?t('internal'):(owned||allowed?'':t('tab_hint'));
+  $('allow').hidden=internal||owned||allowed;$('revoke').hidden=internal||(!allowed&&!attached);$('allow').disabled=!id;$('revoke').disabled=!id;
+}catch(e){$('state-title').textContent=t('not_paired');$('state-detail').textContent=t('error')} }
+$('pair').onclick=async()=>{const port=Number($('port').value),code=$('code').value.trim().toUpperCase(),err=$('pair-error');err.hidden=true;if(!Number.isInteger(port)||port<1||port>65535||!/^[A-HJ-NP-Z2-9]{8}$/.test(code)){err.textContent=t('pair_invalid');err.hidden=false;return}
+  $('pair').disabled=true;try{const r=await send({type:'pair',port,code});if(!r.ok)throw new Error(r.error||t('error'));$('code').value='';$('state-detail').textContent=t('pair_ok');await refresh()}catch(e){err.textContent=t('bad_pair')+e.message;err.hidden=false}finally{$('pair').disabled=false}};
+$('code').addEventListener('input',()=>{$('code').value=$('code').value.toUpperCase().replace(/[^A-HJ-NP-Z2-9]/g,'').slice(0,8)});
+$('allow').onclick=async()=>{if(currentTab)await send({type:'allow_tab',tab:currentTab.id});await refresh()};$('revoke').onclick=async()=>{if(currentTab)await send({type:'revoke_tab',tab:currentTab.id});await refresh()};
+$('unpair').onclick=async()=>{if(!confirm(t('disconnect_confirm')))return;await send({type:'unpair'});$('state-detail').textContent=t('disconnected');await refresh()};
+refresh();setInterval(refresh,2500);"""
 
-PC_OPTIONS_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="ext.css"><title>AI Web Bridge - options</title></head><body>
-<h1>AI Web Bridge - Personal Chrome</h1>
-<p>This extension lets the AI Web Bridge running on <b>this computer</b> (127.0.0.1 only) drive tabs that it opens itself, or tabs you explicitly allow in the toolbar popup.
-It uses the <code>chrome.debugger</code> permission to read network traffic and page state of those tabs; Chrome shows its own banner while that is active.
-It never reads your other tabs, never stores your passwords, and the bridge cannot be reached from web pages or from other computers.</p>
-<div id="state" class="box"></div><button id="unpair">Disconnect</button><script src="options.js"></script></body></html>"""
+PC_OPTIONS_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="ext.css"><title>AI Web Bridge</title></head><body class="options">
+<main><header class="brand large"><img src="icons/icon48.png" alt=""><div><h1>AI Web Bridge</h1><p data-i="settings_subtitle">A private connection between your browser and your bridge.</p></div></header>
+<section class="status-card"><div class="status-line"><i id="dot" class="dot"></i><div><strong id="status-title">Checking…</strong><p id="status-detail" class="muted"></p></div></div><div class="metrics"><div><b id="port">—</b><span data-i="local_port">local port</span></div><div><b id="attached">0</b><span data-i="active_tabs">tabs being inspected</span></div></div></section>
+<section class="panel"><h2 data-i="privacy_title">A small privacy promise</h2><p class="muted" data-i="privacy_body">Only tabs opened by Bridge or tabs you allow here can be inspected. The link stays on this computer.</p>
+<div class="promise"><span>✦</span><p data-i="debugger_note">Chrome shows a clear notice while an approved tab is being inspected. The extension disconnects when you ask it to.</p></div></section>
+<section class="panel"><div class="section-heading"><h2 data-i="connection">Connection</h2><button id="disconnect" class="secondary" hidden data-i="disconnect">Disconnect</button></div><p id="connection-note" class="muted"></p></section>
+<footer class="options-footer"><img src="icons/icon16.png" alt=""><span data-i="local_only">Private · this computer only</span><span class="spacer"></span><span>v<span id="version"></span></span></footer></main><script src="options.js"></script></body></html>"""
 
-PC_OPTIONS_JS = r"""chrome.runtime.sendMessage({type: 'status'}, s => { document.getElementById('state').textContent = JSON.stringify(s); });
-document.getElementById('unpair').onclick = () => chrome.runtime.sendMessage({type: 'unpair'}, () => location.reload());"""
+PC_OPTIONS_JS = r"""const send=m=>new Promise((resolve,reject)=>chrome.runtime.sendMessage(m,r=>{if(chrome.runtime.lastError)reject(new Error(chrome.runtime.lastError.message));else resolve(r||{})}));
+const $=id=>document.getElementById(id),lang=(navigator.language||'en').toLowerCase().startsWith('fa')?'fa':'en';document.documentElement.lang=lang;document.documentElement.dir=lang==='fa'?'rtl':'ltr';
+const T={en:{settings_subtitle:'A private connection between your browser and your bridge.',local_port:'local port',active_tabs:'tabs being inspected',privacy_title:'A small privacy promise',privacy_body:'Only tabs opened by Bridge or tabs you allow in the popup can be inspected. Your connection stays on this computer.',debugger_note:'Chrome shows its own notice while an approved tab is being inspected. Disconnect any time.',connection:'Connection',disconnect:'Disconnect',connected:'Connected',waiting:'Waiting for Bridge',unpaired:'Not connected',wait_note:'Keep Bridge running on this computer.',unpaired_note:'Pair from the extension popup with a one-time code in the Bridge dashboard.',confirm:'Disconnect this browser from Bridge?',local_only:'Private · this computer only'},fa:{settings_subtitle:'اتصالی خصوصی بین مرورگر تو و Bridge.',local_port:'درگاه محلی',active_tabs:'زبانه‌ی در حال بررسی',privacy_title:'قول کوچک حریم خصوصی',privacy_body:'فقط زبانه‌هایی که Bridge باز کرده یا در popup اجازه داده‌ای قابل بررسی‌اند. ارتباط فقط روی همین کامپیوتر می‌ماند.',debugger_note:'هنگام بررسی زبانه‌ی مجاز، Chrome اعلان خودش را نشان می‌دهد. هر زمان بخواهی می‌توانی اتصال را قطع کنی.',connection:'اتصال',disconnect:'قطع اتصال',connected:'متصل است',waiting:'در انتظار Bridge',unpaired:'متصل نیست',wait_note:'Bridge را روی همین کامپیوتر باز نگه دار.',unpaired_note:'از popup افزونه و کد یک‌بارمصرف داشبورد Bridge وصل شو.',confirm:'اتصال این مرورگر با Bridge قطع شود؟',local_only:'خصوصی · فقط همین کامپیوتر'}};const tr=k=>T[lang][k]||T.en[k]||k;document.querySelectorAll('[data-i]').forEach(e=>e.textContent=tr(e.dataset.i));
+async function refresh(){try{const s=await send({type:'status'}),ok=!!s.paired&&!!s.lastOk&&Date.now()-s.lastOk<45000;$('dot').className='dot '+(ok?'good':s.paired?'warm':'');$('status-title').textContent=s.paired?(ok?tr('connected'):tr('waiting')):tr('unpaired');$('status-detail').textContent=s.paired?(ok?'':tr('wait_note')):tr('unpaired_note');$('port').textContent=s.paired?s.port:'—';$('attached').textContent=(s.attached||[]).length;$('disconnect').hidden=!s.paired;$('connection-note').textContent=s.lastError||'';$('version').textContent=chrome.runtime.getManifest().version}catch(e){$('status-title').textContent=tr('unpaired')}}
+$('disconnect').onclick=async()=>{if(!confirm(tr('confirm')))return;await send({type:'unpair'});refresh()};refresh();setInterval(refresh,3000);"""
 
-PC_CSS = """body{font:13px system-ui,sans-serif;margin:10px;min-width:300px}h1{font-size:15px}.box{border:1px solid #8884;border-radius:6px;padding:8px;margin:8px 0}
-button{margin:4px 0;padding:5px 8px}.small{font-size:11px;opacity:.8}input{margin:2px 4px}@media(prefers-color-scheme:dark){body{background:#1e1e1e;color:#ddd}}"""
+PC_CSS = """*{box-sizing:border-box}body{--bg:#fbf9ff;--panel:#fff;--ink:#28253a;--muted:#77738a;--line:#eee9f5;--purple:#7867e8;--pink:#ed86b7;--green:#3aab7a;--amber:#e5a446;margin:0;background:var(--bg);color:var(--ink);font:13px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif}body.popup{width:360px;padding:15px}.brand{display:flex;align-items:center;gap:11px;position:relative;margin:0 0 13px}.brand img{width:42px;height:42px;border-radius:13px;box-shadow:0 4px 12px #8e74d62a}.brand h1{font-size:16px;line-height:1.1;margin:0;font-weight:750;letter-spacing:-.3px}.brand p{margin:4px 0 0;color:var(--muted);font-size:11px}.sparkle{margin-inline-start:auto;color:var(--pink);font-size:22px;transform:rotate(12deg)}.status-card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:13px;margin:10px 0;box-shadow:0 4px 14px #43387808}.status-line{display:flex;gap:10px;align-items:center}.status-line strong{font-size:13px}.status-line p{margin:2px 0 0}.dot{width:10px;height:10px;border-radius:50%;background:#c8c3d1;box-shadow:0 0 0 4px #f0edf4;flex:0 0 auto}.dot.good{background:var(--green);box-shadow:0 0 0 4px #e6f7ef}.dot.warm{background:var(--amber);box-shadow:0 0 0 4px #fff5e4}.muted{color:var(--muted);font-size:11px}.metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;border-top:1px solid var(--line);margin-top:12px;padding-top:10px}.metrics div{display:flex;align-items:baseline;gap:5px}.metrics b{font-size:16px;color:var(--purple);font-variant-numeric:tabular-nums}.metrics span{font-size:10px;color:var(--muted)}h2{font-size:12px;margin:0 0 7px;font-weight:700}.panel>p{margin:4px 0}.field{display:block;margin:10px 0 0}.field span{display:block;color:var(--muted);font-size:10px;margin-bottom:4px}.field input{width:100%;height:36px;border:1px solid var(--line);border-radius:10px;background:#fdfcff;color:var(--ink);padding:0 10px;font:inherit;outline:none}.field input:focus{border-color:var(--purple);box-shadow:0 0 0 3px #7867e81c}.ltr{direction:ltr;text-align:left;unicode-bidi:plaintext}.primary,.secondary,.link-button{font:inherit;border-radius:10px;cursor:pointer;transition:transform .12s,box-shadow .12s,background .12s}.primary{width:100%;border:0;background:linear-gradient(135deg,#796ae9,#9c7eea);color:#fff;font-weight:650;padding:9px 12px;margin-top:10px;box-shadow:0 5px 12px #806be62e}.primary:hover{box-shadow:0 7px 16px #806be645;transform:translateY(-1px)}.primary:disabled{opacity:.6;cursor:wait}.secondary{border:1px solid var(--line);background:#fff;color:var(--muted);padding:7px 10px}.secondary:hover{border-color:#f0bad3;color:#bd5788}.error{padding:8px 9px!important;border-radius:9px;background:#fff0f4;color:#a33b61!important}.section-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}.section-heading h2{margin:0}.tag{font-size:9px;color:var(--muted);background:#f4f1f8;padding:3px 7px;border-radius:99px;max-width:175px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tag.tag-on{color:#348763;background:#eaf8f0}.tab-title{font-size:12px;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:9px!important}.note{margin-top:8px!important}.privacy{padding:3px 2px;color:var(--muted);font-size:10px}.privacy summary{cursor:pointer;list-style:none}.privacy summary::-webkit-details-marker{display:none}.privacy summary:before{content:'✦';color:var(--pink);margin-inline-end:6px}.privacy p{padding:0 7px;margin:7px 0 3px}.popup footer{display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--line);padding-top:10px;margin-top:8px}.local-mark{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:10px}.local-mark i{width:7px;height:7px;border-radius:50%;background:var(--green)}.link-button{border:0;background:none;color:var(--muted);font-size:10px;padding:4px}.link-button:hover{color:#bd5788}.options{min-height:100vh;padding:32px 18px}.options main{max-width:560px;margin:auto}.brand.large{margin-bottom:20px}.brand.large img{width:54px;height:54px;border-radius:17px}.brand.large h1{font-size:20px}.options .status-card,.options .panel{padding:18px;margin:13px 0;border-radius:18px}.options .metrics{margin-top:16px;padding-top:13px}.promise{display:flex;gap:9px;align-items:flex-start;background:#fff7fb;border:1px solid #f7eaf1;border-radius:12px;padding:10px;margin-top:12px}.promise span{color:var(--pink)}.promise p{margin:0;font-size:11px}.options-footer{display:flex;align-items:center;gap:7px;padding:12px 4px;color:var(--muted);font-size:10px}.options-footer img{width:16px;height:16px}.spacer{flex:1}[hidden]{display:none!important}@media(prefers-color-scheme:dark){body{--bg:#171522;--panel:#211e2e;--ink:#f2effb;--muted:#aaa4bb;--line:#383347;--purple:#a99aff;--pink:#f09bc5;--green:#69d2a2;--amber:#f4c26d}.field input{background:#191724;color:var(--ink)}.secondary{background:#272334;color:var(--muted)}.tag{background:#302b3c}.tag.tag-on{background:#20372e;color:#8fe0b8}.error{background:#3a202d;color:#ffb3ca!important}.promise{background:#2b2230;border-color:#403044}}"""
 
 
 def pc_manifest() -> Dict[str, Any]:
     return {
-        "manifest_version": 3, "name": "AI Web Bridge - Personal Chrome", "version": PC_VERSION,
-        "description": "Lets the AI Web Bridge on this computer use tabs it opened (or tabs you allow) in your own Chrome. Loopback only.",
+        "manifest_version": 3, "name": "AI Web Bridge", "version": PC_VERSION, "version_name": "Personal Chrome companion",
+        "description": "A private, local companion for AI Web Bridge. Works only with tabs you approve.",
         "minimum_chrome_version": "116",
         "permissions": ["debugger", "tabs", "storage", "alarms"],
         "host_permissions": ["http://127.0.0.1/*"],
         "background": {"service_worker": "background.js"},
-        "action": {"default_title": "AI Web Bridge", "default_popup": "popup.html"},
+        "icons": {"16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png"},
+        "action": {"default_title": "AI Web Bridge", "default_icon": {"16": "icons/icon16.png", "32": "icons/icon32.png"}, "default_popup": "popup.html"},
         "options_ui": {"page": "options.html", "open_in_tab": True},
         "content_security_policy": {"extension_pages": "script-src 'self'; object-src 'self'"},
     }
 
 
-def pc_assets() -> Dict[str, str]:
-    """The embedded extension, as {relative path: text}. Everything the extension needs lives here; nothing is shipped as a separate file."""
+def pc_icon_png(size: int) -> bytes:
+    """Render a small, deterministic bridge mark as PNG using only the standard library."""
+    size = max(16, min(int(size), 256))
+    px = bytearray(size * size * 4)
+    def put(x: int, y: int, color: Tuple[int, int, int, int]) -> None:
+        if 0 <= x < size and 0 <= y < size:
+            i = (y * size + x) * 4
+            px[i:i + 4] = bytes(color)
+    def stroke(x0: float, y0: float, x1: float, y1: float, color: Tuple[int, int, int, int], width: float) -> None:
+        dx, dy = x1 - x0, y1 - y0
+        steps = max(1, int(max(abs(dx), abs(dy)) * 2))
+        radius = max(.65, width / 2)
+        for n in range(steps + 1):
+            x, y = x0 + dx * n / steps, y0 + dy * n / steps
+            for yy in range(int(y - radius), int(y + radius + 1)):
+                for xx in range(int(x - radius), int(x + radius + 1)):
+                    if (xx - x) ** 2 + (yy - y) ** 2 <= radius ** 2:
+                        put(xx, yy, color)
+    scale = size
+    for y in range(size):
+        for x in range(size):
+            r = size * .22
+            cx, cy = (r if x < r else size - 1 - r if x >= size - r else x), (r if y < r else size - 1 - r if y >= size - r else y)
+            if (x - cx) ** 2 + (y - cy) ** 2 > r * r:
+                continue
+            t = (x + y) / max(1, 2 * (size - 1))
+            put(x, y, (int(105 + 83 * t), int(99 - 7 * t), int(224 - 19 * t), 255))
+    white = (255, 255, 255, 245)
+    w = max(1.0, scale * .055)
+    deck_y = .69 * scale
+    stroke(.24 * scale, deck_y, .76 * scale, deck_y, white, w * 1.15)
+    stroke(.34 * scale, .49 * scale, .34 * scale, deck_y, white, w)
+    stroke(.66 * scale, .49 * scale, .66 * scale, deck_y, white, w)
+    last = None
+    for n in range(41):
+        t = n / 40
+        x = (.34 * (1 - t) ** 2 + .50 * 2 * (1 - t) * t + .66 * t * t) * scale
+        y = (.49 * (1 - t) ** 2 + .31 * 2 * (1 - t) * t + .49 * t * t) * scale
+        if last:
+            stroke(last[0], last[1], x, y, white, w)
+        last = (x, y)
+    for t in (.16, .34, .50, .66, .84):
+        x = (.34 * (1 - t) ** 2 + .50 * 2 * (1 - t) * t + .66 * t * t) * scale
+        y = (.49 * (1 - t) ** 2 + .31 * 2 * (1 - t) * t + .49 * t * t) * scale
+        stroke(x, y, x, deck_y - .02 * scale, (255, 255, 255, 205), max(.8, w * .55))
+    # A tiny four-point sparkle gives the mark a friendly, polished finish.
+    sx, sy = .75 * scale, .27 * scale
+    for a, b in (((sx, sy - .075 * scale), (sx, sy + .075 * scale)), ((sx - .06 * scale, sy), (sx + .06 * scale, sy))):
+        stroke(a[0], a[1], b[0], b[1], (255, 231, 175, 255), max(1.0, w * .8))
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+    raw = b"".join(b"\0" + bytes(px[y * size * 4:(y + 1) * size * 4]) for y in range(size))
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b"")
+
+
+def pc_assets() -> Dict[str, Any]:
+    """The embedded extension assets; nothing is shipped as a separate file."""
     return {"manifest.json": json.dumps(pc_manifest(), indent=2), "background.js": PC_BACKGROUND_JS, "popup.html": PC_POPUP_HTML, "popup.js": PC_POPUP_JS,
-            "options.html": PC_OPTIONS_HTML, "options.js": PC_OPTIONS_JS, "ext.css": PC_CSS}
+            "options.html": PC_OPTIONS_HTML, "options.js": PC_OPTIONS_JS, "ext.css": PC_CSS,
+            **{f"icons/icon{s}.png": pc_icon_png(s) for s in (16, 32, 48, 128)}}
 
 
 def pc_extract(root: Path) -> Dict[str, Any]:
@@ -2252,10 +2326,11 @@ def pc_extract(root: Path) -> Dict[str, Any]:
     ext.mkdir(parents=True, exist_ok=True)
     assets, hashes, changed = pc_assets(), {}, []
     for rel, text in assets.items():
-        data = text.encode("utf-8")
+        data = text if isinstance(text, bytes) else text.encode("utf-8")
         hashes[rel] = hashlib.sha256(data).hexdigest()
         p = ext / rel
         if not p.exists() or p.read_bytes() != data:
+            p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix(p.suffix + ".tmp")
             tmp.write_bytes(data)
             os.replace(tmp, p)
@@ -27506,13 +27581,33 @@ setTimeout(() => process.exit(0), 60000);
             self.assertEqual(set(m["permissions"]), {"debugger", "tabs", "storage", "alarms"})
             self.assertEqual(m["host_permissions"], ["http://127.0.0.1/*"])
             self.assertNotIn("<all_urls>", json.dumps(m))
+            self.assertEqual(m["name"], "AI Web Bridge")
+            self.assertEqual(m["icons"]["48"], "icons/icon48.png")
+            self.assertIn("tabs you approve", m["description"])
             assets = pc_assets()
             for rel in (m["background"]["service_worker"], m["action"]["default_popup"], m["options_ui"]["page"]):
                 self.assertIn(rel, assets)
+            for size in (16, 32, 48, 128):
+                icon = assets[f"icons/icon{size}.png"]
+                self.assertTrue(icon.startswith(b"\x89PNG\r\n\x1a\n"))
+                self.assertEqual(struct.unpack(">II", icon[16:24]), (size, size))
+                pos, image_data, ended = 8, bytearray(), False
+                while pos < len(icon):
+                    length = struct.unpack(">I", icon[pos:pos + 4])[0]
+                    kind, payload = icon[pos + 4:pos + 8], icon[pos + 8:pos + 8 + length]
+                    crc = struct.unpack(">I", icon[pos + 8 + length:pos + 12 + length])[0]
+                    self.assertEqual(crc, zlib.crc32(kind + payload) & 0xffffffff)
+                    if kind == b"IDAT": image_data.extend(payload)
+                    pos += 12 + length
+                    if kind == b"IEND": ended = True; break
+                self.assertTrue(ended)
+                self.assertEqual(len(zlib.decompress(image_data)), size * (1 + size * 4))
             for rel in ("popup.html", "options.html"):
                 for ref in re.findall(r'(?:src|href)="([^"]+)"', assets[rel]):
                     self.assertIn(ref, assets)
             for name, text in assets.items():                                                                             # no embedded secret: no long random-looking literal anywhere
+                if isinstance(text, bytes):
+                    continue
                 self.assertEqual(re.findall(r"['\"][A-Za-z0-9_\-]{32,}['\"]", text), [], name)
 
         def test_extraction_is_repeatable_verified_and_confined(self) -> None:
