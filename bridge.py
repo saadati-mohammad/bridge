@@ -164,7 +164,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.43"
+VERSION = "7.44"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -12730,7 +12730,7 @@ class Accounts:
                 d["profile"] = {"status": p.status, "reason": p.status_reason}
                 progress = self.store.read(f"analysis/{safe_host_dir(a['host'])}/o29.json", None)
                 if isinstance(progress, dict):
-                    d["native_learning"] = {k: progress[k] for k in ("status", "reason", "rounds", "requests", "budget", "updated_at") if k in progress}
+                    d["native_learning"] = {k: progress[k] for k in ("status", "reason", "rounds", "requests", "budget", "gates", "review", "updated_at") if k in progress}
             out.append(d)
         return out
 
@@ -18586,7 +18586,7 @@ else if(a.last_error&&a.state!=='ready'&&!run)h+=`<div class="err"><div class="m
 const det=[];if(j&&j.lines&&j.lines.length)det.push(`<div class="mut">${esc(t('last_lines'))}</div><pre class="mini">${esc(j.lines.slice(-8).join('\n'))}</pre>`);
 if(a.lifecycle)det.push(`<div class="ltr"><b>${esc(a.lifecycle.state)}</b> <span class="mut">${esc(a.lifecycle.reason)} · ${esc(new Date((a.lifecycle.at||0)*1000).toLocaleString())}</span></div>`);
 if(a.learn_budget)det.push(`<div class="mut ltr">learning used ${esc(a.learn_budget.used)}/${esc(a.learn_budget.limit)} requests`+(a.learn_budget.owner_explicit?` (+${esc(a.learn_budget.owner_explicit)} you ran by hand)`:'')+`</div>`);
-if(a.native_learning){const n=a.native_learning;det.push(`<div class="mut ltr">native path: ${esc(n.status||'unknown')}${n.rounds!=null?` · rounds ${esc(n.rounds)}`:''}${n.requests!=null?` · Brain requests ${esc(n.requests)}/${esc(n.budget??'?')}`:''}${n.reason?` · ${esc(n.reason)}`:''}</div>`)}
+if(a.native_learning){const n=a.native_learning;det.push(`<div class="mut ltr">native path: ${esc(n.status||'unknown')}${n.rounds!=null?` · rounds ${esc(n.rounds)}`:''}${n.requests!=null?` · Brain requests ${esc(n.requests)}/${esc(n.budget??'?')}`:''}${n.review?` · review ${esc(n.review.outcome||'unknown')} (${esc(n.review.confirmed_defects||0)} confirmed)`:''}${n.gates?.length?` · gates ${esc(n.gates.join(', '))}`:''}${n.reason?` · ${esc(n.reason)}`:''}</div>`)}
 det.push(`<div class="mut ltr">${a.requests||0}${a.inflight?' ('+a.inflight+' live)':''} ${esc(t('req'))} · ${a.fail||0} ${esc(t('fails'))}${a.ema_ms?' · '+(a.ema_ms/1000).toFixed(1)+'s avg':''}${a.health?(a.health.ok?' · '+esc(t('healthy')):' · '+esc(t('unhealthy'))):''}</div>`);
 h+=`<details data-id="${esc(a.id)}" ${openDet.has(a.id)?'open':''} ontoggle="togDet(this)"><summary>${esc(t('details'))}</summary>${det.join('')}</details>`;
 h+=`<div class="acts">`+(a.type=='api'?'':`<button class="sm" onclick="act(${escJ(a.id)},'relogin')">${esc(t('b_relogin'))}</button><button class="sm" onclick="act(${escJ(a.id)},'relearn')">${esc(t('b_relearn'))}</button>`+(a.tier=='direct'?'':`<button class="sm" onclick="recheckDirect(${escJ(a.id)})">${esc(t('b_recheck'))}</button>`))+
