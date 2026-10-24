@@ -18,3 +18,7 @@ _full_sweep.py
 # Python
 __pycache__/
 *.pyc
+
+# Private, generated runtime state. It can contain sessions, browser pairing material,
+# captures, logs, and generated extension files; recreate it locally from bridge.py.
+bridge_data/
