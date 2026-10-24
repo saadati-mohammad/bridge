@@ -11510,6 +11510,19 @@ class Toolchain:
             self._install_node_runtime()
         return self.install()
 
+    def run_acorn(self, scripts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        st = self.status()
+        if not st.get("usable"):
+            raise BridgeError("no usable JS parser (" + str(st.get("integrity")) + ")", "setup", 409)
+        flags = [f for f in str(os.environ.get("BRIDGE_NODE_FLAGS", self.cfg.data.get("node_flags", "")) or "").split() if f]
+        script = self.store.path("tools", "analyze_js.cjs")
+        self.dir.mkdir(parents=True, exist_ok=True)
+        script.write_text(JS_ANALYZER, "utf-8")
+        r = subprocess.run([self._node()] + flags + [str(script), st["parser"]["path"]], input=json.dumps({"scripts": scripts}), capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            raise BridgeError("the JS analyzer failed: " + redact_evidence(r.stderr, 200), "setup", 500)
+        return json.loads(r.stdout)["results"]
+
 
 def bootstrap_toolchain(store: "Store", cfg: "Config") -> None:
     """Run optional source-analysis dependency setup without blocking dashboard startup or the classic fallback."""
@@ -11536,20 +11549,6 @@ def bootstrap_toolchain(store: "Store", cfg: "Config") -> None:
         with TOOLCHAIN_BOOTSTRAP_LOCK:
             TOOLCHAIN_BOOTSTRAP.update(state="failed", message=message, updated=now())
         log("automatic tool setup did not complete; the bridge remains available on its documented fallback: " + message, "warn")
-
-    def run_acorn(self, scripts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        st = self.status()
-        if not st.get("usable"):
-            raise BridgeError("no usable JS parser (" + str(st.get("integrity")) + ")", "setup", 409)
-        flags = [f for f in str(os.environ.get("BRIDGE_NODE_FLAGS", self.cfg.data.get("node_flags", "")) or "").split() if f]
-        script = self.store.path("tools", "analyze_js.cjs")
-        self.dir.mkdir(parents=True, exist_ok=True)
-        script.write_text(JS_ANALYZER, "utf-8")
-        r = subprocess.run([self._node()] + flags + [str(script), st["parser"]["path"]], input=json.dumps({"scripts": scripts}), capture_output=True, text=True, timeout=120)
-        if r.returncode != 0:
-            raise BridgeError("the JS analyzer failed: " + redact_evidence(r.stderr, 200), "setup", 500)
-        return json.loads(r.stdout)["results"]
-
 
 # -- low-confidence path: no parser. Literal call sites only; everything computed is `unknown` ---------------------------------------------------
 _LIT_CALL_RE = re.compile(r"""\b(fetch|sendBeacon)\s*\(\s*(["'`])((?:\\.|(?!\2).)*)\2""")
