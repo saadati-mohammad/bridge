@@ -26767,6 +26767,8 @@ setTimeout(() => process.exit(0), 60000);
             self.assertIn('"PLAYWRIGHT_BROWSERS_PATH"', body)
             self.assertIn('"--target", str(target)', src[src.index("def _ensure_local_python_package"):src.index("def export_bundle")])
             self.assertIn('cryptography==50.0.2', src[src.index("def export_bundle"):src.index("def import_bundle")])
+            self.assertIn('log("automatic tool setup complete: pinned local JavaScript analysis is ready", "debug")', src)
+            self.assertIn('log(f"preparing optional dependency {requirement} in the application data folder", "debug")', src)
 
         def test_toolchain_state_is_not_rendered_in_dashboard(self) -> None:
             src = Path(__file__).read_text(encoding="utf-8")
