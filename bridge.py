@@ -164,7 +164,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.40"
+VERSION = "7.41"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -25535,6 +25535,51 @@ def run_selftest(quick: bool = False) -> int:
                 self.assertIn("native descriptor is missing", result["reason"])
             finally:
                 globals()["o26_investigate"], globals()["o27_author"], globals()["o28_review"], globals()["o27_commit"] = originals
+
+        def test_o29_fake_brain_investigation_authors_commits_and_attaches_native_modules(self) -> None:
+            h = TestGroupO17("test_o17_hmac_header_plus_pow_is_direct_candidate_after_the_cross_check")
+            exs = h.site(sig=True, pow_=False)
+            scripts = h.scripts()
+            a = add_acct(self.app, "brain1", "Brain", host=h.HOST, tier="page")
+            lc_init(a, "degraded_fallback", "test")
+            self.acc.save_session("brain1", {"cookies": [], "auth": {}, "ua": ""})
+            recipe = {"host": h.HOST, "tier": "page", "continuity": False, "version": 1,
+                      "chat": {"method": "POST", "url": "https://mock17.test/api/chat", "headers": {"x-ts": "{{timestamp}}"},
+                               "body_kind": "json", "body": {"prompt": "{{prompt}}", "model": "m-fast"}},
+                      "stream": TestGroupO8.STREAM}
+            self.store.write(f"recipes/{h.HOST}.json", recipe)
+            CaptureStore(self.store, h.HOST).add_run("login+learn", exs)
+            store_served(self.store, h.HOST, scripts)
+            analysis = o17_analyze(exs, h.HOST, scripts, endpoint="POST /api/chat", input_locs=("body.$.prompt",))
+            self.store.write(f"analysis/{safe_host_dir(h.HOST)}/o17.json", analysis, private=True)
+            sig = h.sig_spec()
+            action_view = {"action": "view_script", "params": {"sha256": o17_script_hash(h.APP), "lines": [1, 7]}, "reason": "inspect the client"}
+            action_spec = {"action": "spec", "params": {k: sig[k] for k in ("loc", "name", "provenance", "expr")}, "reason": "the source explains the header"}
+            author_fixture = TestGroupO27("test_o27_a_correct_draft_passes_every_gate_and_the_generated_test_file_runs_for_real")
+            fake = FakeBrain({"o26_round": [action_view, action_spec],
+                              "o27_author": {"tokens_py": author_fixture.good(), "notes": "ported from the cited script"},
+                              "o28_review": {"verdict": "matches the cited source", "findings": []}})
+            brain = Brain(fake.send, lambda _n, _w: None, site=h.HOST)
+            self.acc.brain_for = lambda *_args, **_kwargs: brain  # type: ignore[assignment]
+
+            class PendingSupervisor:
+                def tick(inner_self) -> List[Dict[str, Any]]:
+                    parts, why = self.acc.o8_parts(a)
+                    self.assertIsNotNone(parts, why)
+                    lc_transition(a, "validating", "mock O8 gate started")
+                    return [{"id": "brain1", "state": "validating", "did": ["o8:pending"]}]
+
+            self.acc.o9_supervisor = lambda: PendingSupervisor()  # type: ignore[assignment]
+            result = self.acc.o29_after_learn("brain1")
+            self.assertEqual(result["status"], "validating", result)
+            self.assertEqual(result["review"]["outcome"], "reviewed")
+            self.assertEqual(result["supervisor"]["did"], ["o8:pending"])
+            loaded = o18_load(self.store, h.HOST, scripts)
+            self.assertTrue(loaded.get("use"), loaded)
+            self.assertIsNotNone(loaded.get("native"), loaded)
+            self.assertIn(O18_NATIVE_FILE, loaded["manifest"]["modules"])
+            self.assertEqual([re.match(r"BRAIN_TASK ([A-Za-z0-9_.-]+)", p).group(1) for p in fake.prompts],
+                             ["o26_round", "o26_round", "o27_author", "o28_review"])
 
         def test_two_supervisor_ticks_move_a_fallback_account_to_stable_direct_through_a_validation_id(self) -> None:
             a = self.account()
