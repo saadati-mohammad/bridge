@@ -163,7 +163,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.49"
+VERSION = "7.50"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -3669,7 +3669,7 @@ def _ensure_playwright_legacy() -> None:
     try:
         __import__("playwright.sync_api")
     except ImportError:
-        log("preparing the optional Playwright runtime in the application data folder", "info")
+        log("preparing the optional Playwright runtime in the application data folder", "debug")
         r = subprocess.run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-warn-script-location", "--target", str(tool_root), "playwright==1.64.1"], capture_output=True, text=True, timeout=600)
         if r.returncode:
             raise BridgeError("could not prepare the app-local Playwright runtime: " + redact_evidence(r.stderr, 300), "setup", 502)
@@ -3686,7 +3686,7 @@ def _ensure_playwright_legacy() -> None:
                 return
             except Exception:
                 continue
-    log("downloading Chromium (one time)...", "warn")
+    log("preparing the app-local Chromium runtime", "debug")
     # Browser downloads are app-local and version-coupled to the pinned Python package.
     r = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], capture_output=True, text=True, timeout=900, env=dict(os.environ, PYTHONPATH=str(tool_root)))
     if r.returncode:
@@ -6243,7 +6243,7 @@ def _ensure_local_python_package(import_name: str, requirement: str, timeout: in
         return target
     except ImportError:
         pass
-    log(f"preparing optional dependency {requirement} in the application data folder", "info")
+    log(f"preparing optional dependency {requirement} in the application data folder", "debug")
     try:
         proc = subprocess.run([sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--no-warn-script-location", "--target", str(target), requirement], capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
@@ -11583,7 +11583,7 @@ def bootstrap_toolchain(store: "Store", cfg: "Config") -> None:
         if result.get("usable"):
             with TOOLCHAIN_BOOTSTRAP_LOCK:
                 TOOLCHAIN_BOOTSTRAP.update(state="ready", message="pinned analysis tools are ready", updated=now())
-            log("automatic tool setup complete: pinned local JavaScript analysis is ready", "ok")
+            log("automatic tool setup complete: pinned local JavaScript analysis is ready", "debug")
         else:
             raise BridgeError("installed parser is not trusted: " + str(result.get("integrity")), "setup", 409)
     except Exception as e:
