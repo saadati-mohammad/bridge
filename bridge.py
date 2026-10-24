@@ -21345,8 +21345,9 @@ def run_selftest(quick: bool = False) -> int:
             st = self.task(m2)
             self.assertEqual([e["account"] for e in st["route_history"]], ["a1", "b2"])
             self.assertEqual((st["msg_total"], len(st["checkpoints"])), (3, 2))
-            self.assertEqual(self.store.path("tasks").glob("task_*.json").__class__.__name__, "generator")
-            self.assertEqual(len(list(self.store.path("tasks").glob("task_*.json"))), 1)       # ONE task, however many routes served it
+            task_files = self.store.path("tasks").glob("task_*.json")
+            self.assertIs(iter(task_files), task_files)                                      # Path.glob's concrete iterator type is Python-version-specific
+            self.assertEqual(len(list(self.store.path("tasks").glob("task_*.json"))), 1)   # ONE task, however many routes served it
 
         def test_state_is_reloaded_after_a_restart_and_continues(self) -> None:
             self.reply_calls = [[{"id": "toolu_A", "name": "Bash", "input": {"command": "ls"}}]]
