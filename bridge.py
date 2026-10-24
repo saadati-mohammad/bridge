@@ -164,7 +164,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.45"
+VERSION = "7.46"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -25585,7 +25585,7 @@ def run_selftest(quick: bool = False) -> int:
             self.assertEqual([re.match(r"BRAIN_TASK ([A-Za-z0-9_.-]+)", p).group(1) for p in fake.prompts],
                              ["o26_round", "o26_round", "o27_author", "o28_review"])
 
-        def test_o29_native_ready_runs_real_o8_battery_then_serves_continued_chat_without_browser(self) -> None:
+        def test_o29_native_ready_promotes_serves_direct_and_falls_back_on_drift(self) -> None:
             a = self.account()
             self.modules()
             exs, scripts = self.o8.exs, self.o8.f.scripts()
@@ -25610,6 +25610,16 @@ def run_selftest(quick: bool = False) -> int:
             self.assertEqual("".join(backend.ask(conv, "What was the code?")), "zz9")
             self.assertEqual(len(self.classic.asked), classic_calls)
             self.assertFalse(self.acc.browsers)
+            self.site.fail_status = 503
+            fresh = backend.new_conv()
+            self.assertEqual("".join(backend.ask(fresh, "Reply with the single word bm0000abcd and nothing else.")), "bm0000abcd")
+            self.assertEqual(lc_state(a), "stable_direct")
+            continued = {**backend.new_conv(), "turn": 2, "native": {"id": "c1"}}
+            with self.assertRaises(BridgeError):
+                "".join(backend.ask(continued, "More."))
+            self.assertEqual(lc_state(a), "degraded_fallback")
+            repair = self.store.read(f"site_modules/{safe_host_dir(self.HOST)}/repair.json")
+            self.assertEqual(repair["status"], "pending")
 
         def test_two_supervisor_ticks_move_a_fallback_account_to_stable_direct_through_a_validation_id(self) -> None:
             a = self.account()
