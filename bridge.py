@@ -166,7 +166,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.61"
+VERSION = "7.62"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -858,7 +858,7 @@ class Config:
         "max_body_mb": 32,
         "queue_wait_seconds": 300,
         "allow_private_api_hosts": False,    # opt-in for local model servers (Ollama, LM Studio ...)
-        "client_model_prefixes": ["claude-"],  # client model names that mean "use bridge-auto" (data, editable)
+        "client_model_prefixes": ["claude-", "sonnet", "opus", "haiku"],  # recognized Claude Code aliases route to the configured Bridge policy
         "catalog_ttl_seconds": 86400,        # model catalog is refreshed when older than this (0 = only on demand)
         "catalog_auto_refresh": True,        # discover on account add/login and when stale; never polls in the background
         "catalog_retry_seconds": 300,        # minimum gap between automatic (non-explicit) refresh attempts
@@ -16645,7 +16645,10 @@ class RoutingEngine:
                     if rule:
                         pol, prof, how2, tgt = self._resolve_name(str(rule["to"]), cfgd, pinned, key_id, True)
                         return pol, prof, f"client-map>{how2}", tgt
-                    target, how = self.acc.resolve(m, pinned)              # legacy client_model_prefixes -> auto, otherwise the 404
+                    if m.lower() in ("sonnet", "opus", "haiku"):
+                        target, how = (pinned or ""), "claude-native-alias"
+                    else:
+                        target, how = self.acc.resolve(m, pinned)          # legacy client_model_prefixes -> auto, otherwise the 404
         if profile_override:
             how = "profile-alias"
         pol_name = ""
@@ -17091,7 +17094,10 @@ class RoutingEngine:
     def explain_none(dec: RouteDecision, kind: str, policy: Dict[str, Any]) -> str:
         why = "; ".join(f"{e['route']}: {e['code']} ({e['detail']})" for e in dec.excluded[:8]) or "no candidate routes exist - add an account in the dashboard"
         more = f" (+{len(dec.excluded) - 8} more)" if len(dec.excluded) > 8 else ""
+        if any(e.get("code") == "account_not_ready" and "needs_learning" in e.get("detail", "") for e in dec.excluded):
+            why += "; login is saved, but this website has no learned request protocol yet. In Bridge, open the account card and choose 'Start learning'; login alone cannot make a website account usable through Claude Code"
         return f"no eligible route under policy '{dec.policy}' ({kind}). Excluded: {why}{more}"
+
 
     # -- records ----------------------------------------------------------------------------------------------------
     def record(self, dec: RouteDecision) -> None:
@@ -17182,6 +17188,45 @@ def redact_stored(text: Any) -> Tuple[str, int]:
 
 def call_key(name: str, args: Any) -> str:
     return sha(str(name) + "|" + jdump(args if args is not None else {}))
+
+
+def forget_account_routes(config: Dict[str, Any], aid: str) -> Dict[str, Any]:
+    """Remove deleted account references and prune policies that would otherwise become broken."""
+    out = dict(config)
+    policies = {k: dict(v) for k, v in (out.get("policies") or {}).items() if isinstance(v, dict)}
+    removed: set = set()
+    target = "acct:" + aid
+    for name, policy in list(policies.items()):
+        policy["members"] = [r for r in (policy.get("members") or []) if not str(r).startswith(target)]
+        backups = [r for r in (policy.get("backups") or []) if not str(r).startswith(target)]
+        primary = policy.get("primary")
+        if isinstance(primary, str) and primary.startswith(target):
+            primary = backups.pop(0) if backups else ""
+        if "backups" in policy:
+            policy["backups"] = backups
+        if primary:
+            policy["primary"] = primary
+        else:
+            policy.pop("primary", None)
+        if (policy.get("kind") == "fixed" and len(policy.get("members") or []) != 1
+                or policy.get("kind") == "rotation" and not policy.get("members")
+                or policy.get("kind") == "failover" and (not policy.get("primary") or not policy.get("backups"))):
+            removed.add(name)
+            policies.pop(name, None)
+    out["policies"] = policies
+    out["excluded_routes"] = [r for r in (out.get("excluded_routes") or []) if not str(r).startswith(target)]
+    out["client_models"] = [r for r in (out.get("client_models") or [])
+                            if not (isinstance(r, dict) and str(r.get("to") or "").startswith("bridge-pool/")
+                                    and str(r.get("to")).split("/", 1)[1] in removed)]
+    for key in ("aliases", "key_policy", "account_policy"):
+        mapping = dict(out.get(key) or {})
+        for k, val in list(mapping.items()):
+            if (key == "account_policy" and k == aid) or val in removed:
+                mapping.pop(k, None)
+        out[key] = mapping
+    if out.get("default_policy") in removed:
+        out["default_policy"] = ""
+    return out
 
 
 class TaskStore:
@@ -18442,9 +18487,12 @@ def open_workspace_tool(app_name: str, folder: str, port: int, api_key: str, mod
             if not re.fullmatch(r"[A-Za-z0-9._:/-]+", model):
                 raise BridgeError("invalid Claude Code model or pool name", "client", 400)
             # Keep Claude Code on its recognized `sonnet` alias while mapping that alias to the Bridge route.
-            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = model
-            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = model
-            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model
+            # These values are Claude Code's recognized UI aliases. The Bridge maps them to the
+            # owner's account pool in routing.json; exposing bridge-auto/pool ids here makes
+            # newer Claude Code releases warn that the model is unknown.
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = "sonnet"
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = "opus"
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = "haiku"
         if full_access:
             args.append("--dangerously-skip-permissions")
     elif app_name in ("vscode", "cursor"):
@@ -19013,6 +19061,16 @@ class Handler(BaseHTTPRequestHandler):
                 except BridgeError as e_:
                     return self._json(e_.status, {"error": str(e_)})
             if method == "DELETE" and len(parts) == 2:
+                routing_ = forget_account_routes(app.engine.config(), aid)
+                route_errors_ = app.engine.save_config(routing_)
+                if route_errors_:
+                    return self._json(409, {"error": "account could not be removed from routing policies", "problems": route_errors_})
+                for key_ in cfg.data.get("keys", []):
+                    if key_.get("account") == aid:
+                        key_["account"] = ""
+                if cfg.data.get("default_account") == aid:
+                    cfg.data["default_account"] = ""
+                cfg.save()
                 acc.remove(aid)
                 return self._json(200, {"ok": True})
             if parts[2:] in (["relogin"], ["relearn"]) and method == "POST":
@@ -19474,6 +19532,10 @@ cf_rm:'این حساب و پروفایل مرورگرش حذف شود؟',cf_forg
 L.en.add_btn='Add web account';L.en.add_hint='The account is saved as soon as you confirm login in the selected Chrome profile. Learning is optional and can be started later.';L.en.account_profile='Chrome profile';L.en.profile_any='Any paired profile';L.en.profile_unpaired='No paired Chrome profiles yet';L.en.pc_profiles='Chrome profiles';L.en.profile_assign='Use in profile';L.en.login_queued='Login request queued. Open the AI Web Bridge extension in the selected Chrome profile.';L.en.strategy_title='Claude Code account pool';L.en.strategy_hint='Choose the accounts Claude Code may use and how it selects among them. Only enabled, eligible accounts in this list are considered.';L.en.strategy_save='Save routing strategy';L.en.strategy_fixed='Fixed account';L.en.strategy_auto='Automatic selection';L.en.strategy_rotation='Rotate conversations through selected accounts';L.en.strategy_failover='Primary, then retry-safe failover';L.en.strategy_latency='Lowest measured latency';L.en.strategy_best_fit='Best fit for the request';L.en.strategy_manual='Ask before changing account';L.en.strategy_policy='Selection strategy';L.en.strategy_saved='Routing strategy saved.';L.en.strategy_empty='Select at least one account.';L.en.strategy_choose_one='Fixed routing requires exactly one selected account.';L.en.strategy_needs_two='This strategy needs at least two selected accounts.';L.en.profile_disconnected='Disconnected';L.en.profile_connected='Connected';L.en.profile_none='No Chrome profiles paired. Set one up above.';L.en.profile_changed='Account profile saved.';
 L.fa.add_btn='افزودن حساب وب';L.fa.add_hint='پس از تأیید ورود در افزونه‌ی پروفایل انتخاب‌شده، حساب بلافاصله ذخیره و قابل استفاده است. یادگیری اختیاری است و بعداً جداگانه آغاز می‌شود.';L.fa.account_profile='پروفایل Chrome';L.fa.profile_any='هر پروفایل متصل';L.fa.profile_unpaired='هنوز پروفایل Chrome متصل نیست';L.fa.pc_profiles='پروفایل‌های Chrome';L.fa.profile_assign='پروفایل استفاده';L.fa.login_queued='درخواست ورود ثبت شد؛ افزونه‌ی AI Web Bridge را در پروفایل Chrome انتخاب‌شده باز کنید.';L.fa.strategy_title='حساب‌های قابل استفاده در Claude Code';L.fa.strategy_hint='حساب‌هایی را که Claude Code اجازه‌ی استفاده از آن‌ها را دارد و روش انتخاب را مشخص کنید. فقط حساب‌های فعال و واجدشرایط همین فهرست بررسی می‌شوند.';L.fa.strategy_save='ذخیره‌ی سیاست استفاده';L.fa.strategy_fixed='یک حساب ثابت';L.fa.strategy_auto='انتخاب خودکار';L.fa.strategy_rotation='چرخش گفت‌وگوها میان حساب‌های انتخاب‌شده';L.fa.strategy_failover='حساب اصلی، سپس جایگزینی امن در خطای قابل‌تکرار';L.fa.strategy_latency='کمترین زمان پاسخ اندازه‌گیری‌شده';L.fa.strategy_best_fit='انتخاب مناسب‌تر برای درخواست';L.fa.strategy_manual='پیش از تغییر حساب تأیید بگیر';L.fa.strategy_policy='روش انتخاب حساب';L.fa.strategy_saved='سیاست مسیریابی ذخیره شد.';L.fa.strategy_empty='حداقل یک حساب انتخاب کنید.';L.fa.strategy_choose_one='مسیریابی ثابت به دقیقاً یک حساب نیاز دارد.';L.fa.strategy_needs_two='این روش حداقل به دو حساب انتخاب‌شده نیاز دارد.';L.fa.profile_disconnected='قطع';L.fa.profile_connected='متصل';L.fa.profile_none='هنوز پروفایل Chrome جفت نشده است؛ ابتدا از بالا یکی را وصل کنید.';L.fa.profile_changed='پروفایل حساب ذخیره شد.';
 L.en.workspace_key_label='Bridge API key';L.fa.workspace_key_label='کلید API در Bridge';
+L.en.add_hint='After confirming login, the account is saved. Sign-in lets Bridge verify the browser session; for a new website, start learning separately before Claude Code can send requests through it.';
+L.fa.add_hint='بعد از تأیید ورود، حساب ذخیره می‌شود. این یعنی نشست مرورگر ثبت شده؛ برای استفاده از سایت جدید در Claude Code باید جداگانه دکمه‌ی شروع یادگیری را بزنی.';
+L.en.strategy_hint='Choose accounts Claude Code may use and how it selects them. A green login status only confirms sign-in; a site marked needs_learning cannot serve Claude Code until you start learning. Start learning or remove an account here.';
+L.fa.strategy_hint='حساب‌های مجاز Claude Code و روش انتخاب را مشخص کن. سبز بودن ورود فقط تأیید می‌کند وارد شده‌ای؛ حساب needs_learning تا شروع یادگیری نمی‌تواند به Claude Code پاسخ بدهد. همین‌جا یادگیری را شروع یا حساب را حذف کن.';
 let lang=localStorage.lang||'fa';const t=k=>(L[lang]&&L[lang][k])??L.en[k]??k;
 function setTheme(v){if(v==='system')document.documentElement.removeAttribute('data-theme');else document.documentElement.dataset.theme=v;localStorage.setItem('theme',v)}
 const STAGES=['open','login','learn','analyse','verify','finish'];
@@ -19484,9 +19546,9 @@ document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));d
 if(S&&S.presets&&$('preset').options.length)$('preset').options[0].textContent=t('preset');navRender();render();renderCtx()}
 function navRender(){$('nav').innerHTML=VIEWS.map(v=>`<button class="${v[0]==view?'on':''}" onclick="go('${v[0]}')">${esc(t(v[1]))}</button>`).join('')}
 function go(v){view=v;document.querySelectorAll('.view').forEach(e=>e.classList.toggle('on',e.id=='v_'+v||(v=='accounts'&&e.id=='v_adv')));navRender()}
-function snippets(k,port,model){const u='http://127.0.0.1:'+port,m=model||'bridge-auto';return{'claude-ps':`$env:ANTHROPIC_BASE_URL="${u}"\n$env:ANTHROPIC_API_KEY="${k}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:ANTHROPIC_DEFAULT_SONNET_MODEL="${m}"\n$env:ANTHROPIC_DEFAULT_OPUS_MODEL="${m}"\n$env:ANTHROPIC_DEFAULT_HAIKU_MODEL="${m}"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nclaude`,
-'claude-sh':`export ANTHROPIC_BASE_URL=${u}\nexport ANTHROPIC_API_KEY=${k}\nexport ANTHROPIC_MODEL=sonnet\nexport ANTHROPIC_DEFAULT_SONNET_MODEL=${m}\nexport ANTHROPIC_DEFAULT_OPUS_MODEL=${m}\nexport ANTHROPIC_DEFAULT_HAIKU_MODEL=${m}\nexport CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
-'claude-cmd':`set ANTHROPIC_BASE_URL=${u}\nset ANTHROPIC_API_KEY=${k}\nset ANTHROPIC_MODEL=sonnet\nset ANTHROPIC_DEFAULT_SONNET_MODEL=${m}\nset ANTHROPIC_DEFAULT_OPUS_MODEL=${m}\nset ANTHROPIC_DEFAULT_HAIKU_MODEL=${m}\nset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
+function snippets(k,port,model){const u='http://127.0.0.1:'+port;return{'claude-ps':`$env:ANTHROPIC_BASE_URL="${u}"\n$env:ANTHROPIC_API_KEY="${k}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:ANTHROPIC_DEFAULT_SONNET_MODEL="sonnet"\n$env:ANTHROPIC_DEFAULT_OPUS_MODEL="opus"\n$env:ANTHROPIC_DEFAULT_HAIKU_MODEL="haiku"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nclaude`,
+'claude-sh':`export ANTHROPIC_BASE_URL=${u}\nexport ANTHROPIC_API_KEY=${k}\nexport ANTHROPIC_MODEL=sonnet\nexport ANTHROPIC_DEFAULT_SONNET_MODEL=sonnet\nexport ANTHROPIC_DEFAULT_OPUS_MODEL=opus\nexport ANTHROPIC_DEFAULT_HAIKU_MODEL=haiku\nexport CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
+'claude-cmd':`set ANTHROPIC_BASE_URL=${u}\nset ANTHROPIC_API_KEY=${k}\nset ANTHROPIC_MODEL=sonnet\nset ANTHROPIC_DEFAULT_SONNET_MODEL=sonnet\nset ANTHROPIC_DEFAULT_OPUS_MODEL=opus\nset ANTHROPIC_DEFAULT_HAIKU_MODEL=haiku\nset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
 'openai':`Base URL : ${u}/v1\nAPI key  : ${k}\nModel    : bridge-auto   (or acct:<id> / the exact account label to force one account)\n\nCursor / VS Code agents / Continue / Cline / any OpenAI-compatible client:\nuse the "OpenAI compatible" provider with the values above.`}}
 const names={'claude-ps':'Claude Code (PowerShell)','claude-sh':'Claude Code (bash)','claude-cmd':'Claude Code (cmd)','openai':'Cursor / VS Code / OpenAI-compatible'};
 const mmss=s=>{s=Math.max(0,Math.floor(s));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
@@ -19539,10 +19601,10 @@ async function setServingMode(id,mode){try{await api('accounts/'+encodeURICompon
 async function setModelChoice(id,variant){try{if(variant)await api('accounts/'+encodeURIComponent(id)+'/model-choice','POST',{mode:'fixed',variant});else await api('accounts/'+encodeURIComponent(id)+'/model-choice','DELETE');await tick()}catch(e){alert(errMsg(e));await tick()}}
 async function setAccountProfile(id,clientId){try{await api('accounts/'+encodeURIComponent(id)+'/chrome-profile','POST',{client_id:clientId});$('strategy_status').textContent=t('profile_changed');await tick()}catch(e){alert(errMsg(e));await tick()}}
 function renderStrategy(){if(!S)return;const accts=S.accounts.filter(a=>!a.disabled),policies=(RC&&RC.config&&RC.config.policies)||{};const current=policies['user-claude-pool'];if(routePoolDraft===null)routePoolDraft=(current&&current.members||[]).map(x=>String(x).replace(/^acct:/,'').split('/')[0]);if(!routeKindDraft)routeKindDraft=current&&current.kind||'auto';const kind=$('strategy_kind');if(kind&&kind.value!==routeKindDraft)kind.value=routeKindDraft;
-$('strategy_accounts').innerHTML=accts.map(a=>`<label class="pool-item"><input type="checkbox" value="${esc(a.id)}" ${routePoolDraft.includes(a.id)?'checked':''} onchange="toggleRouteAccount(this)"><span><b>${esc(a.label)}</b><br><span class="mut ltr">${esc(a.host)}</span></span><span class="b ${a.state==='ready'||a.state==='needs_learning'?'ready':'learning'}">${esc(a.state||'')}</span></label>`).join('')||`<p class="mut">${esc(t('no_acc'))}</p>`;
+$('strategy_accounts').innerHTML=accts.map(a=>`<div class="pool-item"><label class="grow"><input type="checkbox" value="${esc(a.id)}" ${routePoolDraft.includes(a.id)?'checked':''} onchange="toggleRouteAccount(this)"><b>${esc(a.label)}</b><br><span class="mut ltr">${esc(a.host)}</span></label><span class="b ${a.state==='ready'?'ready':'learning'}">${esc(a.state==='needs_learning'?(lang==='fa'?'نیازمند یادگیری':'needs_learning'):(a.state||''))}</span>${a.state==='needs_learning'?`<button class="sm p" onclick="act(${escJ(a.id)},'relearn')">${lang==='fa'?'شروع یادگیری':'Start learning'}</button>`:''}<button class="sm d" title="${lang==='fa'?'حذف کامل حساب':'Delete account'}" onclick="delAcc(${escJ(a.id)})">${lang==='fa'?'حذف':'Remove'}</button></div>`).join('')||`<p class="mut">${esc(t('no_acc'))}</p>`;
 const sel=$('strategy_kind');if(sel)routeKindDraft=sel.value;}
 function toggleRouteAccount(el){const id=el.value;routePoolDraft=routePoolDraft||[];routePoolDraft=el.checked?[...new Set([...routePoolDraft,id])]:routePoolDraft.filter(x=>x!==id)}
-async function saveStrategy(){const members=[...(routePoolDraft||[])].filter(id=>S.accounts.some(a=>a.id===id&&!a.disabled)).map(id=>'acct:'+id);if(!members.length){$('strategy_status').textContent=t('strategy_empty');return}const kind=$('strategy_kind').value;if(kind==='fixed'&&members.length!==1){$('strategy_status').textContent=t('strategy_choose_one');return}if((kind==='failover'||kind==='rotation')&&members.length<2){$('strategy_status').textContent=t('strategy_needs_two');return}const config={...(RC&&RC.config||{}),policies:{...((RC&&RC.config&&RC.config.policies)||{})}};let policy={kind,profile:'balanced',members};if(kind==='rotation'){policy={kind,profile:'balanced',members,strategy:'round_robin',unit:'conversation'}}else if(kind==='failover'){policy={kind,profile:'balanced',primary:members[0],backups:members.slice(1)}}config.policies['user-claude-pool']=policy;try{await api('routing','POST',config);RC={...(RC||{}),config};routePoolDraft=members.map(x=>x.replace(/^acct:/,''));routeKindDraft=kind;$('strategy_status').textContent=t('strategy_saved');renderStrategy();updateWorkspaceCommand()}catch(e){$('strategy_status').textContent=errMsg(e)}}
+async function saveStrategy(){const members=[...(routePoolDraft||[])].filter(id=>S.accounts.some(a=>a.id===id&&!a.disabled)).map(id=>'acct:'+id);if(!members.length){$('strategy_status').textContent=t('strategy_empty');return}const kind=$('strategy_kind').value;if(kind==='fixed'&&members.length!==1){$('strategy_status').textContent=t('strategy_choose_one');return}if((kind==='failover'||kind==='rotation')&&members.length<2){$('strategy_status').textContent=t('strategy_needs_two');return}const config={...(RC&&RC.config||{}),policies:{...((RC&&RC.config&&RC.config.policies)||{})}};let policy={kind,profile:'balanced',members};if(kind==='rotation'){policy={kind,profile:'balanced',members,strategy:'round_robin',unit:'conversation'}}else if(kind==='failover'){policy={kind,profile:'balanced',primary:members[0],backups:members.slice(1)}}config.policies['user-claude-pool']=policy;config.client_models=(config.client_models||[]).filter(r=>!(r&&r.match==='exact'&&['sonnet','opus','haiku'].includes(String(r.value||'').toLowerCase())));for(const value of ['sonnet','opus','haiku'])config.client_models.push({match:'exact',value,to:'bridge-pool/user-claude-pool'});try{await api('routing','POST',config);RC={...(RC||{}),config};routePoolDraft=members.map(x=>x.replace(/^acct:/,''));routeKindDraft=kind;$('strategy_status').textContent=t('strategy_saved');renderStrategy();updateWorkspaceCommand()}catch(e){$('strategy_status').textContent=errMsg(e)}}
  $('rep_show').onclick=async()=>{let h=$('rep_host').value.trim();if(!h)return;try{if(/^https?:\/\//i.test(h))h=new URL(h).hostname;if(!/^[a-z0-9.:[\]-]+$/i.test(h)||h.includes('..'))throw new Error('Enter a site hostname or URL, such as claude.ai');$('rep_host').value=h;$('rep_out').style.display='block';const r=await api('analysis/'+encodeURIComponent(h)+'/report');$('rep_out').textContent=r.markdown||'no report yet for this site'}catch(e){$('rep_out').style.display='block';$('rep_out').textContent='✘ '+e.message}};
 let reqOffset=0,reqTotal=0;async function showRequests(offset=0){let h=$('rep_host').value.trim();if(!h)return;if(/^https?:\/\//i.test(h))h=new URL(h).hostname;$('rep_host').value=h;reqOffset=Math.max(0,offset);try{const r=await api('analysis/'+encodeURIComponent(h)+'/requests?offset='+reqOffset+'&limit=100');reqTotal=r.total||0;$('req_out').style.display='block';$('req_nav').hidden=false;$('req_page').textContent=(reqTotal?`${reqOffset+1}-${Math.min(reqOffset+r.rows.length,reqTotal)}`:'0')+' / '+reqTotal;$('req_prev').disabled=reqOffset===0;$('req_next').disabled=reqOffset+r.rows.length>=reqTotal;$('req_out').innerHTML=(r.rows||[]).map(x=>`<details class="card"><summary><b>#${esc(x.seq??'')} ${esc(x.method)} ${esc(x.status||'')}</b> <span class="ltr mut">${esc(x.url)}</span> <span class="mut">${esc(x.type)} · ${esc(x.duration_s??'')}s</span></summary><div class="ltr"><b>Request (${esc(x.request_format)}):</b><pre class="mini">${esc(x.request||'(no text preview)')}</pre><b>Response (${esc(x.response_format)}):</b><pre class="mini">${esc(x.response||'(no text preview)')}</pre>${x.failed?'<div class="err">'+esc(x.failed)+'</div>':''}</div></details>`).join('')||'<p class="mut">No captured requests for this site.</p>'}catch(e){$('req_out').style.display='block';$('req_out').textContent='✘ '+errMsg(e)}}
 $('req_show').onclick=()=>showRequests(0);$('req_prev').onclick=()=>showRequests(reqOffset-100);$('req_next').onclick=()=>showRequests(reqOffset+100);
@@ -19591,9 +19653,9 @@ if(view=='log'||!$('log').textContent){const lg=await api('log');const hide=$('h
 render();renderCtx();renderO12();renderDecisions()}catch(e){$('st').textContent='disconnected'}finally{busy=false}}
 async function addAcc(){const url=$('url').value.trim();if(!url)return alert(t('url_ph'));try{await api('accounts','POST',{url,label:$('label').value.trim(),learn:$('learn_on_add').checked,manual_login:true,pc_client_id:$('account_profile').value});$('url').value='';$('label').value='';$('urlprev').textContent='';tick()}catch(e){alert(errMsg(e))}}
 async function selectWorkspace(){try{const r=await api('workspace/select','POST',{});if(r.folder){$('workspace_path').value=r.folder;localStorage.workspacePath=r.folder;$('workspace_status').textContent=t('workspace_ready')}else $('workspace_status').textContent=t('workspace_cancel');updateWorkspaceCommand()}catch(e){$('workspace_status').textContent=t('workspace_error')+errMsg(e)}}
-function workspaceModel(){const key=(S&&S.keys.find(k=>k.id===$('workspace_key').value))||{},hasPool=!!(RC&&RC.config&&RC.config.policies&&RC.config.policies['user-claude-pool']);return key.account?'acct:'+key.account:(hasPool?'bridge-pool/user-claude-pool':'bridge-auto')}
+function workspaceModel(){return 'sonnet'}
  function updateWorkspaceCommand(){const app=$('workspace_app').value,folder=$('workspace_path').value,keyValue=(S&&S.keys.find(k=>k.id===$('workspace_key').value)||{}).key||'',base='http://127.0.0.1:'+(S?S.port:'8788'),policy=workspaceModel();localStorage.workspaceApp=app;localStorage.claudeFullAccess=$('claude_full_access').checked?'1':'0';let cmd='';const psPath="'"+folder.replace(/'/g,"''")+"'";
- if(!folder)cmd=t('workspace_ph');else if(app==='claude'&&!keyValue)cmd=t('workspace_key_required');else if(app==='claude'){const full=$('claude_full_access').checked,flag=full?' --dangerously-skip-permissions':'';cmd=`$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_API_KEY="${keyValue}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:ANTHROPIC_DEFAULT_SONNET_MODEL="${policy}"\n$env:ANTHROPIC_DEFAULT_OPUS_MODEL="${policy}"\n$env:ANTHROPIC_DEFAULT_HAIKU_MODEL="${policy}"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nSet-Location -LiteralPath ${psPath}\nclaude${flag}`}
+ if(!folder)cmd=t('workspace_ph');else if(app==='claude'&&!keyValue)cmd=t('workspace_key_required');else if(app==='claude'){const full=$('claude_full_access').checked,flag=full?' --dangerously-skip-permissions':'';cmd=`$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_API_KEY="${keyValue}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:ANTHROPIC_DEFAULT_SONNET_MODEL="sonnet"\n$env:ANTHROPIC_DEFAULT_OPUS_MODEL="opus"\n$env:ANTHROPIC_DEFAULT_HAIKU_MODEL="haiku"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nSet-Location -LiteralPath ${psPath}\nclaude${flag}`}
 else if(app==='vscode')cmd=`code "${folder}"`;else if(app==='cursor')cmd=`cursor "${folder}"`;else if(app==='cmd')cmd=`cd /d "${folder}"`;else cmd=`Set-Location -LiteralPath ${psPath}`;
  $('workspace_command').textContent=cmd||'Select a workspace folder to prepare the command.'}
 async function copyWorkspaceCommand(){updateWorkspaceCommand();const cmd=$('workspace_command').textContent;if(!cmd||cmd===t('workspace_ph')||cmd===t('workspace_key_required'))return;try{await navigator.clipboard.writeText(cmd);$('workspace_status').textContent=t('workspace_copied')}catch(e){$('workspace_status').textContent=cmd}}
@@ -28050,7 +28112,9 @@ setTimeout(() => process.exit(0), 60000);
                 with mock.patch("shutil.which", return_value="C:/Tools/claude.exe"), mock.patch("subprocess.Popen", popen):
                     open_workspace_tool("claude", str(tmp), 8788, "bridge-key", "bridge-pool/user-claude-pool")
                 self.assertEqual(popen.call_args.kwargs["env"]["ANTHROPIC_MODEL"], "sonnet")
-                self.assertEqual(popen.call_args.kwargs["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "bridge-pool/user-claude-pool")
+                self.assertEqual(popen.call_args.kwargs["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "sonnet")
+                self.assertEqual(popen.call_args.kwargs["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "opus")
+                self.assertEqual(popen.call_args.kwargs["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "haiku")
                 with mock.patch("shutil.which", return_value="C:/Tools/claude.exe"), mock.patch("subprocess.Popen", popen):
                     open_workspace_tool("claude", str(tmp), 8788, "bridge-key", "bridge-auto", full_access=True)
                 self.assertIn("--dangerously-skip-permissions", popen.call_args.args[0])
@@ -28171,6 +28235,24 @@ setTimeout(() => process.exit(0), 60000);
             self.assertIn("Start here", DASHBOARD_HTML)
             self.assertIn("ANTHROPIC_DEFAULT_SONNET_MODEL", DASHBOARD_HTML)
             self.assertIn("--dangerously-skip-permissions", DASHBOARD_HTML)
+            self.assertIn("needs_learning cannot serve Claude Code until you start learning", DASHBOARD_HTML)
+            self.assertIn("Start learning", DASHBOARD_HTML)
+            self.assertIn("function workspaceModel(){return 'sonnet'}", DASHBOARD_HTML)
+
+        def test_account_deletion_prunes_its_routes_without_breaking_other_pools(self) -> None:
+            cfg = {"policies": {"pool": {"kind": "rotation", "members": ["acct:a1", "acct:a2"]},
+                                "fixed": {"kind": "fixed", "members": ["acct:a1"]}},
+                   "aliases": {"use-pool": "pool", "use-fixed": "fixed"},
+                   "key_policy": {"key1": "fixed", "key2": "pool"},
+                   "account_policy": {"a1": "fixed"}, "default_policy": "fixed",
+                   "excluded_routes": ["acct:a1", "acct:a2/model:x"]}
+            cleaned = forget_account_routes(cfg, "a1")
+            self.assertEqual(cleaned["policies"], {"pool": {"kind": "rotation", "members": ["acct:a2"]}})
+            self.assertEqual(cleaned["aliases"], {"use-pool": "pool"})
+            self.assertEqual(cleaned["key_policy"], {"key2": "pool"})
+            self.assertEqual(cleaned["account_policy"], {})
+            self.assertEqual(cleaned["default_policy"], "")
+            self.assertEqual(cleaned["excluded_routes"], ["acct:a2/model:x"])
 
     class TestServingModesAndEvidence(unittest.TestCase):
         """Owner-selected serving path and credential-safe learning evidence exports; mock data only."""
