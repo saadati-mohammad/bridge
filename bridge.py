@@ -167,7 +167,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.64"
+VERSION = "7.65"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -4744,11 +4744,48 @@ def ui_diff_lines(body: str, before: Set[str], prompt: str) -> List[str]:
     """Return newly rendered page text without echoing the request or common chat controls."""
     norm = lambda value: " ".join(str(value or "").split()).casefold()
     prompt_flat = norm(prompt)
+    body = str(body or "")
+    # Some web clients render the complete request and answer as one reflowed text block
+    # (especially when the request contains a system/tool schema). Compare a whitespace-
+    # folded view, but retain source offsets so only the echoed request is removed.
+    if prompt_flat:
+        folded: List[str] = []
+        starts: List[int] = []
+        ends: List[int] = []
+        i = 0
+        while i < len(body):
+            if body[i].isspace():
+                j = i + 1
+                while j < len(body) and body[j].isspace():
+                    j += 1
+                if folded and folded[-1] != " ":
+                    folded.append(" "); starts.append(i); ends.append(j)
+                elif folded:
+                    ends[-1] = j
+                i = j
+                continue
+            ch = body[i]
+            cf = ch.casefold()
+            folded.extend(cf)
+            starts.extend([i] * len(cf))
+            ends.extend([i + 1] * len(cf))
+            i += 1
+        flat = "".join(folded)
+        at = flat.find(prompt_flat)
+        if at >= 0:
+            raw_start, raw_end = starts[at], ends[at + len(prompt_flat) - 1]
+            # Drop the adjacent user label too, while keeping any assistant answer
+            # rendered immediately after the prompt on the same line.
+            prefix = body[:raw_start]
+            label = re.search(r"(?:you said|you|user)\s*:\s*$", prefix, re.I)
+            if label:
+                raw_start = label.start()
+            body = body[:raw_start] + body[raw_end:]
     prompt_lines = {norm(line) for line in str(prompt or "").splitlines() if len(norm(line)) >= 10}
     old = {norm(line) for line in before}
     controls = {"share", "copy", "edit", "retry", "regenerate", "you said:", "claude responded:"}
     out: List[str] = []
-    for raw in str(body or "").splitlines():
+    for raw in body.splitlines():
         line = raw.strip()
         key = norm(line)
         if not key or key in old or key in controls:
@@ -16182,6 +16219,8 @@ def parse_tool_calls(text: str, tools: Dict[str, Dict[str, Any]], seed: str = ""
     raws = [m.group(1) for m in CALL_RE.finditer(text)] + [m.group(1) for m in FENCE_RE.finditer(text)]
     lower = {n.lower(): n for n in tools}
     for raw in raws:
+        if re.search(r"[\"']name[\"']\s*:\s*[\"']\s*<\s*tool\s+name\s*>\s*[\"']", raw, re.I):
+            continue
         try:
             obj = loose_json(raw)
             name = str(obj.get("name") or obj.get("tool") or "")
@@ -20184,6 +20223,14 @@ def run_selftest(quick: bool = False) -> int:
                 self.assertEqual([c["name"] for c in calls], want, txt)
             self.assertEqual(parse_tool_calls("<tool_call>x</tool_call>", {}, "s")[1], [])                  # no tools -> text untouched
 
+        def test_echoed_tool_schema_placeholder_is_not_retried_as_an_unknown_tool(self) -> None:
+            tools = {"Bash": {"description": "", "input_schema": {}}}
+            sample = 'Here is the format:\n```tool_call\n{"name": "<tool name>", "arguments": { ... }}\n```\nPlain answer.'
+            clean, calls, problems = parse_tool_calls(sample, tools, "s")
+            self.assertEqual(calls, [])
+            self.assertEqual(problems, [])
+            self.assertIn("Plain answer.", clean)
+
     class TestStreamDecoder(unittest.TestCase):
         def test_every_single_byte_split_matches_the_unsplit_stream(self) -> None:
             samples = {
@@ -21202,6 +21249,14 @@ def run_selftest(quick: bool = False) -> int:
             self.assertNotIn("Share", response)
             self.assertIn("Hi!", response)
             self.assertIn("What would you like to work on?", response)
+
+        def test_generic_ui_diff_removes_reflowed_multiline_prompt_from_same_text_block(self) -> None:
+            prompt = "<system>\nx-anthropic-billing-header: cli\nUse the tool schema below.\n</system>\n<tool name>"
+            body = "You said: " + prompt.replace("\n", "   ") + " Claude responded: I didn't make a tool call."
+            response = "\n".join(ui_diff_lines(body, set(), prompt))
+            self.assertNotIn("anthropic-billing-header", response.lower())
+            self.assertNotIn("<tool name>", response.lower())
+            self.assertIn("I didn't make a tool call.", response)
 
         def test_unlearned_ui_preserves_the_owner_tab_if_new_chat_control_is_unavailable(self) -> None:
             from unittest import mock
