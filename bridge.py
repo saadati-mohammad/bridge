@@ -166,7 +166,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.58"
+VERSION = "7.59"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -2060,7 +2060,7 @@ def build_evidence(probes: List[Dict[str, Any]], storage: Dict[str, Any], secret
 # The user's own Chrome is the browser. A Manifest-V3 extension (embedded below, extracted at run time) executes commands that the bridge sends over an
 # authenticated loopback channel; a small Playwright-shaped compatibility layer (PCContext / PCPage / PCLocator / PCCdpSession) keeps every existing call site working.
 # ============================================================================
-PC_VERSION = "1.2.0"
+PC_VERSION = "1.2.1"
 
 PC_BACKGROUND_JS = r"""'use strict';
 // AI Web Bridge - Personal Chrome extension (service worker). Talks ONLY to http://127.0.0.1:<port>/pc/* with a bearer token obtained by one-time pairing.
@@ -13380,7 +13380,7 @@ class Accounts:
                 if target and target != client_id:
                     continue
                 rows.append({"id": a["id"], "label": str(a.get("label") or a.get("host") or "Account")[:80], "host": a.get("host", ""),
-                             "url": a.get("url", ""), "claimed": bool(target), "created": a.get("login_requested_at", a.get("created", 0))})
+                             "url": a.get("url", ""), "claimed": a.get("state") == "login_claimed", "created": a.get("login_requested_at", a.get("created", 0))})
             return rows[:100]
 
     def claim_browser_login(self, client_id: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
@@ -19330,7 +19330,7 @@ const _clog=(kind,msg,x)=>{try{if(_clog.n++>40)return;fetch('/api/clientlog',{me
 window.addEventListener('error',e=>_clog('js_error',e.message,{src:String(e.filename||'').split('/').pop(),line:e.lineno,col:e.colno,stack:e.error&&e.error.stack?String(e.error.stack):''}));
 window.addEventListener('unhandledrejection',e=>{const r=e.reason;_clog('promise_rejected',r&&r.message?r.message:String(r),{stack:r&&r.stack?String(r.stack):''})});
 ['error','warn'].forEach(m=>{const o=console[m];console[m]=function(){try{_clog('console_'+m,Array.prototype.map.call(arguments,String).join(' '))}catch(e){}return o.apply(console,arguments)}});
-const api=async(p,m='GET',b)=>{let r;try{r=await fetch('/api/'+p,{method:m,headers:{'x-admin-key':K,'content-type':'application/json'},body:b?JSON.stringify(b):undefined})}catch(e){if(p!='clientlog')_clog('api_network_error',m+' /api/'+p+': '+e.message);throw e}if(!r.ok){const tx=await r.text();if(p!='clientlog')_clog('api_http_'+r.status,m+' /api/'+p+' -> '+tx.slice(0,300));throw new Error(tx)}const t=await r.text();try{return JSON.parse(t)}catch(e){return t}};
+const api=async(p,m='GET',b)=>{if(m&&typeof m==='object'){b=m;m='GET'}m=String(m||'GET').toUpperCase();const opts={method:m,headers:{'x-admin-key':K,'content-type':'application/json'}};if(b!==undefined&&m!=='GET'&&m!=='HEAD')opts.body=JSON.stringify(b);let r;try{r=await fetch('/api/'+p,opts)}catch(e){if(p!='clientlog')_clog('api_network_error',m+' /api/'+p+': '+e.message);throw e}if(!r.ok){const tx=await r.text();if(p!='clientlog')_clog('api_http_'+r.status,m+' /api/'+p+' -> '+tx.slice(0,300));throw new Error(tx)}const t=await r.text();try{return JSON.parse(t)}catch(e){return t}};
 const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const escJ=s=>esc(JSON.stringify(String(s)));
 const L={en:{
 accounts:'Manage accounts',connect:'Connect tools',keys:'API keys',sites:'Learned sites',settings:'Settings',advanced:'Advanced',log:'Log',
@@ -28005,12 +28005,15 @@ setTimeout(() => process.exit(0), 60000);
                 self.assertIsNone(job)
                 self.assertEqual(account["state"], "login_pending")
                 self.assertNotIn("learn_budget", account)
-                self.assertEqual([r["id"] for r in app.acc.browser_login_requests("profile-a")], [account["id"]])
+                initial_request = app.acc.browser_login_requests("profile-a")
+                self.assertEqual([r["id"] for r in initial_request], [account["id"]])
+                self.assertFalse(initial_request[0]["claimed"])  # assignment to a profile must not disable its login button
                 self.assertEqual(app.acc.browser_login_requests("profile-b"), [])
                 status, _ = app.acc.claim_browser_login("profile-b", {"account_id": account["id"]})
                 self.assertEqual(status, 409)
                 status, _ = app.acc.claim_browser_login("profile-a", {"account_id": account["id"]})
                 self.assertEqual(status, 200)
+                self.assertTrue(app.acc.browser_login_requests("profile-a")[0]["claimed"])
                 with mock.patch.object(app.acc, "start_job", return_value=types.SimpleNamespace(id="login-job")) as start:
                     status, result = app.acc.confirm_browser_login("profile-a", {"account_id": account["id"], "tab": 9, "url": "https://claude.ai/"})
                 self.assertEqual((status, result["job"]), (200, "login-job"))
@@ -28038,6 +28041,7 @@ setTimeout(() => process.exit(0), 60000);
             self.assertIn("function saveStrategy()", DASHBOARD_HTML)
             self.assertIn("ANTHROPIC_MODEL", DASHBOARD_HTML)
             self.assertIn("pc_profiles_list", DASHBOARD_HTML)
+            self.assertIn("typeof m==='object'", DASHBOARD_HTML)
 
     class TestServingModesAndEvidence(unittest.TestCase):
         """Owner-selected serving path and credential-safe learning evidence exports; mock data only."""
