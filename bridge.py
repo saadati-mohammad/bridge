@@ -4740,6 +4740,34 @@ class PageBackend(DirectBackend):
         return self.client.upload_text(conv, text, cancel)
 
 
+def ui_diff_lines(body: str, before: Set[str], prompt: str) -> List[str]:
+    """Return newly rendered page text without echoing the request or common chat controls."""
+    norm = lambda value: " ".join(str(value or "").split()).casefold()
+    prompt_flat = norm(prompt)
+    prompt_lines = {norm(line) for line in str(prompt or "").splitlines() if len(norm(line)) >= 10}
+    old = {norm(line) for line in before}
+    controls = {"share", "copy", "edit", "retry", "regenerate", "you said:", "claude responded:"}
+    out: List[str] = []
+    for raw in str(body or "").splitlines():
+        line = raw.strip()
+        key = norm(line)
+        if not key or key in old or key in controls:
+            continue
+        content = key
+        display = line
+        for prefix in ("you said:", "you:", "user:", "claude responded:"):
+            if content.startswith(prefix):
+                content = content[len(prefix):].strip()
+                display = line[len(prefix):].strip()
+                break
+        if not content or content == prompt_flat or content in prompt_lines:
+            continue
+        if prompt_flat and len(content) >= 24 and (content in prompt_flat or prompt_flat in content):
+            continue
+        out.append(display)
+    return out
+
+
 UI_GENERATING_SELECTOR = ('button[aria-label*="stop" i], button[data-testid*="stop" i], button[title*="stop" i], [aria-label*="stop generating" i], '
                           '[aria-label*="stop streaming" i], [aria-label*="stop response" i], [data-testid*="stop-button" i]')
 
@@ -4789,9 +4817,7 @@ class UIBackend:
 
         def page_text(ctx: Any) -> Tuple[int, str, str, bool]:
             pg = _page(self.ab, ctx, base, self.recipe.get("entry"))
-            lines = [l.strip() for l in pg.inner_text("body").splitlines() if l.strip()]
-            snip = prompt.strip()[:40]
-            new = [l for l in lines if l not in before and not (snip and snip in l)]
+            new = ui_diff_lines(pg.inner_text("body"), before, prompt)
             return len(new), "\n".join(new), pg.url, ui_generating(pg)
 
         def start(ctx: Any) -> int:
@@ -21166,6 +21192,16 @@ def run_selftest(quick: bool = False) -> int:
             self.assertFalse(backend.diff)
             self.assertIn("cloneNode(true)", UI_STATE_JS)
             self.assertIn("e.textContent = ''", UI_STATE_JS)
+
+        def test_generic_ui_diff_removes_echoed_prompt_and_chat_controls(self) -> None:
+            prompt = "<system>\nx-anthropic-billing-header: example\nBefore saving, check for an existing file.\n</system>\nhi"
+            body = "Share\nYou said:\n" + prompt + "\nClaude responded: Hi!\nHi! What would you like to work on?"
+            response = "\n".join(ui_diff_lines(body, set(), prompt))
+            self.assertNotIn("anthropic-billing-header", response.lower())
+            self.assertNotIn("Before saving", response)
+            self.assertNotIn("Share", response)
+            self.assertIn("Hi!", response)
+            self.assertIn("What would you like to work on?", response)
 
         def test_unlearned_ui_preserves_the_owner_tab_if_new_chat_control_is_unavailable(self) -> None:
             from unittest import mock
