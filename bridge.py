@@ -141,6 +141,7 @@ import queue
 import random
 import re
 import secrets
+import shutil
 import socket
 import ssl
 import statistics
@@ -165,7 +166,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.53"
+VERSION = "7.54"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -5860,6 +5861,8 @@ def lc_derive(a: Dict[str, Any], has_recipe: bool) -> Tuple[str, str]:
     if a.get("disabled"):
         return "disabled", "migrated: the owner had disabled this account"
     st = a.get("state")
+    if st == "needs_learning":
+        return "degraded_fallback", "login saved; owner-started learning is required before serving this new site"
     if st in ("login_required", "expired") or st == "learning":
         return "needs_login", f"migrated from state '{st}'"
     if st == "ready" and (has_recipe or a.get("tier")):
@@ -13132,7 +13135,7 @@ class Accounts:
                 return str(e)
             raise
 
-    def add(self, url: str, label: str) -> Tuple[Dict[str, Any], Job]:
+    def add(self, url: str, label: str, learn: bool = True) -> Tuple[Dict[str, Any], Job]:
         site = normalize_site_input(url)                         # O2: raises a plain-language BridgeError for junk / non-http(s)
         note = self.site_guard(site["open_url"])
         host = site["host"]
@@ -13150,8 +13153,9 @@ class Accounts:
             self.items.append(acct)
             self.save()
         self.lc(acct["id"], "logging_in", "a visible browser opens so the owner can log in")
-        self.begin_learn(acct["id"], "learn")
-        return acct, self.start_job(acct, "login")
+        if learn:
+            self.begin_learn(acct["id"], "learn")
+        return acct, self.start_job(acct, "login" if learn else "login-only")
 
     def add_api(self, kind: str, base: str, key: str, model: str, label: str) -> Dict[str, Any]:
         if kind not in ("openai", "anthropic") or not base.startswith("http") or not key:
@@ -13329,7 +13333,7 @@ class Accounts:
     def start_job(self, acct: Dict[str, Any], kind: str, headless: Optional[bool] = None, login_timeout: int = 600) -> Job:
         job = Job(kind, acct["label"])
         job.account = acct["id"]
-        if kind in ("login", "relearn"):
+        if kind in ("login", "login-only", "relearn"):
             acct["login_run"] = uuid.uuid4().hex[:8]                 # O3: one login run = one acceptance (see finish_login)
         job.headless, job.login_timeout = headless, login_timeout
         self.jobs[job.id] = job
@@ -13374,7 +13378,17 @@ class Accounts:
                     self.browser(acct["id"]).close()
             except Exception:
                 pass
-            if job.ok and job.kind != "human":                    # only after the job released the browser profile
+            if job.ok and job.kind == "login-only":
+                recipe = self.recipe(acct.get("host", "")) or {}
+                if recipe:
+                    acct.update(state="ready", tier=str(recipe.get("tier") or "page"), last_error="", cooldown_until=0)
+                    reason = "login saved; reusing the existing site recipe without a learning probe"
+                else:
+                    acct.update(state="needs_learning", tier="", last_error="Login saved. Start learning when you want to use this site in Claude Code.")
+                    reason = "login saved; no site recipe exists yet, serving waits for owner-started learning"
+                for st_, why_ in (("capturing", "login detected; session saved"), ("degraded_fallback", reason)):
+                    self.lc(acct["id"], st_, why_)
+            elif job.ok and job.kind != "human":                    # only after the job released the browser profile
                 for st_, why_ in (("capturing", "login detected; traffic captured"), ("learning", "recipe built from the captured traffic"),
                                   ("degraded_fallback", f"recipe learned (tier {acct.get('tier') or 'page'}); never validated (O8 not run), so not stable")):
                     self.lc(acct["id"], st_, why_)
@@ -13868,6 +13882,17 @@ class Accounts:
                     if v:
                         sess["auth"][n] = v
             return st
+
+        if job.kind == "login-only":
+            # Save the owner's session without sending any learning prompts. A known site recipe
+            # can be reused; a new site remains visibly unavailable until learning is requested.
+            refresh_sess()
+            self.save_session(acct["id"], sess)
+            if self.recipe(host):
+                job.say("login saved; the existing site recipe is available without a new probe")
+            else:
+                job.say("login saved; no recipe exists yet. Choose Start learning when you want to make this account usable")
+            return
 
         if recipe:
             refresh_sess()
@@ -18008,6 +18033,59 @@ def pc_api_status() -> Dict[str, Any]:
             "extension_dir": str(hub.root / "extension"), "extension_version": PC_VERSION}
 
 
+def pick_workspace_directory() -> str:
+    """Open the native folder picker on the local machine running the bridge."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+            path = filedialog.askdirectory(parent=root, title="Choose a Claude Code workspace", mustexist=True)
+        finally:
+            root.destroy()
+        return str(Path(path).resolve()) if path else ""
+    except Exception as e:
+        raise BridgeError(f"Windows folder picker could not open: {type(e).__name__}: {e}", "client", 500)
+
+
+def open_workspace_tool(app_name: str, folder: str, port: int, api_key: str) -> Dict[str, Any]:
+    """Launch one supported local tool in a user-selected folder without invoking a shell."""
+    p = Path(folder).expanduser().resolve()
+    if not p.is_dir():
+        raise BridgeError("choose an existing workspace folder first", "client", 400)
+    allowed = {"claude", "vscode", "cursor", "powershell", "cmd"}
+    if app_name not in allowed:
+        raise BridgeError("app must be claude, vscode, cursor, powershell, or cmd", "client", 400)
+    exe_name = {"claude": "claude", "vscode": "code", "cursor": "cursor", "powershell": "powershell", "cmd": "cmd"}[app_name]
+    exe = shutil.which(exe_name) or (shutil.which("pwsh") if app_name == "powershell" else None)
+    if not exe:
+        raise BridgeError(f"'{exe_name}' was not found in PATH; install it or choose another app", "setup", 404)
+    args = [exe]
+    env = os.environ.copy()
+    if app_name == "claude":
+        if not api_key:
+            raise BridgeError("select an API key for Claude Code first", "client", 400)
+        env.update(ANTHROPIC_BASE_URL=f"http://127.0.0.1:{int(port)}", ANTHROPIC_API_KEY=api_key,
+                   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
+    elif app_name in ("vscode", "cursor"):
+        args.append(str(p))
+    elif app_name == "powershell":
+        args.extend(["-NoLogo", "-NoExit"])
+    elif app_name == "cmd":
+        args.extend(["/K"])
+    flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if os.name == "nt" else 0
+    try:
+        proc = subprocess.Popen(args, cwd=str(p), env=env, stdin=subprocess.DEVNULL if app_name in ("vscode", "cursor") else None,
+                                stdout=subprocess.DEVNULL if app_name in ("vscode", "cursor") else None,
+                                stderr=subprocess.DEVNULL if app_name in ("vscode", "cursor") else None,
+                                close_fds=(os.name != "nt"), creationflags=flags)
+    except OSError as e:
+        raise BridgeError(f"could not start {exe_name}: {e}", "setup", 500)
+    return {"ok": True, "pid": int(proc.pid), "app": app_name, "folder": str(p)}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     app: App
@@ -18369,6 +18447,17 @@ class Handler(BaseHTTPRequestHandler):
     def _api(self, method: str, path: str) -> None:
         app, acc, cfg = self.app, self.app.acc, self.app.cfg
         parts = path.split("/")[2:]
+        if parts == ["workspace", "select"] and method == "POST":
+            return self._json(200, {"folder": pick_workspace_directory()})
+        if parts == ["workspace", "open"] and method == "POST":
+            body_ = self._body()
+            key_id = str(body_.get("key_id") or "")
+            selected_key = next((str(k.get("key") or "") for k in cfg["keys"] if k.get("id") == key_id), "")
+            try:
+                result_ = open_workspace_tool(str(body_.get("app") or ""), str(body_.get("folder") or ""), int(cfg["port"]), selected_key)
+            except BridgeError as e_:
+                return self._json(e_.status, {"error": str(e_)})
+            return self._json(200, result_)
         if path == "/api/personal-chrome" and method == "GET":
             return self._json(200, pc_api_status())
         if path == "/api/personal-chrome/setup" and method == "POST":
@@ -18498,7 +18587,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"account": a})
             if not d.get("url"):
                 raise BridgeError("url required", "client", 400)
-            a, job = acc.add(d["url"], d.get("label", ""))
+            a, job = acc.add(d["url"], d.get("label", ""), learn=bool(d.get("learn", True)))
             return self._json(200, {"account": a, "job": job.id})
         if len(parts) >= 2 and parts[0] == "accounts":
             aid = parts[1]
@@ -18792,16 +18881,19 @@ class OpenAIWriter(_SSEBase):
 # ============================================================================
 DASHBOARD_HTML = r"""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI Web Bridge</title><style>
-:root{--bg:#0f1218;--card:#171c26;--line:#262e3e;--tx:#e6e9ef;--mut:#8b94a7;--acc:#6ea8fe;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171}
-@media(prefers-color-scheme:light){:root{--bg:#f4f6fa;--card:#fff;--line:#dfe3ec;--tx:#1b2130;--mut:#667085;--acc:#2563eb;--ok:#16a34a;--warn:#b45309;--bad:#dc2626}}
+:root{--bg:#10131b;--card:#191e2a;--line:#2b3447;--tx:#eef0f7;--mut:#a2abc0;--acc:#a78bfa;--ok:#4ade80;--warn:#fbbf24;--bad:#fb7185;--shadow:0 12px 32px rgba(0,0,0,.13)}
+:root[data-theme="light"]{--bg:#f5f6fb;--card:#fff;--line:#e2e5ef;--tx:#20243a;--mut:#68708a;--acc:#6d5ce8;--ok:#15803d;--warn:#a16207;--bad:#dc2626;--shadow:0 10px 28px rgba(50,50,90,.06)}
+:root[data-theme="mint"]{--bg:#edf8f4;--card:#fff;--line:#cce6da;--tx:#17362d;--mut:#55776b;--acc:#16876d;--ok:#16803d;--warn:#a16207;--bad:#c24155;--shadow:0 10px 28px rgba(15,70,54,.08)}
+:root[data-theme="berry"]{--bg:#1b1220;--card:#26182d;--line:#493253;--tx:#f7eefa;--mut:#c0a9c5;--acc:#ed82c8;--ok:#72dda4;--warn:#ffd166;--bad:#ff7890;--shadow:0 12px 32px rgba(0,0,0,.18)}
+@media(prefers-color-scheme:light){:root:not([data-theme]){--bg:#f5f6fb;--card:#fff;--line:#e2e5ef;--tx:#20243a;--mut:#68708a;--acc:#6d5ce8;--ok:#15803d;--warn:#a16207;--bad:#dc2626;--shadow:0 10px 28px rgba(50,50,90,.06)}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.65 Vazirmatn,"Segoe UI",Tahoma,system-ui,sans-serif}
 header{display:flex;align-items:center;gap:10px;padding:12px 20px;border-bottom:1px solid var(--line);flex-wrap:wrap}h1{font-size:17px;margin:0}.sp{flex:1}
 .pill{padding:2px 10px;border-radius:99px;background:var(--line);color:var(--mut);font-size:12px}
 nav{display:flex;gap:2px;padding:0 14px;border-bottom:1px solid var(--line);overflow-x:auto}
 nav button{border:0;border-bottom:2px solid transparent;border-radius:0;background:none;padding:10px 14px;color:var(--mut);white-space:nowrap}
 nav button.on{color:var(--tx);border-bottom-color:var(--acc)}
-main{max-width:1060px;margin:0 auto;padding:18px}.view{display:none}.view.on{display:block}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px;min-width:0}
+main{max-width:1240px;margin:0 auto;padding:clamp(12px,2vw,24px)}.view{display:none}.view.on{display:block}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:clamp(13px,2vw,20px);margin-bottom:14px;min-width:0;box-shadow:var(--shadow)}
 h2{font-size:14px;margin:0 0 10px}h3{font-size:13px;margin:14px 0 6px;color:var(--mut)}
 button,input,select{font:inherit;color:var(--tx);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 10px}
 button{cursor:pointer}button:hover{border-color:var(--acc)}button.p{background:var(--acc);color:#fff;border-color:var(--acc)}button.d:hover{border-color:var(--bad);color:var(--bad)}.sm{font-size:12px;padding:3px 9px}
@@ -18827,8 +18919,10 @@ ol.steps li.bad i{background:var(--bad);border-color:var(--bad);color:#fff}ol.st
 .mini{max-height:120px;font-size:11px;margin-top:6px}details{margin-top:10px}summary{cursor:pointer;color:var(--mut);font-size:13px}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:4px 18px}label.f{display:flex;align-items:center;gap:6px;margin:5px 0}input[type=number]{width:96px}
 .acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
+@media(max-width:640px){header{padding:10px 12px}nav{padding:0 6px}nav button{padding:9px 11px}main{padding:10px}.row>*{max-width:100%}.row>input,.row>select{min-width:0;flex:1 1 100%}table{display:block;overflow-x:auto;white-space:nowrap}.steps li{font-size:10px!important}.card{border-radius:13px}}
+@media(min-width:1600px){main{max-width:1480px}}
 </style></head><body>
-<header><h1>AI Web Bridge <span class="mut ltr">v__VERSION__</span></h1><span class="pill ltr" id="st">…</span><span class="pill ltr" id="sts"></span><span class="sp"></span><button class="sm" id="langbtn" onclick="setLang(lang=='fa'?'en':'fa')"></button></header>
+<header><h1>AI Web Bridge <span class="mut ltr">v__VERSION__</span></h1><span class="pill ltr" id="st">…</span><span class="pill ltr" id="sts"></span><span class="sp"></span><select id="theme" aria-label="Theme" onchange="setTheme(this.value)"><option value="system">System</option><option value="light">Light</option><option value="mint">Mint</option><option value="berry">Berry</option></select><button class="sm" id="langbtn" onclick="setLang(lang=='fa'?'en':'fa')"></button></header>
 <nav id="nav"></nav>
 <main>
 <div class="view on" id="v_accounts">
@@ -18839,10 +18933,15 @@ ol.steps li.bad i{background:var(--bad);border-color:var(--bad);color:#fff}ol.st
 <p class="mut"><span data-i="pc_port_label"></span> <code class="ltr" id="pc_port"></code></p><p class="mut"><span data-i="pc_folder_label"></span> <code class="ltr" id="pc_folder"></code></p><p class="mut" data-i="pc_security"></p><a href="chrome://extensions" target="_blank" rel="noreferrer" data-i="pc_open_link"></a></div></div>
 <div class="card"><h2 data-i="add_title"></h2>
 <div class="row" style="margin-top:0"><select id="preset"></select><input id="url" class="ltr" data-ph="url_ph" oninput="urlPrev()"><input id="label" data-ph="label_ph"><button class="p" onclick="addAcc()" data-i="add_btn"></button></div>
+<label class="f"><input type="checkbox" id="learn_on_add"><span data-i="learn_on_add"></span></label>
 <p class="mut" id="urlprev" style="margin:6px 0 0"></p><p class="mut" id="urlhint" style="margin:6px 0 0" data-i="add_hint"></p>
 <details><summary data-i="api_title"></summary><div class="row"><select id="akind"><option value="openai">OpenAI-compatible</option><option value="anthropic">Anthropic-compatible</option></select>
 <input id="abase" class="ltr" placeholder="https://api.deepseek.com"><input id="akey" class="ltr" type="password" placeholder="API key"><input id="amodel" class="ltr" placeholder="model id"><input id="alabel" data-ph="label_ph"><button class="p" onclick="addApi()" data-i="api_btn"></button></div></details></div>
-<div id="acc"></div></div>
+<div id="acc"></div>
+<div class="card" id="workspacecard"><h2 data-i="workspace_title"></h2><p class="mut" data-i="workspace_hint"></p>
+<div class="row"><input id="workspace_path" class="ltr" data-ph="workspace_ph" readonly><button class="sm" onclick="selectWorkspace()" data-i="workspace_select"></button></div>
+<div class="row"><select id="workspace_app" aria-label="Application" onchange="updateWorkspaceCommand()"><option value="claude">Claude Code</option><option value="vscode">Visual Studio Code</option><option value="cursor">Cursor</option><option value="powershell">PowerShell</option><option value="cmd">Command Prompt</option></select><select id="workspace_key" aria-label="API key" onchange="updateWorkspaceCommand()"></select><button class="p" onclick="openWorkspace()" data-i="workspace_open"></button><button class="sm" onclick="copyWorkspaceCommand()" data-i="workspace_copy"></button></div>
+<pre id="workspace_command" class="mini"></pre><span id="workspace_status" class="mut"></span></div></div>
 
 <div class="view" id="v_connect">
 <div class="card"><h2 data-i="connect_title"></h2><div id="tabs" class="row" style="margin-top:0"></div><pre id="snip"></pre>
@@ -18866,7 +18965,7 @@ ol.steps li.bad i{background:var(--bad);border-color:var(--bad);color:#fff}ol.st
 <label class="f"><span data-i="s_idle"></span> <input type="number" id="s_idle" onchange="saveS()"></label></div>
 <p class="mut ltr" id="home"></p></div></div>
 
-<div class="view" id="v_adv">
+<div class="view on" id="v_adv">
 <div class="card" id="analysiscard"><h2>Site analysis</h2>
 <div class="row"><input id="rep_host" class="ltr" placeholder="chat.example.com"><button id="rep_show" class="sm" data-i="rep_show"></button><button id="req_show" class="sm" data-i="req_show"></button><button id="evidence_download" class="sm" data-i="evidence_download"></button></div><div id="req_nav" class="row" hidden><button id="req_prev" class="sm" data-i="req_prev"></button><span id="req_page" class="mut"></span><button id="req_next" class="sm" data-i="req_next"></button></div><div id="req_out" class="mut" style="display:none"></div><pre id="rep_out" class="mut" style="display:none"></pre></div>
 <div class="card" id="dircard"><h2>Site directory</h2><div id="dir_meta" class="mut"></div>
@@ -18876,6 +18975,7 @@ ol.steps li.bad i{background:var(--bad);border-color:var(--bad);color:#fff}ol.st
 <div class="card" id="o12card"><h2>Direct path &amp; validation</h2><div id="o12_meta" class="mut ltr"></div>
 <div id="o12_cards"></div>
 <table><thead><tr><th>Account</th><th>State</th><th>Validation</th><th>Supervisor (last tick)</th><th>Actions</th></tr></thead><tbody id="o12_rows"></tbody></table></div>
+<div class="card" id="decisioncard"><h2>Recent route decisions</h2><p id="decision_meta" class="mut"></p><table><thead><tr><th>Time</th><th>Requested</th><th>Selected account / model</th><th>Policy</th><th>Outcome</th><th>Fallback / exclusions</th></tr></thead><tbody id="decision_rows"></tbody></table></div>
 <div class="card" id="ctxcard"><h2>Context &amp; submission</h2><div id="ctx_meta" class="mut ltr"></div>
 <table><thead><tr><th>Counter</th><th>Value</th><th>Kind</th></tr></thead><tbody id="ctx_cnt"></tbody></table>
 <h3>Learned windows (per route)</h3><table><thead><tr><th>Route</th><th>Chars</th><th>Kind</th><th>Refused at</th></tr></thead><tbody id="ctx_win"></tbody></table>
@@ -18895,17 +18995,17 @@ window.addEventListener('unhandledrejection',e=>{const r=e.reason;_clog('promise
 const api=async(p,m='GET',b)=>{let r;try{r=await fetch('/api/'+p,{method:m,headers:{'x-admin-key':K,'content-type':'application/json'},body:b?JSON.stringify(b):undefined})}catch(e){if(p!='clientlog')_clog('api_network_error',m+' /api/'+p+': '+e.message);throw e}if(!r.ok){const tx=await r.text();if(p!='clientlog')_clog('api_http_'+r.status,m+' /api/'+p+' -> '+tx.slice(0,300));throw new Error(tx)}const t=await r.text();try{return JSON.parse(t)}catch(e){return t}};
 const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const escJ=s=>esc(JSON.stringify(String(s)));
 const L={en:{
-accounts:'Accounts',connect:'Connect tools',keys:'API keys',sites:'Learned sites',settings:'Settings',advanced:'Advanced',log:'Log',
-add_title:'Add an account',add_btn:'Add account (opens browser)',url_ph:'chat.example.com',label_ph:'name (optional)',preset:'Choose a site…',
+accounts:'Manage accounts',connect:'Connect tools',keys:'API keys',sites:'Learned sites',settings:'Settings',advanced:'Advanced',log:'Log',
+add_title:'Add an account',add_btn:'Add account (opens browser)',url_ph:'chat.example.com',label_ph:'name (optional)',preset:'Choose a site…',learn_on_add:'Start learning after login (sends a few test messages; optional)',choose_model:'Account model',default_model:'Use site default',workspace_title:'Open a tool in a workspace',workspace_hint:'Choose a folder, then open Claude Code, Cursor, VS Code, or a terminal there. Claude Code uses the selected bridge API key.',workspace_ph:'Choose a workspace folder…',workspace_select:'Select folder…',workspace_open:'Open here',workspace_copy:'Copy command',workspace_ready:'Workspace selected.',workspace_cancel:'Folder selection cancelled.',workspace_error:'Could not open workspace: ',workspace_opened:'Application opened in the selected folder.',workspace_copied:'Command copied.',
 pc_title:'Connect your own Chrome (one-time setup)',pc_intro:'Make the bridge work with your normal Chrome profile. This guided setup opens the extension page and the extension folder, then gives you a one-time pairing code.',pc_start:'Set up Chrome connection',pc_step1:'Enable Developer mode and choose “Load unpacked”.',pc_step2:'Select the opened “extension” folder.',pc_step3:'Open the extension toolbar icon and enter the port and code.',pc_code_label:'One-time pairing code:',pc_code_note:'Valid for 10 minutes. Keep it private; it can only pair this local bridge.',pc_copy:'Copy code',pc_port_label:'Bridge port:',pc_folder_label:'Extension folder:',pc_security:'Chrome requires you to approve loading this local extension yourself. The bridge cannot silently install extensions into a personal Chrome profile.',pc_open_link:'Open Chrome extensions page again',pc_opening:'Preparing the extension and opening the setup windows…',pc_ready:'Setup is ready. Complete the three steps above in Chrome.',pc_error:'Could not prepare setup: ',pc_copied:'Copied.',
-add_hint:'A browser window opens once so YOU can log in. The bridge then learns how the site works. Keep that window open until the card turns Ready.',
+add_hint:'A browser window opens for you to log in. Learning is optional; if it stays off, only the login is saved and a new site needs Start learning later.',
 api_title:'…or add an official API account instead',api_btn:'Add API account',no_acc:'No accounts yet - add one above.',
 connect_title:'Connect your tools',key_used:'key used in the snippet',key_create:'Create key',klabel_ph:'label e.g. cursor',key_pin:'Pin a key to an account to force that provider for the tool using it.',
 th_site:'Site',th_tier:'Mode',th_mem:'Chat memory',import:'Import recipe',
 s_cont:"Reuse the site's own chat memory (send only new messages)",s_sum:'Summarize old history with the model instead of cutting it',s_tool:'Tool description limit (chars)',s_sys:'System prompt limit (chars)',s_res:'Tool result limit (chars)',s_his:'History limit (chars)',s_hc:'Health check every (min, 0 = off)',s_cache:'Cache identical requests (s, 0 = off)',s_idle:'Close idle browser after (s)',
 rep_show:'Show analysis report',req_show:'Show captured requests',evidence_download:'Download source + requests',req_prev:'Previous',req_next:'Next',
 disc_hint:'Spends exactly 3 real requests on the chosen account to find the response field in which the site reports turning long text into an attachment. Nothing is sent until you confirm.',disc_btn:'Discover signal (3 real requests)',hide_tech:'Hide technical lines (DEBUG / tracebacks)',log_cp:'Copy diagnostic report',log_dl:'Download full log file',log_hint:'The report holds the version, account states, Chrome-extension state and the latest log lines (no keys, no message text). Paste it into the chat instead of describing the page.',log_copied:'Copied. Paste it into the chat.',log_failed:'Could not copy automatically; the report was downloaded instead.',
-s_ready:'Ready',s_learning:'Working',s_needs_you:'Needs you',s_needs_login:'Login needed',s_failed:'Failed',s_cooling:'Cooling down',
+s_ready:'Ready',s_learning:'Working',s_needs_you:'Needs you',s_needs_login:'Login needed',s_needs_learning:'Login saved · learning needed',s_failed:'Failed',s_cooling:'Cooling down',
 m_direct:'direct (fast)',m_page:'via browser page',m_ui:'via browser typing (slow)',
 st_open:'Open site',st_login:'Log in',st_learn:'Learn',st_analyse:'Analyse',st_verify:'Verify',st_finish:'Save',
 d_open:'Opening the site in a browser window…',d_login:'Waiting for you to log in inside the browser window.',d_learn:'Sending 3 short test messages through the site while recording the traffic.',d_analyse:'Working out how to talk to the site.',d_verify:'Testing which mode works: direct, then page, then browser typing.',d_finish:'Saving the recording and analysing it offline (up to ~30 s).',
@@ -18916,22 +19016,22 @@ a_check_t:'The site is checking your browser',a_check_b:'Complete the check in t
 a_check_h:'Stuck on "Just a moment…" for more than 1-2 minutes? Then the site is rejecting this automated window. Press F5 once in that window. If it still loops, close it and use an official API account (top of this page) for this site.',
 f_title:'It did not finish',h_check:'The site kept showing its human check and never let this automated window through. Retry once with Re-login (press F5 if it spins). If it loops again, this site cannot be learned this way: use its official API account instead.',
 h_closed:'The browser window was closed before the process finished. Press Re-login and leave the window open until the card says Ready.',h_generic:'Open the Log tab for details, then press Re-learn.',
-b_relogin:'Re-login',b_relearn:'Re-learn',b_recheck:'Try without browser',b_default:'Make default',b_remove:'Remove',def:'default',details:'Technical details',last_lines:'Last steps',transport:'Serving path',mode_auto:'Automatic · direct + browser fallback',mode_browser:'Browser only',mode_direct:'Direct only',mode_unavailable:'Direct mode unlocks after verification',
+b_relogin:'Re-login',b_relearn:'Re-learn',b_start_learn:'Start learning',b_recheck:'Try without browser',b_default:'Make default',b_remove:'Remove',b_use:'Use for routing',def:'default',details:'Technical details',last_lines:'Last steps',transport:'Serving path',mode_auto:'Automatic · direct + browser fallback',mode_browser:'Browser only',mode_direct:'Direct only',mode_unavailable:'Direct mode unlocks after verification',
 req:'requests',fails:'fails',healthy:'healthy',unhealthy:'unhealthy',
 c_copy:'Copy',c_revoke:'Revoke',docs:'Docs',tool:'Tool',export:'Export',forget:'Forget',yes:'yes',no:'no',any_acc:'any account',running:'running on port ',errors:'errors',
 cf_rm:'Remove this account and its browser profile?',cf_forget:'Forget the learned recipe for this site? It will be re-learned on next login.'
 },fa:{
-accounts:'حساب‌ها',connect:'اتصال ابزارها',keys:'کلیدهای API',sites:'سایت‌های یادگرفته‌شده',settings:'تنظیمات',advanced:'پیشرفته',log:'گزارش',
+accounts:'مدیریت حساب‌ها',connect:'اتصال ابزارها',keys:'کلیدهای API',sites:'سایت‌های یادگرفته‌شده',settings:'تنظیمات',advanced:'پیشرفته',log:'گزارش',
 pc_title:'اتصال Chrome شخصی (راه‌اندازی یک‌باره)',pc_intro:'برنامه را به پروفایل معمول Chrome شما وصل می‌کند. این راهنما صفحه‌ی افزونه‌ها و پوشه‌ی افزونه را باز می‌کند و کد یک‌بارمصرف اتصال را می‌دهد.',pc_start:'راه‌اندازی اتصال Chrome',pc_step1:'Developer mode را روشن کنید و «Load unpacked» را بزنید.',pc_step2:'پوشه‌ی بازشده‌ی «extension» را انتخاب کنید.',pc_step3:'آیکن افزونه در نوار Chrome را باز و پورت و کد را وارد کنید.',pc_code_label:'کد یک‌بارمصرف اتصال:',pc_code_note:'۱۰ دقیقه اعتبار دارد. آن را خصوصی نگه دارید؛ فقط برای اتصال همین bridge محلی است.',pc_copy:'کپی کد',pc_port_label:'درگاه اتصال برنامه:',pc_folder_label:'پوشه‌ی افزونه:',pc_security:'Chrome لازم می‌داند بارگذاری این افزونه‌ی محلی را خودتان تأیید کنید. برنامه نمی‌تواند افزونه را بی‌صدا در پروفایل شخصی نصب کند.',pc_open_link:'باز کردن دوباره‌ی صفحه‌ی افزونه‌های Chrome',pc_opening:'در حال آماده‌سازی افزونه و باز کردن پنجره‌های راه‌اندازی…',pc_ready:'راه‌اندازی آماده است. سه مرحله‌ی بالا را در Chrome انجام دهید.',pc_error:'آماده‌سازی راه‌اندازی انجام نشد: ',pc_copied:'کپی شد.',
-add_title:'افزودن حساب',add_btn:'افزودن حساب (مرورگر باز می‌شود)',url_ph:'chat.example.com',label_ph:'نام (اختیاری)',preset:'انتخاب سایت…',
-add_hint:'یک پنجره‌ی مرورگر باز می‌شود تا خودتان وارد شوید. سپس برنامه روش کار سایت را یاد می‌گیرد. تا وقتی کارت «آماده» نشده پنجره را نبندید.',
+add_title:'افزودن حساب',add_btn:'افزودن حساب (مرورگر باز می‌شود)',url_ph:'chat.example.com',label_ph:'نام (اختیاری)',preset:'انتخاب سایت…',learn_on_add:'بعد از ورود، یادگیری شروع شود (چند پیام آزمایشی می‌فرستد؛ اختیاری)',choose_model:'مدل این حساب',default_model:'مدل پیش‌فرض سایت',workspace_title:'باز کردن ابزار در workspace',workspace_hint:'پوشه را انتخاب کنید و Claude Code، Cursor، VS Code یا ترمینال را همان‌جا باز کنید. Claude Code از کلید API انتخاب‌شده‌ی Bridge استفاده می‌کند.',workspace_ph:'پوشه‌ی workspace را انتخاب کنید…',workspace_select:'انتخاب پوشه…',workspace_open:'باز کردن',workspace_copy:'کپی دستور',workspace_ready:'پوشه انتخاب شد.',workspace_cancel:'انتخاب پوشه لغو شد.',workspace_error:'باز کردن workspace ناموفق بود: ',workspace_opened:'برنامه در پوشه‌ی انتخاب‌شده باز شد.',workspace_copied:'دستور کپی شد.',
+add_hint:'یک پنجره‌ی مرورگر برای ورود باز می‌شود. یادگیری اختیاری است؛ اگر خاموش باشد فقط ورود ذخیره می‌شود و برای سایت جدید باید بعداً «شروع یادگیری» را بزنید.',
 api_title:'…یا به‌جای آن یک حساب API رسمی اضافه کنید',api_btn:'افزودن حساب API',no_acc:'هنوز حسابی نیست؛ از بالا اضافه کنید.',
 connect_title:'اتصال ابزارهای شما',key_used:'کلیدی که در دستور استفاده می‌شود',key_create:'ساخت کلید',klabel_ph:'برچسب، مثلا cursor',key_pin:'کلید را به یک حساب وصل کنید تا ابزار فقط از همان سرویس استفاده کند.',
 th_site:'سایت',th_tier:'حالت',th_mem:'حافظه‌ی چت',import:'وارد کردن recipe',
 s_cont:'استفاده از حافظه‌ی خود سایت (فقط پیام‌های جدید ارسال شود)',s_sum:'خلاصه‌کردن تاریخچه‌ی قدیمی با مدل به‌جای بریدن',s_tool:'حد توضیح ابزار (حرف)',s_sys:'حد پرامپت سیستم (حرف)',s_res:'حد نتیجه‌ی ابزار (حرف)',s_his:'حد تاریخچه (حرف)',s_hc:'بررسی سلامت هر (دقیقه، 0 = خاموش)',s_cache:'کش درخواست‌های یکسان (ثانیه، 0 = خاموش)',s_idle:'بستن مرورگر بی‌کار بعد از (ثانیه)',
 rep_show:'نمایش گزارش تحلیل',req_show:'نمایش درخواست‌های ثبت‌شده',evidence_download:'دانلود سورس و درخواست‌ها',req_prev:'قبلی',req_next:'بعدی',
 disc_hint:'دقیقا ۳ درخواست واقعی روی حساب انتخابی مصرف می‌کند. تا تایید نکنید چیزی ارسال نمی‌شود.',disc_btn:'کشف سیگنال (۳ درخواست واقعی)',hide_tech:'پنهان‌کردن خطوط فنی (DEBUG و traceback)',log_cp:'کپی گزارش تشخیصی',log_dl:'دانلود کامل فایل لاگ',log_hint:'گزارش شامل نسخه، وضعیت حساب‌ها، وضعیت افزونه‌ی کروم و آخرین خطوط لاگ است (بدون کلید و بدون متن پیام‌ها). به جای توضیح صفحه، همین را در چت بگذارید.',log_copied:'کپی شد. در چت بگذارید.',log_failed:'کپی خودکار نشد؛ گزارش دانلود شد.',
-s_ready:'آماده',s_learning:'در حال کار',s_needs_you:'نیاز به شما',s_needs_login:'نیاز به ورود',s_failed:'ناموفق',s_cooling:'در حال استراحت',
+s_ready:'آماده',s_learning:'در حال کار',s_needs_you:'نیاز به شما',s_needs_login:'نیاز به ورود',s_needs_learning:'ورود ذخیره شد · نیازمند یادگیری',s_failed:'ناموفق',s_cooling:'در حال استراحت',
 m_direct:'مستقیم (سریع)',m_page:'از طریق صفحه‌ی مرورگر',m_ui:'تایپ در مرورگر (کند)',
 st_open:'باز کردن',st_login:'ورود',st_learn:'یادگیری',st_analyse:'تحلیل',st_verify:'آزمایش',st_finish:'ذخیره',
 d_open:'در حال باز کردن سایت در پنجره‌ی مرورگر…',d_login:'منتظر ورود شما داخل پنجره‌ی مرورگر…',d_learn:'ارسال ۳ پیام آزمایشی کوتاه به سایت و ضبط ترافیک.',d_analyse:'در حال کشف روش ارتباط با سایت.',d_verify:'آزمایش اینکه کدام حالت کار می‌کند: مستقیم، بعد صفحه، بعد تایپ در مرورگر.',d_finish:'ذخیره‌ی ضبط و تحلیل آفلاین (حداکثر حدود ۳۰ ثانیه).',
@@ -18942,19 +19042,20 @@ a_check_t:'سایت در حال بررسی مرورگر شماست',a_check_b:'�
 a_check_h:'اگر بیش از ۱ تا ۲ دقیقه روی «Just a moment…» ماند، یعنی سایت این پنجره‌ی خودکار را قبول نمی‌کند. یک بار F5 بزنید. اگر باز هم چرخید، پنجره را ببندید و برای این سایت از حساب API رسمی (بالای همین صفحه) استفاده کنید.',
 f_title:'کار تمام نشد',h_check:'سایت مدام صفحه‌ی بررسی انسان را نشان داد و این پنجره‌ی خودکار را عبور نداد. یک بار با «ورود دوباره» تلاش کنید (اگر چرخید F5 بزنید). اگر باز هم تکرار شد، این سایت از این راه قابل یادگیری نیست؛ از حساب API رسمی‌اش استفاده کنید.',
 h_closed:'پنجره‌ی مرورگر قبل از پایان کار بسته شد. «ورود دوباره» را بزنید و تا وقتی کارت «آماده» نشده پنجره را باز بگذارید.',h_generic:'برای جزئیات تب «گزارش» را ببینید، بعد «یادگیری دوباره» را بزنید.',
-b_relogin:'ورود دوباره',b_relearn:'یادگیری دوباره',b_recheck:'امتحان بدون مرورگر',b_default:'پیش‌فرض شود',b_remove:'حذف',def:'پیش‌فرض',details:'جزئیات فنی',last_lines:'آخرین مراحل',transport:'مسیر ارسال',mode_auto:'خودکار · مسیر مستقیم + پشتیبان مرورگر',mode_browser:'فقط مرورگر',mode_direct:'فقط مستقیم',mode_unavailable:'مسیر مستقیم پس از تأیید فعال می‌شود',
+b_relogin:'ورود دوباره',b_relearn:'یادگیری دوباره',b_start_learn:'شروع یادگیری',b_recheck:'امتحان بدون مرورگر',b_default:'پیش‌فرض شود',b_remove:'حذف',b_use:'استفاده در مسیریابی',def:'پیش‌فرض',details:'جزئیات فنی',last_lines:'آخرین مراحل',transport:'مسیر ارسال',mode_auto:'خودکار · مسیر مستقیم + پشتیبان مرورگر',mode_browser:'فقط مرورگر',mode_direct:'فقط مستقیم',mode_unavailable:'مسیر مستقیم پس از تأیید فعال می‌شود',
 req:'درخواست',fails:'خطا',healthy:'سالم',unhealthy:'ناسالم',
 c_copy:'کپی',c_revoke:'ابطال',docs:'مستندات',tool:'ابزار',export:'خروجی',forget:'فراموش کن',yes:'بله',no:'خیر',any_acc:'هر حسابی',running:'اجرا روی پورت ',errors:'خطا',
 cf_rm:'این حساب و پروفایل مرورگرش حذف شود؟',cf_forget:'recipe یادگرفته‌شده‌ی این سایت فراموش شود؟ در ورود بعدی دوباره یاد گرفته می‌شود.'}};
 let lang=localStorage.lang||'fa';const t=k=>(L[lang]&&L[lang][k])??L.en[k]??k;
+function setTheme(v){if(v==='system')document.documentElement.removeAttribute('data-theme');else document.documentElement.dataset.theme=v;localStorage.setItem('theme',v)}
 const STAGES=['open','login','learn','analyse','verify','finish'];
-const VIEWS=[['accounts','accounts'],['connect','connect'],['sites','sites'],['settings','settings'],['adv','advanced'],['log','log']];let view='accounts';
+const VIEWS=[['accounts','accounts'],['connect','connect'],['sites','sites'],['settings','settings'],['log','log']];let view='accounts';
 let S=null,C=null,O=null,O12E='',tab='claude-ps',editing=false,openDet=new Set();
 function setLang(l){lang=l;localStorage.lang=l;document.documentElement.lang=l;document.documentElement.dir=l=='fa'?'rtl':'ltr';$('langbtn').textContent=l=='fa'?'English':'فارسی';
 document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));document.querySelectorAll('[data-ph]').forEach(e=>e.placeholder=t(e.dataset.ph));
 if(S&&S.presets&&$('preset').options.length)$('preset').options[0].textContent=t('preset');navRender();render();renderCtx()}
 function navRender(){$('nav').innerHTML=VIEWS.map(v=>`<button class="${v[0]==view?'on':''}" onclick="go('${v[0]}')">${esc(t(v[1]))}</button>`).join('')}
-function go(v){view=v;document.querySelectorAll('.view').forEach(e=>e.classList.toggle('on',e.id=='v_'+v));navRender()}
+function go(v){view=v;document.querySelectorAll('.view').forEach(e=>e.classList.toggle('on',e.id=='v_'+v||(v=='accounts'&&e.id=='v_adv')));navRender()}
 function snippets(k,port){const u='http://127.0.0.1:'+port;return{'claude-ps':`$env:ANTHROPIC_BASE_URL="${u}"\n$env:ANTHROPIC_API_KEY="${k}"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nclaude`,
 'claude-sh':`export ANTHROPIC_BASE_URL=${u}\nexport ANTHROPIC_API_KEY=${k}\nexport CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
 'claude-cmd':`set ANTHROPIC_BASE_URL=${u}\nset ANTHROPIC_API_KEY=${k}\nset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
@@ -18966,10 +19067,12 @@ function stepper(j){const cur=Math.max(0,STAGES.indexOf(j.stage)),fin=j.done&&j.
 return '<ol class="steps">'+STAGES.map((s,i)=>{let c=fin||i<cur?'done':(i==cur?(j.done?'bad':'cur'):'');return `<li class="${c}"><i>${c=='done'?'✓':(c=='bad'?'✕':i+1)}</i><div>${esc(t('st_'+s))}</div></li>`}).join('')+'</ol>'}
 function failHint(e){e=String(e||'');if(/verification step|human check|not completed in time/i.test(e))return t('h_check');if(/closed|TargetClosed/i.test(e))return t('h_closed');return t('h_generic')}
 function accCard(a){const j=jobOf(a),run=j&&!j.done,fail=j&&j.done&&!j.ok&&a.state!=='ready',att=run&&j.attention&&j.attention.kind?j.attention:null;
-let s;if(run)s=att?'needs_you':'learning';else if(a.human)s='needs_you';else if(fail)s='failed';else if(a.state==='ready')s=a.cooling?'cooling':'ready';else if(a.state==='login_required')s='needs_login';else if(a.state==='learning')s='learning';else s=a.state||'learning';
+let s;if(run)s=att?'needs_you':'learning';else if(a.human)s='needs_you';else if(fail)s='failed';else if(a.state==='ready')s=a.cooling?'cooling':'ready';else if(a.state==='login_required')s='needs_login';else if(a.state==='needs_learning')s='needs_learning';else if(a.state==='learning')s='learning';else s=a.state||'learning';
 const label=t('s_'+s)==='s_'+s?s:t('s_'+s);let h=`<div class="card acc s-${esc(s)}"><div class="top"><div class="grow"><b>${esc(a.label)}</b> <span class="mut ltr">${esc(a.host)}</span> ${S.default_account==a.id?`<span class="b">${esc(t('def'))}</span>`:''}</div>`+
 (a.tier?`<span class="b ${esc(a.tier)}" title="${esc(t('m_'+a.tier))}">${esc(t('m_'+a.tier))}</span>`:'')+`<span class="stt">● ${esc(label)}${a.cooling?' '+esc(a.cooling)+'s':''}</span></div>`;
-if(a.type!=='api'){const v=a.serving||{mode:'auto',browser:false,direct:false};h+=`<div class="row"><label class="mut">${esc(t('transport'))}</label><select aria-label="${esc(t('transport'))}" onchange="setServingMode(${escJ(a.id)},this.value)"><option value="auto" ${v.mode==='auto'?'selected':''}>${esc(t('mode_auto'))}</option><option value="browser" ${v.mode==='browser'?'selected':''} ${!v.browser&&v.mode!=='browser'?'disabled':''}>${esc(t('mode_browser'))}</option><option value="direct" ${v.mode==='direct'?'selected':''} ${!v.direct&&v.mode!=='direct'?'disabled':''}>${esc(t('mode_direct'))}</option></select>${!v.direct?`<span class="mut">${esc(t('mode_unavailable'))}</span>`:''}</div>`}
+if(a.type!=='api'){const v=a.serving||{mode:'auto',browser:false,direct:false};h+=`<div class="row"><label class="mut">${esc(t('transport'))}</label><select aria-label="${esc(t('transport'))}" onchange="setServingMode(${escJ(a.id)},this.value)"><option value="auto" ${v.mode==='auto'?'selected':''}>${esc(t('mode_auto'))}</option><option value="browser" ${v.mode==='browser'?'selected':''} ${!v.browser&&v.mode!=='browser'?'disabled':''}>${esc(t('mode_browser'))}</option><option value="direct" ${v.mode==='direct'?'selected':''} ${!v.direct&&v.mode!=='direct'?'disabled':''}>${esc(t('mode_direct'))}</option></select>${!v.direct?`<span class="mut">${esc(t('mode_unavailable'))}</span>`:''}<label class="f mut"><input type="checkbox" ${a.disabled?'':'checked'} onchange="o12Toggle(${escJ(a.id)},this.checked)"> ${esc(t('b_use'))}</label></div>`}
+else h+=`<div class="row"><label class="f mut"><input type="checkbox" ${a.disabled?'':'checked'} onchange="o12Toggle(${escJ(a.id)},this.checked)"> ${esc(t('b_use'))}</label></div>`;
+const mc=a.model_choice||{},ms=mc.selector||{},choice=mc.choice||{};if(ms.present){h+=`<div class="row"><label class="mut">${esc(t('choose_model'))}</label><select aria-label="${esc(t('choose_model'))}" onchange="setModelChoice(${escJ(a.id)},this.value)"><option value="" ${choice.mode==='fixed'?'':'selected'}>${esc(t('default_model'))}</option>${ms.options.map(o=>`<option value="${esc(o.id)}" ${choice.mode==='fixed'&&choice.variant===o.id?'selected':''}>${esc(o.display)} · ${esc(o.mode||'default')}</option>`).join('')}</select></div>`}
 if(run){h+=stepper(j);const p=j.progress||{};const info=(j.stage=='learn'&&p.total)?`${t('probe')} ${p.cur}/${p.total}`:(j.stage=='analyse'&&p.total?`${t('round')} ${p.cur}/${p.total}`:'');
 h+=`<div class="mut">${esc(t('d_'+j.stage))} ${info?'<b>'+esc(info)+'</b>':''} · ${esc(t('elapsed'))} ${mmss(Date.now()/1000-j.started)}</div>`;if(p.total)h+=`<div class="bar"><div style="width:${Math.round(100*p.cur/p.total)}%"></div></div>`}
 if(att){const kd=att.kind=='first_msg'?'a_first':(att.kind=='login'?'a_login':'a_check'),lg=kd!='a_check';h+=`<div class="att"><b>${esc(t(kd+'_t'))}</b> <span class="mut">(${mmss(Date.now()/1000-att.since)})</span><div>${esc(t(kd+'_b'))}</div>`+(lg?'':`<div class="mut" style="margin-top:4px">${esc(t('a_check_h'))}</div>`)+
@@ -18983,7 +19086,7 @@ if(a.learn_budget)det.push(`<div class="mut ltr">learning used ${esc(a.learn_bud
 if(a.native_learning){const n=a.native_learning;det.push(`<div class="mut ltr">native path: ${esc(n.status||'unknown')}${n.rounds!=null?` · rounds ${esc(n.rounds)}`:''}${n.requests!=null?` · Brain requests ${esc(n.requests)}/${esc(n.budget??'?')}`:''}${n.review?` · review ${esc(n.review.outcome||'unknown')} (${esc(n.review.confirmed_defects||0)} confirmed)`:''}${n.gates?.length?` · gates ${esc(n.gates.join(', '))}`:''}${n.reason?` · ${esc(n.reason)}`:''}</div>`)}
 det.push(`<div class="mut ltr">${a.requests||0}${a.inflight?' ('+a.inflight+' live)':''} ${esc(t('req'))} · ${a.fail||0} ${esc(t('fails'))}${a.ema_ms?' · '+(a.ema_ms/1000).toFixed(1)+'s avg':''}${a.health?(a.health.ok?' · '+esc(t('healthy')):' · '+esc(t('unhealthy'))):''}</div>`);
 h+=`<details data-id="${esc(a.id)}" ${openDet.has(a.id)?'open':''} ontoggle="togDet(this)"><summary>${esc(t('details'))}</summary>${det.join('')}</details>`;
-h+=`<div class="acts">`+(a.type=='api'?'':`<button class="sm" onclick="act(${escJ(a.id)},'relogin')">${esc(t('b_relogin'))}</button><button class="sm" onclick="act(${escJ(a.id)},'relearn')">${esc(t('b_relearn'))}</button>`+(a.tier=='direct'?'':`<button class="sm" onclick="recheckDirect(${escJ(a.id)})">${esc(t('b_recheck'))}</button>`))+
+h+=`<div class="acts">`+(a.type=='api'?'':`<button class="sm" onclick="act(${escJ(a.id)},'relogin')">${esc(t('b_relogin'))}</button><button class="sm ${a.state==='needs_learning'?'p':''}" onclick="act(${escJ(a.id)},'relearn')">${esc(t(a.state==='needs_learning'?'b_start_learn':'b_relearn'))}</button>`+(a.tier=='direct'?'':`<button class="sm" onclick="recheckDirect(${escJ(a.id)})">${esc(t('b_recheck'))}</button>`))+
 `<button class="sm" onclick="act(${escJ(a.id)},'default')">${esc(t('b_default'))}</button><button class="sm d" onclick="delAcc(${escJ(a.id)})">${esc(t('b_remove'))}</button></div></div>`;return h}
 function togDet(el){const id=el.dataset.id;if(el.open)openDet.add(id);else openDet.delete(id)}
 function render(){if(!S)return;$('st').textContent=t('running')+S.port;$('sts').textContent=S.stats.requests+' requests · '+S.stats.errors+' '+t('errors');
@@ -18991,12 +19094,16 @@ $('acc').innerHTML=S.accounts.map(accCard).join('')||`<div class="card mut">${es
 if(!editing){const ks=$('keysel'),cur=ks.value;ks.innerHTML=S.keys.map(k=>`<option value="${esc(k.key)}">${esc(k.label)}</option>`).join('');if(cur)ks.value=cur;
 $('kacc').innerHTML=`<option value="">${esc(t('any_acc'))}</option>`+S.accounts.map(a=>`<option value="${esc(a.id)}">${esc(a.label)}</option>`).join('')}
 $('keys').innerHTML=S.keys.map(k=>`<tr><td><b>${esc(k.label)}</b>${k.account?` <span class="b">→ ${esc((S.accounts.find(a=>a.id==k.account)||{}).label||k.account)}</span>`:''}<div class="k">${esc(k.key)}</div></td><td style="text-align:end"><button class="sm" onclick="navigator.clipboard.writeText(${escJ(k.key)})">${esc(t('c_copy'))}</button> <button class="sm d" onclick="delKey(${escJ(k.id)})">${esc(t('c_revoke'))}</button></td></tr>`).join('');
+$('workspace_key').innerHTML=S.keys.map(k=>`<option value="${esc(k.id)}">${esc(k.label)} · ${esc(k.key.slice(0,8))}…</option>`).join('');
+if(!$('workspace_key').value&&S.keys.length)$('workspace_key').value=S.keys[0].id;
+$('workspace_app').value=localStorage.workspaceApp||'claude';$('workspace_path').value=localStorage.workspacePath||'';updateWorkspaceCommand();
 $('rec').innerHTML=S.recipes.map(r=>`<tr><td class="ltr">${esc(r.host)}</td><td><span class="b ${esc(r.tier)}">${esc(r.tier)}</span></td><td>${r.continuity?t('yes'):t('no')}</td><td style="text-align:end"><button class="sm" onclick="showDoc(${escJ(r.host)})">${esc(t('docs'))}</button> <button class="sm" onclick="getTool(${escJ(r.host)})">${esc(t('tool'))}</button> <button class="sm" onclick="expRec(${escJ(r.host)})">${esc(t('export'))}</button> <button class="sm d" onclick="delRec(${escJ(r.host)})">${esc(t('forget'))}</button></td></tr>`).join('')||`<tr><td class="mut" colspan="4">-</td></tr>`;
 $('tabs').innerHTML=Object.keys(names).map(x=>`<button class="sm ${x==tab?'p':''}" onclick="tab='${x}';render()">${names[x]}</button>`).join('');
 $('snip').textContent=snippets($('keysel').value||(S.keys[0]||{}).key||'',S.port)[tab];
 const s=S.settings;if(document.activeElement.tagName!='INPUT'){$('s_cont').checked=s.continuity;$('s_tool').value=s.tool_desc_limit;$('s_sys').value=s.system_limit;$('s_res').value=s.result_limit;$('s_his').value=s.history_limit;$('s_idle').value=s.headless_idle_seconds;$('s_sum').checked=s.summarize_history;$('s_hc').value=s.health_interval_min;$('s_cache').value=s.cache_seconds}
 $('home').textContent='Data folder: '+S.home}
 async function setServingMode(id,mode){try{await api('accounts/'+encodeURIComponent(id)+'/serving-mode','POST',{mode});await tick()}catch(e){alert(errMsg(e));await tick()}}
+async function setModelChoice(id,variant){try{if(variant)await api('accounts/'+encodeURIComponent(id)+'/model-choice','POST',{mode:'fixed',variant});else await api('accounts/'+encodeURIComponent(id)+'/model-choice','DELETE');await tick()}catch(e){alert(errMsg(e));await tick()}}
  $('rep_show').onclick=async()=>{let h=$('rep_host').value.trim();if(!h)return;try{if(/^https?:\/\//i.test(h))h=new URL(h).hostname;if(!/^[a-z0-9.:[\]-]+$/i.test(h)||h.includes('..'))throw new Error('Enter a site hostname or URL, such as claude.ai');$('rep_host').value=h;$('rep_out').style.display='block';const r=await api('analysis/'+encodeURIComponent(h)+'/report');$('rep_out').textContent=r.markdown||'no report yet for this site'}catch(e){$('rep_out').style.display='block';$('rep_out').textContent='✘ '+e.message}};
 let reqOffset=0,reqTotal=0;async function showRequests(offset=0){let h=$('rep_host').value.trim();if(!h)return;if(/^https?:\/\//i.test(h))h=new URL(h).hostname;$('rep_host').value=h;reqOffset=Math.max(0,offset);try{const r=await api('analysis/'+encodeURIComponent(h)+'/requests?offset='+reqOffset+'&limit=100');reqTotal=r.total||0;$('req_out').style.display='block';$('req_nav').hidden=false;$('req_page').textContent=(reqTotal?`${reqOffset+1}-${Math.min(reqOffset+r.rows.length,reqTotal)}`:'0')+' / '+reqTotal;$('req_prev').disabled=reqOffset===0;$('req_next').disabled=reqOffset+r.rows.length>=reqTotal;$('req_out').innerHTML=(r.rows||[]).map(x=>`<details class="card"><summary><b>#${esc(x.seq??'')} ${esc(x.method)} ${esc(x.status||'')}</b> <span class="ltr mut">${esc(x.url)}</span> <span class="mut">${esc(x.type)} · ${esc(x.duration_s??'')}s</span></summary><div class="ltr"><b>Request (${esc(x.request_format)}):</b><pre class="mini">${esc(x.request||'(no text preview)')}</pre><b>Response (${esc(x.response_format)}):</b><pre class="mini">${esc(x.response||'(no text preview)')}</pre>${x.failed?'<div class="err">'+esc(x.failed)+'</div>':''}</div></details>`).join('')||'<p class="mut">No captured requests for this site.</p>'}catch(e){$('req_out').style.display='block';$('req_out').textContent='✘ '+errMsg(e)}}
 $('req_show').onclick=()=>showRequests(0);$('req_prev').onclick=()=>showRequests(reqOffset-100);$('req_next').onclick=()=>showRequests(reqOffset+100);
@@ -19009,7 +19116,7 @@ $('dir_meta').textContent=D.label;const cs=$('dir_cat');if(cs.options.length<2){
 const q=$('dir_q').value.trim().toLowerCase(),cat=cs.value;
 const L=D.entries.filter(e=>(!cat||e.category==cat)&&(!q||(e.name+' '+e.host+' '+(e.notes||'')).toLowerCase().includes(q)));
 $('dir_rows').innerHTML=L.map(e=>`<tr><td class="k">${esc(e.name)}<br><span class="mut ltr">${esc(e.url)}</span>${e.notes?'<br><span class="mut">'+esc(e.notes)+'</span>':''}</td><td>${esc(e.category)}</td><td><span class="b ${e.status=='added'?'ready':(e.status=='needs login'?'direct':'learning')}">${esc(e.status)}</span><br><span class="mut">verified: ${esc(e.verified_at||'not verified')}</span></td><td class="mut">${esc(e.how_to_add)}</td><td>${e.category=='api_compatible'||e.status!='not added'?'':`<button class="sm p" onclick="dirStart('${esc(e.id)}')">Add account</button> `}<button class="sm" onclick="dirDel('${esc(e.id)}')">Remove</button></td></tr>`).join('')||'<tr><td class="mut" colspan="5">No sites match</td></tr>'}
-async function dirStart(id){const e=(D.entries||[]).find(x=>x.id==id);if(!e)return;try{await api('accounts','POST',{url:e.url,label:e.name})}catch(x){alert(errMsg(x))}loadDir();tick()}
+async function dirStart(id){const e=(D.entries||[]).find(x=>x.id==id);if(!e)return;try{await api('accounts','POST',{url:e.url,label:e.name,learn:false})}catch(x){alert(errMsg(x))}loadDir();tick()}
 async function dirDel(id){if(!confirm('Remove this entry from the directory? (accounts are not touched)'))return;try{await api('directory/'+encodeURIComponent(id),'DELETE')}catch(x){alert(errMsg(x))}loadDir()}
 async function dirAdd(){try{await api('directory','POST',{name:$('dir_name').value,url:$('dir_url').value,category:$('dir_newcat').value});$('dir_name').value='';$('dir_url').value=''}catch(x){alert(errMsg(x))}loadDir()}
 const fmtT=t=>t?new Date(t*1000).toLocaleString():'-';
@@ -19023,6 +19130,8 @@ let vt='-';if(v){vt=esc(v.runs_ok)+'/'+esc(v.runs_total)+' runs ok · need '+esc
 if(rp)vt+='<br><span class="mut">repair: '+esc(rp.status)+' (attempts '+esc(rp.attempts??0)+')</span>';
 let st='-';if(sp){st=esc((sp.did||[]).join(', ')||'nothing due');if(sp.skipped)st+='<br><span class="mut">skipped: '+esc(sp.skipped)+'</span>';if(sp.error)st+='<br><span class="mut">error: '+esc(sp.error)+'</span>'}
 return `<tr><td class="k">${esc(a.label||a.id)}<br><span class="mut">${esc(a.host)} · tier ${esc(a.tier||'-')}</span></td><td><span class="b ${stB(l.state)}">${esc(l.state||'-')}</span><br><span class="mut">${esc(l.reason||'')}</span></td><td>${vt}</td><td>${st}</td><td><button class="sm" onclick="o12Toggle('${esc(a.id)}',${a.disabled?'true':'false'})">${a.disabled?'Enable':'Disable'}</button> <button class="sm" onclick="recheckDirect('${esc(a.id)}')">Re-check direct</button></td></tr>`}).join('')||'<tr><td class="mut" colspan="5">No browser accounts yet</td></tr>'}
+let RD=null,RDE='';
+function renderDecisions(){const body=$('decision_rows');if(!RD){$('decision_meta').textContent=RDE?'Could not load routing decisions: '+RDE:'Loading recent decisions…';body.innerHTML='';return}const rows=RD.decisions||[];$('decision_meta').textContent=rows.length?'Recent route choices. Prompts and credentials are never shown here.':'No requests have been routed in this session yet.';body.innerHTML=rows.map(d=>{const s=d.selected||{},ex=(d.excluded||[]).slice(0,3).map(x=>x.code||x.reason||'').filter(Boolean).join(', '),account=(S.accounts.find(a=>a.id===s.account)||{}).label||s.account||'-';return `<tr><td class="mut">${esc(fmtT(d.ts))}</td><td class="k">${esc(d.requested_model||'-')}</td><td>${esc(account)}<br><span class="mut k">${esc(s.variant||s.route||'-')}</span></td><td>${esc(d.policy||'default')} · ${esc(d.policy_kind||'auto')}</td><td><span class="b ${d.outcome==='ok'?'ready':'learning'}">${esc(d.outcome||'pending')}</span></td><td>${d.fallback?'fallback · ':''}${esc(ex||'-')}</td></tr>`}).join('')||'<tr><td class="mut" colspan="6">No decisions yet.</td></tr>'}
 function renderCtx(){if(!C)return;const x=C.tokenizer||{};
 $('ctx_meta').textContent='Token counting: '+(x.kind||'estimate')+' · tokenizer '+(x.active||'?')+' · '+(x.chars_per_token||'?')+' chars/token · '+((C.continuity||{}).chats||[]).length+' remembered chat(s)';
 const rows=[];for(const [k,v] of Object.entries(C.measured||{}))rows.push([k,v,'measured']);for(const [k,v] of Object.entries(C.estimated||{}))rows.push([k,v,'estimated']);
@@ -19037,11 +19146,18 @@ const el=$('ctx_disc');el.style.display='block';el.textContent='Running 3 probe 
 try{const r=await api('accounts/'+encodeURIComponent(id)+'/paste-discover','POST');el.textContent='Requests used: '+r.requests_used+(r.ran?'':' (did not run)')+'\nApplied: '+(r.applied?'yes':'no')+(r.suggestion?'\nSuggested signal: '+JSON.stringify(r.suggestion):'')+(r.reason?'\n'+r.reason:'')}catch(e){el.textContent='Failed: '+e.message}
 tick()}
 let busy=false;
-async function tick(){if(busy)return;busy=true;try{S=await api('state');try{C=await api('context')}catch(e){}try{O=await api('o12');O12E=''}catch(e){O12E=errMsg(e)}
+async function tick(){if(busy)return;busy=true;try{S=await api('state');try{C=await api('context')}catch(e){}try{O=await api('o12');O12E=''}catch(e){O12E=errMsg(e)}try{RD=await api('decisions?n=30');RDE=''}catch(e){RD=null;RDE=errMsg(e)}
 if(!$('preset').options.length){$('preset').innerHTML='<option value="">'+esc(t('preset'))+'</option>'+S.presets.map(p=>`<option value="${esc(p.url)}" data-n="${esc(p.name)}">${esc(p.name)}</option>`).join('');$('preset').onchange=()=>{$('url').value=$('preset').value;$('label').value=$('preset').selectedOptions[0].dataset.n||'';urlPrev()}}
 if(view=='log'||!$('log').textContent){const lg=await api('log');const hide=$('hidetech').checked;let ls=lg.lines;if(hide)ls=ls.filter(l=>!/ DEBUG /.test(l)).map(l=>String(l).split('\n')[0]);const el=$('log'),atEnd=el.scrollTop+el.clientHeight>=el.scrollHeight-20;el.textContent=(lg.file?'Log file: '+lg.file+'\n':'')+ls.join('\n');if(atEnd)el.scrollTop=el.scrollHeight}
-render();renderCtx();renderO12()}catch(e){$('st').textContent='disconnected'}finally{busy=false}}
-async function addAcc(){const url=$('url').value.trim();if(!url)return alert(t('url_ph'));try{await api('accounts','POST',{url,label:$('label').value.trim()});$('url').value='';$('label').value='';$('urlprev').textContent='';tick()}catch(e){alert(errMsg(e))}}
+render();renderCtx();renderO12();renderDecisions()}catch(e){$('st').textContent='disconnected'}finally{busy=false}}
+async function addAcc(){const url=$('url').value.trim();if(!url)return alert(t('url_ph'));try{await api('accounts','POST',{url,label:$('label').value.trim(),learn:$('learn_on_add').checked});$('url').value='';$('label').value='';$('urlprev').textContent='';tick()}catch(e){alert(errMsg(e))}}
+async function selectWorkspace(){try{const r=await api('workspace/select','POST',{});if(r.folder){$('workspace_path').value=r.folder;localStorage.workspacePath=r.folder;$('workspace_status').textContent=t('workspace_ready')}else $('workspace_status').textContent=t('workspace_cancel');updateWorkspaceCommand()}catch(e){$('workspace_status').textContent=t('workspace_error')+errMsg(e)}}
+function updateWorkspaceCommand(){const app=$('workspace_app').value,folder=$('workspace_path').value,keyValue=(S&&S.keys.find(k=>k.id===$('workspace_key').value)||{}).key||'',base='http://127.0.0.1:'+(S?S.port:'8788');localStorage.workspaceApp=app;let cmd='';const psPath="'"+folder.replace(/'/g,"''")+"'";
+if(!folder)cmd=t('workspace_ph');else if(app==='claude'&&!keyValue)cmd='Select an API key first.';else if(app==='claude')cmd=`$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_API_KEY="${keyValue}"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nSet-Location -LiteralPath ${psPath}\nclaude`;
+else if(app==='vscode')cmd=`code "${folder}"`;else if(app==='cursor')cmd=`cursor "${folder}"`;else if(app==='cmd')cmd=`cd /d "${folder}"`;else cmd=`Set-Location -LiteralPath ${psPath}`;
+$('workspace_command').textContent=cmd||'Select a workspace folder to prepare the command.'}
+async function copyWorkspaceCommand(){updateWorkspaceCommand();const cmd=$('workspace_command').textContent;if(!cmd||cmd===t('workspace_ph')||cmd==='Select an API key first.')return;try{await navigator.clipboard.writeText(cmd);$('workspace_status').textContent=t('workspace_copied')}catch(e){$('workspace_status').textContent=cmd}}
+async function openWorkspace(){const folder=$('workspace_path').value;if(!folder)return alert(t('workspace_ph'));try{const r=await api('workspace/open','POST',{app:$('workspace_app').value,folder,key_id:$('workspace_key').value});$('workspace_status').textContent=t('workspace_opened')+' (PID '+r.pid+')'}catch(e){$('workspace_status').textContent=t('workspace_error')+errMsg(e)}}
 async function startPcSetup(){const b=$('pc_start'),s=$('pc_state');b.disabled=true;s.textContent=t('pc_opening');try{const r=await api('personal-chrome/setup','POST',{});$('pc_code').textContent=r.code;$('pc_port').textContent=r.port;$('pc_folder').textContent=r.extension_dir;$('pc_steps').hidden=false;s.textContent=t('pc_ready')+(r.chrome_page_opened&&r.folder_opened?'':' · '+(r.chrome_page_opened?'':'Chrome page did not open automatically; use the link.'))}catch(e){s.textContent=t('pc_error')+errMsg(e)}finally{b.disabled=false}}
 async function copyPcCode(){try{await navigator.clipboard.writeText($('pc_code').textContent);$('pc_state').textContent=t('pc_copied')}catch(e){$('pc_state').textContent=$('pc_code').textContent}}
 let _up=0;async function urlPrev(){const v=$('url').value.trim(),el=$('urlprev'),my=++_up;if(!v){el.textContent='';return}try{const r=await api('sites/normalize','POST',{input:v});if(my===_up)el.textContent='→ '+r.open_url+'  ·  '+r.identity_host+(r.notes.length?'  ·  '+r.notes.join('; '):'')}catch(e){if(my===_up)el.textContent='✘ '+errMsg(e)}}
@@ -19064,7 +19180,7 @@ const _saveTxt=(txt,name)=>{const a=document.createElement('a');a.href=URL.creat
 const _stamp=()=>new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
 $('lgdl').addEventListener('click',async()=>{try{const x=await api('logfile?level=all&full=1&tail=200000&report=1');_saveTxt(x.text,'bridge-log-'+_stamp()+'.txt')}catch(e){$('lgmsg').textContent=e.message}});
 $('lgcp').addEventListener('click',async()=>{let x;try{x=await api('logfile?level=info&tail=300&report=1')}catch(e){$('lgmsg').textContent=e.message;return}const txt=x.text+'\n===== dashboard: '+navigator.userAgent+' | tab: '+(typeof view!=='undefined'?view:'')+' | lang: '+lang+' =====';try{await navigator.clipboard.writeText(txt);$('lgmsg').textContent=t('log_copied')}catch(e){_saveTxt(txt,'bridge-report-'+_stamp()+'.txt');$('lgmsg').textContent=t('log_failed')}});
-setLang(lang);loadDir();tick();setInterval(tick,2000);
+const savedTheme=localStorage.getItem('theme')||'system';$('theme').value=savedTheme;setTheme(savedTheme);setLang(lang);loadDir();tick();setInterval(tick,2000);
 </script></body></html>"""
 
 
@@ -27465,6 +27581,69 @@ setTimeout(() => process.exit(0), 60000);
             for name in ("chatgpt", "openai", "gemini", "claude", "anthropic", "deepseek", "kimi", "qwen", "grok", "perplexity", "mistral", "copilot", "poe.com"):
                 self.assertNotIn(name, body)
 
+    class TestWorkspaceAndOptionalLearning(unittest.TestCase):
+        """Local workspace launch safety and owner-controlled login/learning split."""
+
+        def test_workspace_launch_uses_fixed_app_names_and_never_a_shell(self) -> None:
+            from unittest import mock
+            tmp = Path(tempfile.mkdtemp(prefix="bridge_workspace_test_"))
+            try:
+                popen = mock.Mock(return_value=types.SimpleNamespace(pid=456))
+                with mock.patch("shutil.which", return_value="C:/Tools/claude.exe"), mock.patch("subprocess.Popen", popen):
+                    result = open_workspace_tool("claude", str(tmp), 8788, "bridge-key")
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["pid"], 456)
+                args, kw = popen.call_args
+                self.assertEqual(args[0], ["C:/Tools/claude.exe"])
+                self.assertEqual(kw["cwd"], str(tmp.resolve()))
+                self.assertFalse(kw.get("shell", False))
+                self.assertEqual(kw["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8788")
+                self.assertEqual(kw["env"]["ANTHROPIC_API_KEY"], "bridge-key")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        def test_workspace_rejects_unknown_apps_missing_paths_and_missing_executables(self) -> None:
+            from unittest import mock
+            tmp = Path(tempfile.mkdtemp(prefix="bridge_workspace_test_"))
+            try:
+                with self.assertRaises(BridgeError):
+                    open_workspace_tool("unknown", str(tmp), 8788, "key")
+                with self.assertRaises(BridgeError):
+                    open_workspace_tool("claude", str(tmp / "missing"), 8788, "key")
+                with mock.patch("shutil.which", return_value=None), self.assertRaises(BridgeError):
+                    open_workspace_tool("claude", str(tmp), 8788, "key")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        def test_login_only_add_skips_learning_budget_and_keeps_learning_explicit(self) -> None:
+            from unittest import mock
+            tmp, store, cfg, app = mk_env()
+            try:
+                job = types.SimpleNamespace(id="job1")
+                with mock.patch.object(app.acc, "site_guard", return_value=""), mock.patch.object(app.acc, "start_job", return_value=job) as start:
+                    account, started = app.acc.add("https://new.example.com", "New site", learn=False)
+                self.assertIs(started, job)
+                self.assertNotIn("learn_budget", account)
+                self.assertEqual(start.call_args.args[1], "login-only")
+                account["state"] = "needs_learning"
+                self.assertEqual(lc_derive(account, False)[0], "degraded_fallback")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        def test_dashboard_integrates_advanced_panels_and_workspace_picker(self) -> None:
+            self.assertIn("workspace/select", DASHBOARD_HTML)
+            self.assertIn("workspace/open", DASHBOARD_HTML)
+            self.assertIn("learn_on_add", DASHBOARD_HTML)
+            self.assertIn("function go(v){view=v;", DASHBOARD_HTML)
+            self.assertNotIn("['adv','advanced']", DASHBOARD_HTML)
+            self.assertIn("id=\"decisioncard\"", DASHBOARD_HTML)
+            self.assertIn("data-theme=\"mint\"", DASHBOARD_HTML)
+            self.assertIn("@media(max-width:640px)", DASHBOARD_HTML)
+            self.assertIn("o12Toggle", DASHBOARD_HTML)
+            self.assertIn("b_use", DASHBOARD_HTML)
+            self.assertIn("setModelChoice", DASHBOARD_HTML)
+            self.assertIn("ms.options.map", DASHBOARD_HTML)
+
     class TestServingModesAndEvidence(unittest.TestCase):
         """Owner-selected serving path and credential-safe learning evidence exports; mock data only."""
 
@@ -28400,7 +28579,7 @@ setTimeout(() => process.exit(0), 60000);
                 shutil.rmtree(tmp, ignore_errors=True)
 
     all_cases = (TestFixes725, TestResolver, TestHashing, TestStreamDecoder, TestRouterCore, TestHTTP, TestPersistence, TestSecurityHelpers, TestApiBackend, TestCatalog, TestRouting, TestResolutionCatalog,
-                 TestErrorsAndLimits, TestTaskStateAndFailover, TestContextEngine, TestSubmission, TestGroupO, TestGroupOSetup, TestGroupOCapture, TestGroupO5, TestGroupO17, TestGroupO18, TestGroupO19, TestGroupO8, TestGroupO9, TestGroupO9Supervisor, TestGroupO827, TestGroupO827b, TestGroupO21Link, TestGroupO14, TestGroupO13, TestGroupO15, TestGroupO25, TestGroupO26, TestGroupO27, TestGroupO28, TestServingModesAndEvidence, TestAutomaticDependencySetup, TestReportInSync, TestFixes732, TestGroupO12Dash, TestGroupO11, TestLogFile, TestAccessAndDashboardLog, TestPersonalChrome, TestQuickSmoke)
+                 TestErrorsAndLimits, TestTaskStateAndFailover, TestContextEngine, TestSubmission, TestGroupO, TestGroupOSetup, TestGroupOCapture, TestGroupO5, TestGroupO17, TestGroupO18, TestGroupO19, TestGroupO8, TestGroupO9, TestGroupO9Supervisor, TestGroupO827, TestGroupO827b, TestGroupO21Link, TestGroupO14, TestGroupO13, TestGroupO15, TestGroupO25, TestGroupO26, TestGroupO27, TestGroupO28, TestWorkspaceAndOptionalLearning, TestServingModesAndEvidence, TestAutomaticDependencySetup, TestReportInSync, TestFixes732, TestGroupO12Dash, TestGroupO11, TestLogFile, TestAccessAndDashboardLog, TestPersonalChrome, TestQuickSmoke)
     only = os.environ.get("BRIDGE_SELFTEST_ONLY", "")             # lean workflow (section 0A): BRIDGE_SELFTEST_ONLY=TestSubmission,TestContextEngine runs just those classes
     for case in ((TestQuickSmoke,) if quick else tuple(c for c in all_cases if not only or c.__name__ in only.split(","))):
         suite.addTests(ld.loadTestsFromTestCase(case))

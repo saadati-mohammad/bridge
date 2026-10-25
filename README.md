@@ -4,6 +4,6 @@ Single-file local bridge that presents web-model and compatible API accounts thr
 
 ## Current verification status
 
-The project is version 7.36. The code compiles and the quick self-test passes. The latest full offline self-test ran 421 tests with 3 failures and 5 skips, so this revision is not release-ready. No end-to-end run against a real site, the owner's Chrome, or a real model has been recorded.
+The current base revision is 7.53. Its handoff record reports 440 offline tests passing with 5 environment skips. Version 7.54 is in progress: it adds optional per-account learning, native workspace selection and launch, merged account/advanced controls, recent routing decisions, and selectable themes. The 7.54 tests have not yet been run; no end-to-end run against a real site, the owner's Chrome, or a real model has been recorded.
 
-See `HANDOFF_REPORT.md` for the evidence ledger, known gaps, and the next required step: make the full suite deterministic and green before wiring O29 live promotion.
+See `HANDOFF_REPORT.md` for the evidence ledger, known gaps, and verification status.
