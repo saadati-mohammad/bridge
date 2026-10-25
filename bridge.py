@@ -19562,9 +19562,9 @@ document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));d
 if(S&&S.presets&&$('preset').options.length)$('preset').options[0].textContent=t('preset');navRender();render();renderCtx()}
 function navRender(){$('nav').innerHTML=VIEWS.map(v=>`<button class="${v[0]==view?'on':''}" onclick="go('${v[0]}')">${esc(t(v[1]))}</button>`).join('')}
 function go(v){view=v;document.querySelectorAll('.view').forEach(e=>e.classList.toggle('on',e.id=='v_'+v||(v=='accounts'&&e.id=='v_adv')));navRender()}
-function snippets(k,port,model){const u='http://127.0.0.1:'+port;return{'claude-ps':`$env:ANTHROPIC_BASE_URL="${u}"\n$env:ANTHROPIC_API_KEY="${k}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nclaude`,
-'claude-sh':`export ANTHROPIC_BASE_URL=${u}\nexport ANTHROPIC_API_KEY=${k}\nexport ANTHROPIC_MODEL=sonnet\nexport CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
-'claude-cmd':`set ANTHROPIC_BASE_URL=${u}\nset ANTHROPIC_API_KEY=${k}\nset ANTHROPIC_MODEL=sonnet\nset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
+function snippets(k,port,model){const u='http://127.0.0.1:'+port;return{'claude-ps':`Remove-Item Env:ANTHROPIC_DEFAULT_SONNET_MODEL,Env:ANTHROPIC_DEFAULT_OPUS_MODEL,Env:ANTHROPIC_DEFAULT_HAIKU_MODEL -ErrorAction SilentlyContinue\n$env:ANTHROPIC_BASE_URL="${u}"\n$env:ANTHROPIC_API_KEY="${k}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nclaude`,
+'claude-sh':`unset ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL\nexport ANTHROPIC_BASE_URL=${u}\nexport ANTHROPIC_API_KEY=${k}\nexport ANTHROPIC_MODEL=sonnet\nexport CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
+'claude-cmd':`set ANTHROPIC_DEFAULT_SONNET_MODEL=\nset ANTHROPIC_DEFAULT_OPUS_MODEL=\nset ANTHROPIC_DEFAULT_HAIKU_MODEL=\nset ANTHROPIC_BASE_URL=${u}\nset ANTHROPIC_API_KEY=${k}\nset ANTHROPIC_MODEL=sonnet\nset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
 'openai':`Base URL : ${u}/v1\nAPI key  : ${k}\nModel    : bridge-auto   (or acct:<id> / the exact account label to force one account)\n\nCursor / VS Code agents / Continue / Cline / any OpenAI-compatible client:\nuse the "OpenAI compatible" provider with the values above.`}}
 const names={'claude-ps':'Claude Code (PowerShell)','claude-sh':'Claude Code (bash)','claude-cmd':'Claude Code (cmd)','openai':'Cursor / VS Code / OpenAI-compatible'};
 const mmss=s=>{s=Math.max(0,Math.floor(s));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
@@ -19671,7 +19671,7 @@ async function addAcc(){const url=$('url').value.trim();if(!url)return alert(t('
 async function selectWorkspace(){try{const r=await api('workspace/select','POST',{});if(r.folder){$('workspace_path').value=r.folder;localStorage.workspacePath=r.folder;$('workspace_status').textContent=t('workspace_ready')}else $('workspace_status').textContent=t('workspace_cancel');updateWorkspaceCommand()}catch(e){$('workspace_status').textContent=t('workspace_error')+errMsg(e)}}
 function workspaceModel(){return 'sonnet'}
  function updateWorkspaceCommand(){const app=$('workspace_app').value,folder=$('workspace_path').value,keyValue=(S&&S.keys.find(k=>k.id===$('workspace_key').value)||{}).key||'',base='http://127.0.0.1:'+(S?S.port:'8788'),policy=workspaceModel();localStorage.workspaceApp=app;localStorage.claudeFullAccess=$('claude_full_access').checked?'1':'0';let cmd='';const psPath="'"+folder.replace(/'/g,"''")+"'";
- if(!folder)cmd=t('workspace_ph');else if(app==='claude'&&!keyValue)cmd=t('workspace_key_required');else if(app==='claude'){const full=$('claude_full_access').checked,flag=full?' --dangerously-skip-permissions':'';cmd=`$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_API_KEY="${keyValue}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nSet-Location -LiteralPath ${psPath}\nclaude${flag}`}
+ if(!folder)cmd=t('workspace_ph');else if(app==='claude'&&!keyValue)cmd=t('workspace_key_required');else if(app==='claude'){const full=$('claude_full_access').checked,flag=full?' --dangerously-skip-permissions':'';cmd=`Remove-Item Env:ANTHROPIC_DEFAULT_SONNET_MODEL,Env:ANTHROPIC_DEFAULT_OPUS_MODEL,Env:ANTHROPIC_DEFAULT_HAIKU_MODEL -ErrorAction SilentlyContinue\n$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_API_KEY="${keyValue}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nSet-Location -LiteralPath ${psPath}\nclaude${flag}`}
 else if(app==='vscode')cmd=`code "${folder}"`;else if(app==='cursor')cmd=`cursor "${folder}"`;else if(app==='cmd')cmd=`cd /d "${folder}"`;else cmd=`Set-Location -LiteralPath ${psPath}`;
  $('workspace_command').textContent=cmd||'Select a workspace folder to prepare the command.'}
 async function copyWorkspaceCommand(){updateWorkspaceCommand();const cmd=$('workspace_command').textContent;if(!cmd||cmd===t('workspace_ph')||cmd===t('workspace_key_required'))return;try{await navigator.clipboard.writeText(cmd);$('workspace_status').textContent=t('workspace_copied')}catch(e){$('workspace_status').textContent=cmd}}
@@ -28266,7 +28266,7 @@ setTimeout(() => process.exit(0), 60000);
             self.assertIn("register_active_tab", PC_BACKGROUND_JS)
             self.assertIn("async function testAccount(id)", DASHBOARD_HTML)
             self.assertIn("Start here", DASHBOARD_HTML)
-            self.assertNotIn("ANTHROPIC_DEFAULT_SONNET_MODEL", DASHBOARD_HTML)
+            self.assertIn("Remove-Item Env:ANTHROPIC_DEFAULT_SONNET_MODEL", DASHBOARD_HTML)
             self.assertIn("it never switches this account to Playwright", DASHBOARD_HTML)
             self.assertIn("--dangerously-skip-permissions", DASHBOARD_HTML)
             self.assertIn("A saved login marked needs_learning is still usable through its assigned personal Chrome profile", DASHBOARD_HTML)
