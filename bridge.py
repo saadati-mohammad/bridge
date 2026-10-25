@@ -167,7 +167,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.65"
+VERSION = "7.66"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -4783,7 +4783,8 @@ def ui_diff_lines(body: str, before: Set[str], prompt: str) -> List[str]:
             body = body[:raw_start] + body[raw_end:]
     prompt_lines = {norm(line) for line in str(prompt or "").splitlines() if len(norm(line)) >= 10}
     old = {norm(line) for line in before}
-    controls = {"share", "copy", "edit", "retry", "regenerate", "you said:", "claude responded:"}
+    controls = {"share", "copy", "edit", "retry", "regenerate", "new chat", "new conversation",
+                "ai-generated, for reference only", "you said:", "claude responded:"}
     out: List[str] = []
     for raw in body.splitlines():
         line = raw.strip()
@@ -14787,9 +14788,14 @@ class Accounts:
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise BridgeError("the saved web account has no valid site URL", "setup", 503)
         base = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+        host = str(acct.get("host") or parsed.hostname or "").lower()
         ui = {"diff": True}
-        if str(acct.get("host") or "").lower() == "chatgpt.com" or str(acct.get("host") or "").lower().endswith(".chatgpt.com"):
+        if host == "chatgpt.com" or host.endswith(".chatgpt.com"):
             ui = {"answer": '[data-message-author-role="assistant"]'}
+        elif host == "deepseek.com" or host.endswith(".deepseek.com"):
+            ui = {"answer": '.ds-assistant-message-main-content.ds-markdown, [data-message-author-role="assistant"], [data-role="assistant"]'}
+        elif host == "claude.ai" or host.endswith(".claude.ai"):
+            ui = {"answer": '.font-claude-response, [data-testid="ai-message"], [data-testid="message-assistant"], .assistant-message'}
         backend = UIBackend({"base": base, "entry": base + "/", "continuity": False, "tier": "ui", "ui": ui},
                             self.browser(acct["id"]))
         backend.unlearned_ui = True
@@ -21239,6 +21245,28 @@ def run_selftest(quick: bool = False) -> int:
             self.assertFalse(backend.diff)
             self.assertIn("cloneNode(true)", UI_STATE_JS)
             self.assertIn("e.textContent = ''", UI_STATE_JS)
+
+        def test_unlearned_deepseek_and_claude_use_assistant_message_nodes(self) -> None:
+            from unittest import mock
+            a = self.acc.get("a1")
+            cases = [
+                ("chat.deepseek.com", "https://chat.deepseek.com/", ".ds-assistant-message-main-content.ds-markdown"),
+                ("claude.ai", "https://claude.ai/", ".font-claude-response"),
+            ]
+            for host, url, expected in cases:
+                with self.subTest(host=host):
+                    a.update(state="needs_learning", type="browser", serving_mode="browser", url=url, host=host, tier="ui")
+                    with mock.patch.object(self.acc, "browser", return_value=object()):
+                        backend = self.acc.backend(a)
+                    self.assertIn(expected, backend.sel)
+                    self.assertFalse(backend.diff)
+
+        def test_generic_ui_diff_drops_page_title_and_non_answer_metadata(self) -> None:
+            response = "\n".join(ui_diff_lines("New chat\nAI-generated, for reference only\nDoing well — good to see you.\nWhat are we working on?",
+                                                   set(), "hi babe, how are you doin?"))
+            self.assertNotIn("New chat", response)
+            self.assertNotIn("AI-generated", response)
+            self.assertEqual(response, "Doing well — good to see you.\nWhat are we working on?")
 
         def test_generic_ui_diff_removes_echoed_prompt_and_chat_controls(self) -> None:
             prompt = "<system>\nx-anthropic-billing-header: example\nBefore saving, check for an existing file.\n</system>\nhi"
