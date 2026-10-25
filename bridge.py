@@ -3750,35 +3750,6 @@ class PCContext:
                  "secure": c.get("secure", False), "sameSite": c.get("sameSite", "Lax")} for c in r.get("cookies", [])]
 
 
-class _PCProfileClient:
-    """A profile-bound view of the shared local hub. It never receives commands/events for another Chrome profile."""
-    def __init__(self, hub: PCHub, client_id: str):
-        self._hub, self.client_id = hub, client_id
-        self._listeners: Dict[Callable[[Dict[str, Any]], None], Callable[[Dict[str, Any]], None]] = {}
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._hub, name)
-
-    def call(self, op: str, args: Optional[Dict[str, Any]] = None, **kw: Any) -> Any:
-        return self._hub.call(op, args, client_id=self.client_id, **kw)
-
-    def connected(self) -> bool:
-        return self._hub.connected(self.client_id)
-
-    def add_listener(self, fn: Callable[[Dict[str, Any]], None]) -> None:
-        if fn in self._listeners:
-            return
-        def filtered(ev: Dict[str, Any]) -> None:
-            if ev.get("client_id") == self.client_id:
-                fn(ev)
-        self._listeners[fn] = filtered
-        self._hub.add_listener(filtered)
-
-    def remove_listener(self, fn: Callable[[Dict[str, Any]], None]) -> None:
-        wrapped = self._listeners.pop(fn, None)
-        if wrapped:
-            self._hub.remove_listener(wrapped)
-
     def add_cookies(self, cookies: List[Dict[str, Any]]) -> None:
         pg = next(iter(self.pages), None) or self.new_page()
         pg._cdp("Network.setCookies", {"cookies": [{k: v for k, v in c.items() if k in ("name", "value", "url", "domain", "path", "secure", "httpOnly", "sameSite", "expires")} for c in cookies]})
@@ -3848,6 +3819,36 @@ class _PCProfileClient:
                 except Exception:
                     p._mark_closed()
         self._emit("close", self)
+
+
+class _PCProfileClient:
+    """A profile-bound view of the shared local hub. It never receives commands/events for another Chrome profile."""
+    def __init__(self, hub: PCHub, client_id: str):
+        self._hub, self.client_id = hub, client_id
+        self._listeners: Dict[Callable[[Dict[str, Any]], None], Callable[[Dict[str, Any]], None]] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._hub, name)
+
+    def call(self, op: str, args: Optional[Dict[str, Any]] = None, **kw: Any) -> Any:
+        return self._hub.call(op, args, client_id=self.client_id, **kw)
+
+    def connected(self) -> bool:
+        return self._hub.connected(self.client_id)
+
+    def add_listener(self, fn: Callable[[Dict[str, Any]], None]) -> None:
+        if fn in self._listeners:
+            return
+        def filtered(ev: Dict[str, Any]) -> None:
+            if ev.get("client_id") == self.client_id:
+                fn(ev)
+        self._listeners[fn] = filtered
+        self._hub.add_listener(filtered)
+
+    def remove_listener(self, fn: Callable[[Dict[str, Any]], None]) -> None:
+        wrapped = self._listeners.pop(fn, None)
+        if wrapped:
+            self._hub.remove_listener(wrapped)
 
 
 PC_CAPABILITIES = [
@@ -28456,7 +28457,7 @@ setTimeout(() => process.exit(0), 60000);
             code = self.hub.new_pairing()
             status, repaired = self.post("/pc/pair", {"code": code, "client_id": "profile-a", "client_name": "Personal Dev"}, origin=self.ORIGIN)
             self.assertEqual(status, 200)
-            self.assertIsNone(self.hub.client_for_token(self.ORIGIN, tok_a))
+            self.assertFalse(self.hub.client_for_token(self.ORIGIN, tok_a))
             self.assertEqual(self.hub.client_for_token(self.ORIGIN, repaired["token"]), "profile-a")
             self.assertEqual(self.hub.client_for_token(self.ORIGIN, tok_b), "profile-b")
             self.assertEqual(self.hub.profiles()[1]["name"], "Work")
