@@ -167,7 +167,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.63"
+VERSION = "7.64"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -4324,7 +4324,11 @@ UI_STATE_JS = """(sels) => {
     const ro = box.readOnly === true || box.hasAttribute('readonly') || box.getAttribute('contenteditable') === 'false';
     out.enabled = !dis; out.editable = !ro;
     let c = box; for (let i = 0; i < 4 && c.parentElement && c.parentElement !== document.body; i++) c = c.parentElement;
-    out.scope_text = (c.innerText || '').slice(0, 1500);
+    const scan = c.cloneNode(true);
+    for (const e of scan.querySelectorAll("textarea, [contenteditable='true'], [role='textbox'], input[type='text']")) {
+      if ('value' in e) e.value = ''; e.textContent = '';
+    }
+    out.scope_text = (scan.innerText || '').slice(0, 1500);
   }
   out.widget = [...document.querySelectorAll("iframe[src*='challenges.cloudflare.com'], .cf-turnstile iframe, [id^='cf-chl'], #challenge-running, #challenge-stage")].some(vis);
   return out;
@@ -4477,9 +4481,20 @@ def ui_type_and_send(page: Any, text: str, say: Optional[Callable[[str], None]] 
         box.click(timeout=5000)                                                  # an editor that refuses fill() but is enabled: typing the text is still honest input
         page.keyboard.insert_text(text)
     page.wait_for_timeout(250)
-    if not ui_input_ready(page):                                                 # a check can appear right after the text lands: do not press Enter into it
+    state = ui_page_state(page)                                                 # the composer text is excluded from challenge scanning
+    if state.get("challenge"):
         wait = ui_gate_failed(host)
         raise BridgeError(f"a bot check appeared while the message was being typed; it was not sent; backing off {int(wait)}s", "challenge", 503, retry_after=wait)
+    for _ in range(4):                                                         # allow the site's controlled composer to settle after fill()
+        if not state.get("blocked_by"):
+            break
+        page.wait_for_timeout(250)
+        state = ui_page_state(page)
+        if state.get("challenge"):
+            wait = ui_gate_failed(host)
+            raise BridgeError(f"a bot check appeared while the message was being typed; it was not sent; backing off {int(wait)}s", "challenge", 503, retry_after=wait)
+    if state.get("blocked_by"):
+        raise BridgeError(f"the chat composer became unavailable before sending ({state['blocked_by']}); nothing was sent", "ui", 503)
     page.keyboard.press("Enter")
     page.wait_for_timeout(1500)
     try:
@@ -4785,8 +4800,12 @@ class UIBackend:
             host_ = _ui_host(pg)
             ui_gate_check(host_ or (urllib.parse.urlsplit(base).hostname or ""))      # in a back-off: touch nothing
             answer_probe = self.sel or '[data-message-author-role="assistant"]'
-            fresh_ok = (conv["url"] is None and not ui_select and (self.sel or self.diff) and (pg.url or "").startswith(base) and not url_on_login_path(pg.url) and ui_new_chat(pg, answer_probe))
-            if not fresh_ok and (conv["url"] is None or pg.url != target):
+            on_site = (pg.url or "").startswith(base) and not url_on_login_path(pg.url)
+            fresh_ok = (conv["url"] is None and not ui_select and (self.sel or self.diff) and on_site and ui_new_chat(pg, answer_probe))
+            # The extension borrows the owner's authenticated tab. Preserve a usable same-site tab
+            # when the site's New chat control is missing; reloading it can trigger a browser check.
+            preserve_borrowed_tab = conv["url"] is None and on_site
+            if not fresh_ok and not preserve_borrowed_tab and (conv["url"] is None or pg.url != target):
                 pg.goto(target, wait_until="domcontentloaded", timeout=45000)
                 pg.wait_for_timeout(900)
             if ui_select and (conv["url"] is None or conv.get("model") != model):
@@ -14705,7 +14724,10 @@ class Accounts:
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise BridgeError("the saved web account has no valid site URL", "setup", 503)
         base = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
-        backend = UIBackend({"base": base, "entry": base + "/", "continuity": False, "tier": "ui", "ui": {"diff": True}},
+        ui = {"diff": True}
+        if str(acct.get("host") or "").lower() == "chatgpt.com" or str(acct.get("host") or "").lower().endswith(".chatgpt.com"):
+            ui = {"answer": '[data-message-author-role="assistant"]'}
+        backend = UIBackend({"base": base, "entry": base + "/", "continuity": False, "tier": "ui", "ui": ui},
                             self.browser(acct["id"]))
         backend.unlearned_ui = True
         return backend
@@ -21121,7 +21143,7 @@ def run_selftest(quick: bool = False) -> int:
         def test_login_only_web_account_is_routable_through_personal_chrome(self) -> None:
             from unittest import mock
             a = self.acc.get("a1")
-            a.update(state="needs_learning", type="browser", serving_mode="browser", url="https://chatgpt.com/", tier="ui")
+            a.update(state="needs_learning", type="browser", serving_mode="browser", url="https://chatgpt.com/", host="chatgpt.com", tier="ui")
             self.assertNotIn("account_not_ready", self.codes("acct:a1"))
             selected, _decision = self.plan()
             self.assertEqual(selected["acct"]["id"], "a1")
@@ -21130,8 +21152,45 @@ def run_selftest(quick: bool = False) -> int:
             self.assertIsInstance(backend, UIBackend)
             self.assertTrue(backend.fenced_tools)
             self.assertTrue(backend.unlearned_ui)
-            self.assertTrue(backend.diff)
+            self.assertEqual(backend.sel, '[data-message-author-role="assistant"]')
+            self.assertFalse(backend.diff)
             self.assertFalse(backend.recipe["continuity"])
+
+        def test_unlearned_ui_uses_assistant_selector_and_scans_challenges_outside_composer(self) -> None:
+            from unittest import mock
+            a = self.acc.get("a1")
+            a.update(state="needs_learning", type="browser", serving_mode="browser", url="https://chatgpt.com/", host="chatgpt.com")
+            with mock.patch.object(self.acc, "browser", return_value=object()):
+                backend = self.acc.backend(a)
+            self.assertEqual(backend.sel, '[data-message-author-role="assistant"]')
+            self.assertFalse(backend.diff)
+            self.assertIn("cloneNode(true)", UI_STATE_JS)
+            self.assertIn("e.textContent = ''", UI_STATE_JS)
+
+        def test_unlearned_ui_preserves_the_owner_tab_if_new_chat_control_is_unavailable(self) -> None:
+            from unittest import mock
+            class Loc:
+                def count(self): return 0
+            class Page:
+                url = "https://chatgpt.com/"
+                def __init__(self): self.gotos = []
+                def is_closed(self): return False
+                def locator(self, _selector): return Loc()
+                def get_by_role(self, *_args, **_kwargs): return Loc()
+                def get_by_text(self, *_args, **_kwargs): return Loc()
+                def inner_text(self, _selector): return "ChatGPT"
+                def wait_for_timeout(self, _ms): pass
+                def goto(self, url, **_kwargs): self.gotos.append(url); self.url = url
+            class Browser:
+                def __init__(self, page): self.page_cache = {"page": page}
+                def run(self, fn, *_args): return fn(self)
+            page = Page()
+            be = UIBackend({"base": "https://chatgpt.com", "entry": "https://chatgpt.com/", "tier": "ui", "ui": {"diff": True}}, Browser(page))
+            cancel = threading.Event()
+            cancel.set()
+            with mock.patch(__name__ + ".ui_type_and_send"), mock.patch(__name__ + ".ui_input_ready", return_value=True):
+                list(be.ask(be.new_conv(), "hello", cancel=cancel))
+            self.assertEqual(page.gotos, [])
 
         # -- C1: validator
         def test_validator_rejects_impossible_configs_with_precise_messages(self) -> None:
