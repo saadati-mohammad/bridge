@@ -130,6 +130,7 @@ import gzip
 import hashlib
 import hmac
 import html
+import io
 import http.client
 import inspect
 import json
@@ -151,6 +152,7 @@ import threading
 import time
 import traceback
 import urllib.parse
+import zipfile
 import urllib.request
 import uuid
 import webbrowser
@@ -163,7 +165,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.52"
+VERSION = "7.53"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -845,7 +847,6 @@ class Config:
         "brain_cache_entries": 200,          # O25: per-site cache of answers keyed by the evidence hash (an identical question is never asked twice)
         "brain_max_rounds": 8,               # O26: the investigation loop stops after this many rounds (each round is one brain request)
         "brain_max_experiments": 3,          # O26: replay experiments (real requests to the site) one investigation may run
-        "analysis_ai_assist": True,          # O5: after a login+learn session, ask the site's OWN model (through its UI, 1 counted request, credentials removed) where the prompt/conversation/model/refresh values live; pointers are checked against the recorded traffic
         "analysis_enabled": True,            # O4/O22: record the owner's own login/learn session (CDP, credential-free at rest) and analyse it offline; no model request, no site request
         "capture_max_body_kb": 256,          # O22: per-body cap in the stored capture (head + tail kept)
         "toolchain_consent": False,          # legacy O21 setting; toolchain bootstrap is now automatic and app-local
@@ -12469,6 +12470,60 @@ def load_served(store: "Store", host: str) -> List[Dict[str, Any]]:
     return out
 
 
+def build_evidence_archive(store: "Store", host: str, secrets_: Optional[List[str]] = None, max_bytes: int = 50 * 1024 * 1024) -> bytes:
+    """Build an owner-requested ZIP of captured site scripts and redacted, request-by-request evidence."""
+    hd = safe_host_dir(host)
+    scripts = load_served(store, host)
+    exchanges = CaptureStore(store, host).load_all()
+    if not scripts and not exchanges:
+        raise BridgeError("no source or network captures are available for this site", "client", 404)
+    payload = json.dumps({"schema": 1, "host": host, "exchanges": exchanges}, ensure_ascii=False, separators=(",", ":"))
+    if len(payload.encode("utf-8")) > max_bytes:
+        raise BridgeError("the redacted evidence is too large for one download; use the per-request view", "client", 413)
+    guard_for_model(payload, secrets_ or [], "evidence archive")
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        zf.writestr("requests.json", payload)
+        zf.writestr("README.txt", "Credential-redacted site-learning evidence. Requests and responses are captured from your own session.\n"
+                                  "Source files are the JavaScript/worker responses observed during learning, not a complete server-side source tree.\n")
+        source_index = []
+        for script in scripts:
+            text = str(script.get("text") or "")
+            guard_for_model(text, secrets_ or [], "source archive")
+            sha = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+            name = f"source/{sha}.js"
+            zf.writestr(name, text)
+            source_index.append({"url": str(script.get("url") or ""), "file": name, "sha256": sha, "bytes": len(text.encode("utf-8", "replace"))})
+        zf.writestr("source/index.json", json.dumps(source_index, ensure_ascii=False, indent=2))
+    return out.getvalue()
+
+
+def request_trace_view(exchanges: List[Dict[str, Any]], offset: int = 0, limit: int = 100) -> Dict[str, Any]:
+    """Return a bounded, ordered request trace with redacted body previews and no cookie values."""
+    start, end = max(0, int(offset)), max(1, min(int(limit), 100))
+
+    def preview(body: Any) -> str:
+        if not isinstance(body, dict):
+            return ""
+        for key in ("text", "decoded"):
+            if isinstance(body.get(key), str):
+                return body[key][:500]
+        if body.get("fmt") == "credential_form":
+            return "[credential fields omitted] " + ", ".join(str(k)[:40] for k in body.get("keys", [])[:20])
+        return ""
+
+    rows = []
+    for ex in exchanges[start:start + end]:
+        rows.append({"id": str(ex.get("id") or "")[:100], "run": str(ex.get("run_t") or ""), "seq": ex.get("seq"),
+                     "kind": str(ex.get("kind") or "http")[:20], "method": str(ex.get("method") or "GET")[:12],
+                     "url": str(ex.get("url") or "")[:800], "status": ex.get("status"), "type": str(ex.get("rtype") or "")[:40],
+                     "protocol": str(ex.get("protocol") or "")[:40], "duration_s": ex.get("dur"),
+                     "request": preview(ex.get("req_body")), "request_format": (ex.get("req_body") or {}).get("fmt", "") if isinstance(ex.get("req_body"), dict) else "",
+                     "response": preview(ex.get("resp_body")), "response_format": (ex.get("resp_body") or {}).get("fmt", "") if isinstance(ex.get("resp_body"), dict) else "",
+                     "failed": str(ex.get("failed") or "")[:180], "redirect_to": str(ex.get("redirect_to") or "")[:800]})
+    return {"total": len(exchanges), "offset": start, "limit": end, "rows": rows}
+
+
 def served_scripts(raws: List[Dict[str, Any]], red: Redactor, limit: int = 4_000_000) -> List[Dict[str, Any]]:
     """Scripts and workers from the RAW exchanges (before redaction: redaction would alter code). Only a known credential is removed, in case one is embedded."""
     out, seen = [], set()
@@ -12605,8 +12660,9 @@ class NativeBackend:
     A route that names a model variant, and an upload, are served by the fallback tier (the native client has no way to choose a model or attach a file)."""
     tier = "native"
 
-    def __init__(self, client: "NativeClient", fallback: Callable[[], Any], note: Optional[Callable[[bool, Optional[Dict[str, Any]]], None]] = None):
-        self.client, self.fallback, self.note = client, fallback, note
+    def __init__(self, client: "NativeClient", fallback: Callable[[], Any], note: Optional[Callable[[bool, Optional[Dict[str, Any]]], None]] = None,
+                 allow_fallback: bool = True):
+        self.client, self.fallback, self.note, self.allow_fallback = client, fallback, note, bool(allow_fallback)
         self._fb: Optional[Any] = None
 
     def _fallback(self) -> Any:
@@ -12641,6 +12697,8 @@ class NativeBackend:
 
     def ask(self, conv: Dict[str, Any], prompt: str, cancel: Optional[threading.Event] = None, model: Optional[str] = None) -> Iterator[str]:
         if model or conv.get("via") == "fallback":
+            if not self.allow_fallback:
+                raise BridgeError("direct-only mode cannot serve this selected model; choose automatic mode to allow the browser fallback", "unsupported", 409)
             yield from self._via_fallback(conv, prompt, cancel, model)
             return
         r = self.client.ask(prompt, (conv.get("native") or {}).get("id") or None, (lambda: cancel.is_set()) if cancel is not None else None)
@@ -12655,7 +12713,7 @@ class NativeBackend:
         if err is None:
             err = {"category": "empty_answer", "may_have_been_accepted": True, "message": "the direct call returned an empty answer"}
         self._report(False, err)
-        if not r.get("text") and not err.get("may_have_been_accepted") and int(conv.get("turn") or 0) == 0:
+        if self.allow_fallback and not r.get("text") and not err.get("may_have_been_accepted") and int(conv.get("turn") or 0) == 0:
             yield from self._via_fallback(conv, prompt, cancel, None)
             return
         cat = str(err.get("category") or "")
@@ -12664,6 +12722,8 @@ class NativeBackend:
         raise BridgeError(str(err.get("message") or "the direct call failed")[:300], kind, status)
 
     def upload_text(self, conv: Dict[str, Any], text: str, cancel: Optional[threading.Event] = None) -> Dict[str, Any]:
+        if not self.allow_fallback:
+            raise BridgeError("direct-only mode cannot upload through the browser; choose automatic mode", "unsupported", 409)
         fb = self._fallback()
         conv["via"] = "fallback"
         if conv.get("fb") is None:
@@ -12836,6 +12896,35 @@ class Accounts:
     def get(self, aid: str) -> Optional[Dict[str, Any]]:
         return next((a for a in self.items if a["id"] == aid), None)
 
+    def serving_mode_view(self, acct: Dict[str, Any]) -> Dict[str, Any]:
+        """Expose only verified transport availability; API accounts use their official API transport."""
+        if acct.get("type") == "api":
+            return {"mode": "api", "browser": False, "direct": True, "automatic": True}
+        recipe = self.recipe(str(acct.get("host") or "")) or {}
+        browser = bool(recipe) and (bool(recipe.get("unresolved")) and bool((recipe.get("ui") or {}).get("answer") or (recipe.get("ui") or {}).get("diff"))
+                                    or not recipe.get("unresolved"))
+        direct = lc_state(acct) == "stable_direct" or bool(recipe and recipe.get("tier") == "direct" and not recipe.get("unresolved"))
+        return {"mode": str(acct.get("serving_mode") or "auto"), "browser": browser, "direct": direct, "automatic": True}
+
+    def set_serving_mode(self, aid: str, mode: str) -> Dict[str, Any]:
+        """Persist the owner's transport preference; explicit direct is accepted only for a verified no-browser path."""
+        acct = self.get(aid)
+        if acct is None:
+            raise BridgeError("unknown account", "client", 404)
+        if acct.get("type") == "api":
+            raise BridgeError("official API accounts already use their direct API transport", "client", 409)
+        if mode not in ("auto", "browser", "direct"):
+            raise BridgeError("mode must be auto, browser, or direct", "client", 400)
+        caps = self.serving_mode_view(acct)
+        if mode == "direct" and not caps["direct"]:
+            raise BridgeError("direct mode is not available: this account has no verified no-browser recipe yet", "setup", 409)
+        if mode == "browser" and not caps["browser"]:
+            raise BridgeError("browser mode is not available: this site has no verified page or UI recipe", "setup", 409)
+        with self.lock:
+            acct["serving_mode"] = mode
+            self.save()
+        return self.serving_mode_view(acct)
+
     # -- O1 lifecycle / O6 learning budget ------------------------------------------------------
     def _lifecycle_boot(self) -> None:
         """Every browser account gets a lifecycle record (migrated honestly if it predates it); work that was in flight when the process died is recovered, never left running."""
@@ -12971,6 +13060,7 @@ class Accounts:
             d["cooling"] = max(0, int(a.get("cooldown_until", 0) - now()))
             d["route_cooling"] = {r: {"seconds": int(u - now()), "why": w} for r, (u, w) in list(self.route_cool.items()) if r.startswith(f"acct:{a['id']}") and u > now()}
             d["has_recipe"] = a.get("type") == "api" or bool(self.recipe(a["host"]))
+            d["serving"] = self.serving_mode_view(a)
             cat = self.catalog(a["id"])
             vs = cat.get("variants", [])
             d["models"] = {"count": len(vs), "available": sum(1 for v in vs if v.get("status") == "available"), "status": cat.get("status"),
@@ -13359,7 +13449,6 @@ class Accounts:
             job.say(f"recorded {len(exs)} exchanges (credentials removed before anything was written)")
             r = run_site_analysis(self.store, self.cfg, acct["host"], acct["host"], scripts, session=sess)
             job.say(f"analysed the site offline: {r['endpoints']} endpoints, {r['edges']} dependencies, {r['unknown_surfaces']} surfaces still unknown; see analysis/{acct['host']}/report.md")
-            self._ai_reverse(acct, ctx, job, sess)
         except Exception as e_:
             log(f"site analysis skipped: {type(e_).__name__}: {e_}", "debug")
             try:
@@ -13561,40 +13650,6 @@ class Accounts:
                         raise
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_timeout(1500)
-
-    def _ai_reverse(self, acct: Dict[str, Any], ctx: Any, job: Job, sess: Dict[str, Any]) -> None:
-        """O5, automatic: right after the login session the site's own model is asked (through the page, 1 request counted in the learning budget) to POINT at where the prompt, conversation id,
-        model selector, stream format and token refresh live in the recorded traffic. The evidence it sees has every credential removed (a leftover credential means nothing is sent), each
-        pointer must quote the evidence literally and name a location that exists, and the bridge's own classification has the last word. Never fatal; never changes the recipe by itself."""
-        if not self.cfg["analysis_ai_assist"]:
-            return
-        host = acct["host"]
-        rcp = self.recipe(host)
-        ui = (rcp or {}).get("ui") or {}
-        if not rcp or not (ui.get("answer") or ui.get("diff")):
-            job.say("AI-assisted analysis skipped: the site's chat could not be driven through its page yet")
-            return
-        try:
-            exs = CaptureStore(self.store, host).load_all()
-            if not exs:
-                return
-            teacher = UIBackend({"base": rcp["base"], "entry": rcp.get("entry") or acct["url"], "ui": ui}, Inline(ctx))
-            conv = teacher.new_conv()
-            secrets_ = [str(v) for v in list((sess.get("auth") or {}).values()) + [c.get("value") for c in sess.get("cookies") or []] if v and len(str(v)) >= 8]
-            job.say("asking the site's own model where the request values live (AI-assisted analysis, 1 request, credentials removed)")
-            o5 = o5_reverse_engineer(exs, host, input_locs=recipe_input_locs(rcp), ask=lambda p: "".join(teacher.ask(conv, p)),
-                                     spend=lambda n, what: self.spend_learn(acct["id"], n, what), secrets_=secrets_)
-            self.store.write(f"analysis/{safe_host_dir(host)}/o5_ai.json", o5, private=True)
-            ptr = o5.get("pointers") or {}
-            kept = ptr.get("kept") or []
-            job.say(f"AI-assisted analysis: {len(kept)} pointer(s) kept, {len(ptr.get('dropped') or [])} dropped (not backed by the evidence); direct-mode status: {o5.get('status')}"
-                    + (f" - {ptr['error']}" if ptr.get("error") else ""))
-        except Exception as e_:
-            log(f"AI-assisted analysis skipped: {type(e_).__name__}: {e_}", "debug")
-            try:
-                job.say(f"AI-assisted analysis skipped: {redact_evidence(str(e_), 160)}")
-            except Exception:
-                pass
 
     def analyze_site(self, host: str) -> Dict[str, Any]:
         """Re-run the offline analysis from the stored captures and served scripts (no browser, no network)."""
@@ -14066,8 +14121,35 @@ class Accounts:
         return {"ok": True, "tier": "direct", "changed": True, "reason": "direct works; the browser is no longer used for answers"}
 
     def backend(self, acct: Dict[str, Any]) -> Any:
+        mode = str(acct.get("serving_mode") or "auto")
+        if acct.get("type") == "api":
+            return self._classic_backend(acct)
+        if mode == "browser":
+            recipe = self.recipe(acct["host"])
+            if not recipe:
+                raise BridgeError("browser mode needs a learned recipe", "setup", 503)
+            ui = recipe.get("ui") or {}
+            if recipe.get("tier") == "ui" or recipe.get("unresolved"):
+                if not (ui.get("answer") or ui.get("diff")):
+                    raise BridgeError("browser UI recipe is incomplete; re-learn this account", "setup", 503)
+                return UIBackend(recipe, self.browser(acct["id"]))
+            return PageBackend(recipe, self.session(acct["id"]), self.browser(acct["id"]))
+        if mode == "direct" and not self.cfg["native_serving"] and lc_state(acct) == "stable_direct":
+            raise BridgeError("direct-only mode is unavailable because native direct serving is disabled", "setup", 503)
+        if mode == "direct" and lc_state(acct) == "stable_direct":
+            parts, why = self.o8_parts(acct)
+            if not parts:
+                raise BridgeError("direct-only mode lost its validated native path: " + why, "setup", 503)
+            aid = acct["id"]
+            return NativeBackend(parts["direct"], lambda: self._classic_backend(acct),
+                                 lambda ok, err: self.native_note(aid, ok, err), allow_fallback=False)
+        recipe = self.recipe(acct.get("host", "")) or {}
+        if mode == "direct":
+            if recipe.get("tier") != "direct" or recipe.get("unresolved"):
+                raise BridgeError("direct-only mode is unavailable: no verified direct recipe; choose automatic mode or re-learn", "setup", 503)
+            return DirectBackend(recipe, self.session(acct["id"]))
         be = self._classic_backend(acct)
-        if acct.get("type") == "api" or not self.cfg["native_serving"] or lc_state(acct) != "stable_direct":
+        if not self.cfg["native_serving"] or lc_state(acct) != "stable_direct":
             return be
         try:
             parts, _why = self.o8_parts(acct)
@@ -18029,6 +18111,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def _bytes(self, code: int, data: bytes, ctype: str, extra: Optional[Dict[str, str]] = None) -> None:
+        self.send_response(code)
+        self.send_header("content-type", ctype)
+        self.send_header("content-length", str(len(data)))
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
     def _host_ok(self) -> bool:
         h = (self.headers.get("host") or "").split(":")[0].strip("[]").lower()
         return h in ("127.0.0.1", "localhost", "::1", "")
@@ -18378,6 +18469,25 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 3 and parts[2] == "report" and method == "GET":
                 p_ = app.store.path("analysis", hd_, "report.md")
                 return self._json(200, {"markdown": p_.read_text("utf-8") if p_.exists() else ""})
+            if len(parts) == 3 and parts[2] == "requests" and method == "GET":
+                q_ = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                try:
+                    offset_ = max(0, int((q_.get("offset") or ["0"])[0]))
+                    limit_ = max(1, min(100, int((q_.get("limit") or ["100"])[0])))
+                except ValueError:
+                    return self._json(400, {"error": "offset and limit must be integers"})
+                return self._json(200, request_trace_view(CaptureStore(app.store, host_).load_all(), offset_, limit_))
+            if len(parts) == 3 and parts[2] == "evidence.zip" and method == "GET":
+                secrets_ = []
+                for a_ in acc.items:
+                    if a_.get("type") != "api" and a_.get("host") == host_:
+                        secrets_.extend(secret_values_of(acc.session(a_["id"])))
+                try:
+                    archive_ = build_evidence_archive(app.store, host_, secrets_)
+                except BridgeError as e_:
+                    return self._json(e_.status, {"error": str(e_)})
+                filename_ = safe_host_dir(host_).replace("_", "-") + "-learning-evidence.zip"
+                return self._bytes(200, archive_, "application/zip", {"Content-Disposition": f'attachment; filename="{filename_}"'})
             if len(parts) == 3 and parts[2] == "run" and method == "POST":
                 return self._json(200, acc.analyze_site(host_))
         if parts == ["accounts"] and method == "POST":
@@ -18392,6 +18502,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"account": a, "job": job.id})
         if len(parts) >= 2 and parts[0] == "accounts":
             aid = parts[1]
+            if parts[2:] == ["serving-mode"] and method == "POST":
+                body_ = self._body()
+                try:
+                    return self._json(200, acc.set_serving_mode(aid, str(body_.get("mode") or "")))
+                except BridgeError as e_:
+                    return self._json(e_.status, {"error": str(e_)})
             if method == "DELETE" and len(parts) == 2:
                 acc.remove(aid)
                 return self._json(200, {"ok": True})
@@ -18752,7 +18868,7 @@ ol.steps li.bad i{background:var(--bad);border-color:var(--bad);color:#fff}ol.st
 
 <div class="view" id="v_adv">
 <div class="card" id="analysiscard"><h2>Site analysis</h2>
-<div class="row"><input id="rep_host" class="ltr" placeholder="chat.example.com"><button id="rep_show" class="sm" data-i="rep_show"></button></div><pre id="rep_out" class="mut" style="display:none"></pre></div>
+<div class="row"><input id="rep_host" class="ltr" placeholder="chat.example.com"><button id="rep_show" class="sm" data-i="rep_show"></button><button id="req_show" class="sm" data-i="req_show"></button><button id="evidence_download" class="sm" data-i="evidence_download"></button></div><div id="req_nav" class="row" hidden><button id="req_prev" class="sm" data-i="req_prev"></button><span id="req_page" class="mut"></span><button id="req_next" class="sm" data-i="req_next"></button></div><div id="req_out" class="mut" style="display:none"></div><pre id="rep_out" class="mut" style="display:none"></pre></div>
 <div class="card" id="dircard"><h2>Site directory</h2><div id="dir_meta" class="mut"></div>
 <div class="row"><input id="dir_q" placeholder="search" oninput="renderDir()"><select id="dir_cat" onchange="renderDir()"><option value="">all categories</option></select></div>
 <table><thead><tr><th>Site</th><th>Category</th><th>Status</th><th>How to add</th><th></th></tr></thead><tbody id="dir_rows"></tbody></table>
@@ -18787,7 +18903,7 @@ api_title:'…or add an official API account instead',api_btn:'Add API account',
 connect_title:'Connect your tools',key_used:'key used in the snippet',key_create:'Create key',klabel_ph:'label e.g. cursor',key_pin:'Pin a key to an account to force that provider for the tool using it.',
 th_site:'Site',th_tier:'Mode',th_mem:'Chat memory',import:'Import recipe',
 s_cont:"Reuse the site's own chat memory (send only new messages)",s_sum:'Summarize old history with the model instead of cutting it',s_tool:'Tool description limit (chars)',s_sys:'System prompt limit (chars)',s_res:'Tool result limit (chars)',s_his:'History limit (chars)',s_hc:'Health check every (min, 0 = off)',s_cache:'Cache identical requests (s, 0 = off)',s_idle:'Close idle browser after (s)',
-rep_show:'Show analysis report',
+rep_show:'Show analysis report',req_show:'Show captured requests',evidence_download:'Download source + requests',req_prev:'Previous',req_next:'Next',
 disc_hint:'Spends exactly 3 real requests on the chosen account to find the response field in which the site reports turning long text into an attachment. Nothing is sent until you confirm.',disc_btn:'Discover signal (3 real requests)',hide_tech:'Hide technical lines (DEBUG / tracebacks)',log_cp:'Copy diagnostic report',log_dl:'Download full log file',log_hint:'The report holds the version, account states, Chrome-extension state and the latest log lines (no keys, no message text). Paste it into the chat instead of describing the page.',log_copied:'Copied. Paste it into the chat.',log_failed:'Could not copy automatically; the report was downloaded instead.',
 s_ready:'Ready',s_learning:'Working',s_needs_you:'Needs you',s_needs_login:'Login needed',s_failed:'Failed',s_cooling:'Cooling down',
 m_direct:'direct (fast)',m_page:'via browser page',m_ui:'via browser typing (slow)',
@@ -18800,7 +18916,7 @@ a_check_t:'The site is checking your browser',a_check_b:'Complete the check in t
 a_check_h:'Stuck on "Just a moment…" for more than 1-2 minutes? Then the site is rejecting this automated window. Press F5 once in that window. If it still loops, close it and use an official API account (top of this page) for this site.',
 f_title:'It did not finish',h_check:'The site kept showing its human check and never let this automated window through. Retry once with Re-login (press F5 if it spins). If it loops again, this site cannot be learned this way: use its official API account instead.',
 h_closed:'The browser window was closed before the process finished. Press Re-login and leave the window open until the card says Ready.',h_generic:'Open the Log tab for details, then press Re-learn.',
-b_relogin:'Re-login',b_relearn:'Re-learn',b_recheck:'Try without browser',b_default:'Make default',b_remove:'Remove',def:'default',details:'Technical details',last_lines:'Last steps',
+b_relogin:'Re-login',b_relearn:'Re-learn',b_recheck:'Try without browser',b_default:'Make default',b_remove:'Remove',def:'default',details:'Technical details',last_lines:'Last steps',transport:'Serving path',mode_auto:'Automatic · direct + browser fallback',mode_browser:'Browser only',mode_direct:'Direct only',mode_unavailable:'Direct mode unlocks after verification',
 req:'requests',fails:'fails',healthy:'healthy',unhealthy:'unhealthy',
 c_copy:'Copy',c_revoke:'Revoke',docs:'Docs',tool:'Tool',export:'Export',forget:'Forget',yes:'yes',no:'no',any_acc:'any account',running:'running on port ',errors:'errors',
 cf_rm:'Remove this account and its browser profile?',cf_forget:'Forget the learned recipe for this site? It will be re-learned on next login.'
@@ -18813,7 +18929,7 @@ api_title:'…یا به‌جای آن یک حساب API رسمی اضافه کن
 connect_title:'اتصال ابزارهای شما',key_used:'کلیدی که در دستور استفاده می‌شود',key_create:'ساخت کلید',klabel_ph:'برچسب، مثلا cursor',key_pin:'کلید را به یک حساب وصل کنید تا ابزار فقط از همان سرویس استفاده کند.',
 th_site:'سایت',th_tier:'حالت',th_mem:'حافظه‌ی چت',import:'وارد کردن recipe',
 s_cont:'استفاده از حافظه‌ی خود سایت (فقط پیام‌های جدید ارسال شود)',s_sum:'خلاصه‌کردن تاریخچه‌ی قدیمی با مدل به‌جای بریدن',s_tool:'حد توضیح ابزار (حرف)',s_sys:'حد پرامپت سیستم (حرف)',s_res:'حد نتیجه‌ی ابزار (حرف)',s_his:'حد تاریخچه (حرف)',s_hc:'بررسی سلامت هر (دقیقه، 0 = خاموش)',s_cache:'کش درخواست‌های یکسان (ثانیه، 0 = خاموش)',s_idle:'بستن مرورگر بی‌کار بعد از (ثانیه)',
-rep_show:'نمایش گزارش تحلیل',
+rep_show:'نمایش گزارش تحلیل',req_show:'نمایش درخواست‌های ثبت‌شده',evidence_download:'دانلود سورس و درخواست‌ها',req_prev:'قبلی',req_next:'بعدی',
 disc_hint:'دقیقا ۳ درخواست واقعی روی حساب انتخابی مصرف می‌کند. تا تایید نکنید چیزی ارسال نمی‌شود.',disc_btn:'کشف سیگنال (۳ درخواست واقعی)',hide_tech:'پنهان‌کردن خطوط فنی (DEBUG و traceback)',log_cp:'کپی گزارش تشخیصی',log_dl:'دانلود کامل فایل لاگ',log_hint:'گزارش شامل نسخه، وضعیت حساب‌ها، وضعیت افزونه‌ی کروم و آخرین خطوط لاگ است (بدون کلید و بدون متن پیام‌ها). به جای توضیح صفحه، همین را در چت بگذارید.',log_copied:'کپی شد. در چت بگذارید.',log_failed:'کپی خودکار نشد؛ گزارش دانلود شد.',
 s_ready:'آماده',s_learning:'در حال کار',s_needs_you:'نیاز به شما',s_needs_login:'نیاز به ورود',s_failed:'ناموفق',s_cooling:'در حال استراحت',
 m_direct:'مستقیم (سریع)',m_page:'از طریق صفحه‌ی مرورگر',m_ui:'تایپ در مرورگر (کند)',
@@ -18826,7 +18942,7 @@ a_check_t:'سایت در حال بررسی مرورگر شماست',a_check_b:'�
 a_check_h:'اگر بیش از ۱ تا ۲ دقیقه روی «Just a moment…» ماند، یعنی سایت این پنجره‌ی خودکار را قبول نمی‌کند. یک بار F5 بزنید. اگر باز هم چرخید، پنجره را ببندید و برای این سایت از حساب API رسمی (بالای همین صفحه) استفاده کنید.',
 f_title:'کار تمام نشد',h_check:'سایت مدام صفحه‌ی بررسی انسان را نشان داد و این پنجره‌ی خودکار را عبور نداد. یک بار با «ورود دوباره» تلاش کنید (اگر چرخید F5 بزنید). اگر باز هم تکرار شد، این سایت از این راه قابل یادگیری نیست؛ از حساب API رسمی‌اش استفاده کنید.',
 h_closed:'پنجره‌ی مرورگر قبل از پایان کار بسته شد. «ورود دوباره» را بزنید و تا وقتی کارت «آماده» نشده پنجره را باز بگذارید.',h_generic:'برای جزئیات تب «گزارش» را ببینید، بعد «یادگیری دوباره» را بزنید.',
-b_relogin:'ورود دوباره',b_relearn:'یادگیری دوباره',b_recheck:'امتحان بدون مرورگر',b_default:'پیش‌فرض شود',b_remove:'حذف',def:'پیش‌فرض',details:'جزئیات فنی',last_lines:'آخرین مراحل',
+b_relogin:'ورود دوباره',b_relearn:'یادگیری دوباره',b_recheck:'امتحان بدون مرورگر',b_default:'پیش‌فرض شود',b_remove:'حذف',def:'پیش‌فرض',details:'جزئیات فنی',last_lines:'آخرین مراحل',transport:'مسیر ارسال',mode_auto:'خودکار · مسیر مستقیم + پشتیبان مرورگر',mode_browser:'فقط مرورگر',mode_direct:'فقط مستقیم',mode_unavailable:'مسیر مستقیم پس از تأیید فعال می‌شود',
 req:'درخواست',fails:'خطا',healthy:'سالم',unhealthy:'ناسالم',
 c_copy:'کپی',c_revoke:'ابطال',docs:'مستندات',tool:'ابزار',export:'خروجی',forget:'فراموش کن',yes:'بله',no:'خیر',any_acc:'هر حسابی',running:'اجرا روی پورت ',errors:'خطا',
 cf_rm:'این حساب و پروفایل مرورگرش حذف شود؟',cf_forget:'recipe یادگرفته‌شده‌ی این سایت فراموش شود؟ در ورود بعدی دوباره یاد گرفته می‌شود.'}};
@@ -18853,6 +18969,7 @@ function accCard(a){const j=jobOf(a),run=j&&!j.done,fail=j&&j.done&&!j.ok&&a.sta
 let s;if(run)s=att?'needs_you':'learning';else if(a.human)s='needs_you';else if(fail)s='failed';else if(a.state==='ready')s=a.cooling?'cooling':'ready';else if(a.state==='login_required')s='needs_login';else if(a.state==='learning')s='learning';else s=a.state||'learning';
 const label=t('s_'+s)==='s_'+s?s:t('s_'+s);let h=`<div class="card acc s-${esc(s)}"><div class="top"><div class="grow"><b>${esc(a.label)}</b> <span class="mut ltr">${esc(a.host)}</span> ${S.default_account==a.id?`<span class="b">${esc(t('def'))}</span>`:''}</div>`+
 (a.tier?`<span class="b ${esc(a.tier)}" title="${esc(t('m_'+a.tier))}">${esc(t('m_'+a.tier))}</span>`:'')+`<span class="stt">● ${esc(label)}${a.cooling?' '+esc(a.cooling)+'s':''}</span></div>`;
+if(a.type!=='api'){const v=a.serving||{mode:'auto',browser:false,direct:false};h+=`<div class="row"><label class="mut">${esc(t('transport'))}</label><select aria-label="${esc(t('transport'))}" onchange="setServingMode(${escJ(a.id)},this.value)"><option value="auto" ${v.mode==='auto'?'selected':''}>${esc(t('mode_auto'))}</option><option value="browser" ${v.mode==='browser'?'selected':''} ${!v.browser&&v.mode!=='browser'?'disabled':''}>${esc(t('mode_browser'))}</option><option value="direct" ${v.mode==='direct'?'selected':''} ${!v.direct&&v.mode!=='direct'?'disabled':''}>${esc(t('mode_direct'))}</option></select>${!v.direct?`<span class="mut">${esc(t('mode_unavailable'))}</span>`:''}</div>`}
 if(run){h+=stepper(j);const p=j.progress||{};const info=(j.stage=='learn'&&p.total)?`${t('probe')} ${p.cur}/${p.total}`:(j.stage=='analyse'&&p.total?`${t('round')} ${p.cur}/${p.total}`:'');
 h+=`<div class="mut">${esc(t('d_'+j.stage))} ${info?'<b>'+esc(info)+'</b>':''} · ${esc(t('elapsed'))} ${mmss(Date.now()/1000-j.started)}</div>`;if(p.total)h+=`<div class="bar"><div style="width:${Math.round(100*p.cur/p.total)}%"></div></div>`}
 if(att){const kd=att.kind=='first_msg'?'a_first':(att.kind=='login'?'a_login':'a_check'),lg=kd!='a_check';h+=`<div class="att"><b>${esc(t(kd+'_t'))}</b> <span class="mut">(${mmss(Date.now()/1000-att.since)})</span><div>${esc(t(kd+'_b'))}</div>`+(lg?'':`<div class="mut" style="margin-top:4px">${esc(t('a_check_h'))}</div>`)+
@@ -18879,7 +18996,11 @@ $('tabs').innerHTML=Object.keys(names).map(x=>`<button class="sm ${x==tab?'p':''
 $('snip').textContent=snippets($('keysel').value||(S.keys[0]||{}).key||'',S.port)[tab];
 const s=S.settings;if(document.activeElement.tagName!='INPUT'){$('s_cont').checked=s.continuity;$('s_tool').value=s.tool_desc_limit;$('s_sys').value=s.system_limit;$('s_res').value=s.result_limit;$('s_his').value=s.history_limit;$('s_idle').value=s.headless_idle_seconds;$('s_sum').checked=s.summarize_history;$('s_hc').value=s.health_interval_min;$('s_cache').value=s.cache_seconds}
 $('home').textContent='Data folder: '+S.home}
+async function setServingMode(id,mode){try{await api('accounts/'+encodeURIComponent(id)+'/serving-mode','POST',{mode});await tick()}catch(e){alert(errMsg(e));await tick()}}
  $('rep_show').onclick=async()=>{let h=$('rep_host').value.trim();if(!h)return;try{if(/^https?:\/\//i.test(h))h=new URL(h).hostname;if(!/^[a-z0-9.:[\]-]+$/i.test(h)||h.includes('..'))throw new Error('Enter a site hostname or URL, such as claude.ai');$('rep_host').value=h;$('rep_out').style.display='block';const r=await api('analysis/'+encodeURIComponent(h)+'/report');$('rep_out').textContent=r.markdown||'no report yet for this site'}catch(e){$('rep_out').style.display='block';$('rep_out').textContent='✘ '+e.message}};
+let reqOffset=0,reqTotal=0;async function showRequests(offset=0){let h=$('rep_host').value.trim();if(!h)return;if(/^https?:\/\//i.test(h))h=new URL(h).hostname;$('rep_host').value=h;reqOffset=Math.max(0,offset);try{const r=await api('analysis/'+encodeURIComponent(h)+'/requests?offset='+reqOffset+'&limit=100');reqTotal=r.total||0;$('req_out').style.display='block';$('req_nav').hidden=false;$('req_page').textContent=(reqTotal?`${reqOffset+1}-${Math.min(reqOffset+r.rows.length,reqTotal)}`:'0')+' / '+reqTotal;$('req_prev').disabled=reqOffset===0;$('req_next').disabled=reqOffset+r.rows.length>=reqTotal;$('req_out').innerHTML=(r.rows||[]).map(x=>`<details class="card"><summary><b>#${esc(x.seq??'')} ${esc(x.method)} ${esc(x.status||'')}</b> <span class="ltr mut">${esc(x.url)}</span> <span class="mut">${esc(x.type)} · ${esc(x.duration_s??'')}s</span></summary><div class="ltr"><b>Request (${esc(x.request_format)}):</b><pre class="mini">${esc(x.request||'(no text preview)')}</pre><b>Response (${esc(x.response_format)}):</b><pre class="mini">${esc(x.response||'(no text preview)')}</pre>${x.failed?'<div class="err">'+esc(x.failed)+'</div>':''}</div></details>`).join('')||'<p class="mut">No captured requests for this site.</p>'}catch(e){$('req_out').style.display='block';$('req_out').textContent='✘ '+errMsg(e)}}
+$('req_show').onclick=()=>showRequests(0);$('req_prev').onclick=()=>showRequests(reqOffset-100);$('req_next').onclick=()=>showRequests(reqOffset+100);
+$('evidence_download').onclick=async()=>{let h=$('rep_host').value.trim();if(!h)return;if(/^https?:\/\//i.test(h))h=new URL(h).hostname;$('rep_host').value=h;try{const r=await fetch('/api/analysis/'+encodeURIComponent(h)+'/evidence.zip',{headers:{'x-admin-key':K}});if(!r.ok)throw new Error((await r.text()).slice(0,300));const u=URL.createObjectURL(await r.blob()),a=document.createElement('a');a.href=u;a.download=h.replace(/[^a-z0-9._-]/gi,'_')+'-learning-evidence.zip';a.click();setTimeout(()=>URL.revokeObjectURL(u),30000)}catch(e){$('rep_out').style.display='block';$('rep_out').textContent='✘ '+errMsg(e)}};
 const kindB=k=>k=='measured'?'ready':(k=='estimated'?'learning':'direct');
 let D=null,DE='';
 async function loadDir(){try{D=await api('directory');DE=''}catch(e){DE=errMsg(e)}renderDir()}
@@ -27344,6 +27465,85 @@ setTimeout(() => process.exit(0), 60000);
             for name in ("chatgpt", "openai", "gemini", "claude", "anthropic", "deepseek", "kimi", "qwen", "grok", "perplexity", "mistral", "copilot", "poe.com"):
                 self.assertNotIn(name, body)
 
+    class TestServingModesAndEvidence(unittest.TestCase):
+        """Owner-selected serving path and credential-safe learning evidence exports; mock data only."""
+
+        def setUp(self) -> None:
+            self.tmp, self.store, self.cfg, self.app = mk_env()
+
+        def tearDown(self) -> None:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+        def test_per_account_transport_choice_requires_a_verified_path_and_persists(self) -> None:
+            acc = self.app.acc
+            a = add_acct(self.app, "mode1", "Mode", "mode.test", tier="ui")
+            ui_recipe = {"host": "mode.test", "base": "https://mode.test", "entry": "https://mode.test/", "tier": "ui",
+                         "unresolved": ["ui only"], "ui": {"answer": "div.answer"}}
+            self.store.write("recipes/mode.test.json", ui_recipe)
+            acc.browser = lambda _aid: object()  # type: ignore[assignment]
+            with self.assertRaises(BridgeError):
+                acc.set_serving_mode("mode1", "direct")
+            self.assertEqual(acc.set_serving_mode("mode1", "browser")["mode"], "browser")
+            self.assertIsInstance(acc.backend(a), UIBackend)
+            direct_recipe = {"host": "mode.test", "base": "https://mode.test", "entry": "https://mode.test/", "tier": "direct",
+                             "unresolved": [], "chat": {"method": "POST", "url": "https://mode.test/api/chat", "body": {"prompt": "{{prompt}}"}},
+                             "stream": {"format": "text", "text_paths": ["$raw"]}}
+            self.store.write("recipes/mode.test.json", direct_recipe)
+            self.assertEqual(acc.set_serving_mode("mode1", "direct")["mode"], "direct")
+            self.assertIsInstance(acc.backend(a), DirectBackend)
+            self.assertEqual(json.loads(self.store.path("accounts.json").read_text("utf-8"))[0]["serving_mode"], "direct")
+
+        def test_direct_only_native_mode_never_falls_back_to_the_browser(self) -> None:
+            class Client:
+                def ask(self, *_args: Any, **_kw: Any) -> Dict[str, Any]:
+                    return {"ok": False, "text": "", "error": {"category": "network_error", "message": "offline", "may_have_been_accepted": False}}
+            fallback_called = []
+            be = NativeBackend(Client(), lambda: fallback_called.append(True), allow_fallback=False)  # type: ignore[arg-type]
+            with self.assertRaises(BridgeError):
+                list(be.ask(be.new_conv(), "hello"))
+            self.assertEqual(fallback_called, [])
+
+        def test_source_archive_and_request_trace_are_ordered_and_secret_guarded(self) -> None:
+            host = "evidence.test"
+            store_served(self.store, host, [{"url": "https://evidence.test/app.js", "text": "function submit(){return fetch('/chat')}"}])
+            CaptureStore(self.store, host).add_run("login+learn", [
+                {"kind": "http", "method": "GET", "url": "https://evidence.test/app.js", "status": 200, "rtype": "Script", "req_body": {"fmt": "none"}, "resp_body": {"fmt": "text", "text": "function submit(){}"}},
+                {"kind": "http", "method": "POST", "url": "https://evidence.test/chat", "status": 200, "rtype": "Fetch", "req_body": {"fmt": "json", "text": '{"prompt":"hello"}'}, "resp_body": {"fmt": "json", "text": '{"answer":"world"}'}}])
+            trace = request_trace_view(CaptureStore(self.store, host).load_all(), 1, 1)
+            self.assertEqual((trace["total"], trace["rows"][0]["seq"], trace["rows"][0]["method"]), (2, 1, "POST"))
+            archive = build_evidence_archive(self.store, host)
+            with zipfile.ZipFile(io.BytesIO(archive)) as zf:
+                self.assertIn("requests.json", zf.namelist())
+                self.assertTrue(any(n.startswith("source/") and n.endswith(".js") for n in zf.namelist()))
+                exported = json.loads(zf.read("requests.json").decode("utf-8"))
+                self.assertEqual(json.loads(exported["exchanges"][1]["req_body"]["text"])["prompt"], "hello")
+            canary = "a-secret-token-that-must-not-leak"
+            store_served(self.store, host, [{"url": "https://evidence.test/unsafe.js", "text": f"const token = '{canary}';"}])
+            with self.assertRaises(BridgeError):
+                build_evidence_archive(self.store, host, [canary])
+
+        def test_admin_routes_expose_paged_trace_download_and_transport_control(self) -> None:
+            host = "route-evidence.test"
+            a = add_acct(self.app, "route1", "Route", host, tier="ui")
+            self.store.write(f"recipes/{host}.json", {"host": host, "base": "https://route-evidence.test", "tier": "ui", "unresolved": ["ui only"], "ui": {"answer": "div.answer"}})
+            CaptureStore(self.store, host).add_run("login+learn", [{"kind": "http", "method": "GET", "url": "https://route-evidence.test/app.js", "status": 200,
+                                                                       "req_body": {"fmt": "none"}, "resp_body": {"fmt": "text", "text": "ok"}}])
+            store_served(self.store, host, [{"url": "https://route-evidence.test/app.js", "text": "const ok = true;"}])
+            srv = Server(self.app)
+            try:
+                headers = {"x-admin-key": self.cfg["admin_key"]}
+                self.assertEqual(call(srv.port, "GET", f"/api/analysis/{host}/requests")[0], 401)
+                code, _headers, body = call(srv.port, "GET", f"/api/analysis/{host}/requests?limit=1", headers=headers)
+                self.assertEqual((code, json.loads(body)["total"]), (200, 1))
+                code, headers_out, body = call(srv.port, "GET", f"/api/analysis/{host}/evidence.zip", headers=headers)
+                self.assertEqual((code, headers_out.get("content-type")), (200, "application/zip"))
+                self.assertEqual(call(srv.port, "POST", "/api/accounts/route1/serving-mode", {"mode": "direct"}, headers)[0], 409)
+                code, _h, body = call(srv.port, "POST", "/api/accounts/route1/serving-mode", {"mode": "browser"}, headers)
+                self.assertEqual((code, json.loads(body)["mode"]), (200, "browser"))
+                self.assertEqual(call(srv.port, "POST", "/api/accounts/route1/serving-mode", {"mode": "bogus"}, headers)[0], 400)
+            finally:
+                srv.close()
+
     class TestGroupO11(unittest.TestCase):
         """7.29 (O11) on mocks ONLY: the editable site directory (data file), honest status from the real accounts, custom entries, admin API, dashboard card."""
 
@@ -28200,7 +28400,7 @@ setTimeout(() => process.exit(0), 60000);
                 shutil.rmtree(tmp, ignore_errors=True)
 
     all_cases = (TestFixes725, TestResolver, TestHashing, TestStreamDecoder, TestRouterCore, TestHTTP, TestPersistence, TestSecurityHelpers, TestApiBackend, TestCatalog, TestRouting, TestResolutionCatalog,
-                 TestErrorsAndLimits, TestTaskStateAndFailover, TestContextEngine, TestSubmission, TestGroupO, TestGroupOSetup, TestGroupOCapture, TestGroupO5, TestGroupO17, TestGroupO18, TestGroupO19, TestGroupO8, TestGroupO9, TestGroupO9Supervisor, TestGroupO827, TestGroupO827b, TestGroupO21Link, TestGroupO14, TestGroupO13, TestGroupO15, TestGroupO25, TestGroupO26, TestGroupO27, TestGroupO28, TestAutomaticDependencySetup, TestReportInSync, TestFixes732, TestGroupO12Dash, TestGroupO11, TestLogFile, TestAccessAndDashboardLog, TestPersonalChrome, TestQuickSmoke)
+                 TestErrorsAndLimits, TestTaskStateAndFailover, TestContextEngine, TestSubmission, TestGroupO, TestGroupOSetup, TestGroupOCapture, TestGroupO5, TestGroupO17, TestGroupO18, TestGroupO19, TestGroupO8, TestGroupO9, TestGroupO9Supervisor, TestGroupO827, TestGroupO827b, TestGroupO21Link, TestGroupO14, TestGroupO13, TestGroupO15, TestGroupO25, TestGroupO26, TestGroupO27, TestGroupO28, TestServingModesAndEvidence, TestAutomaticDependencySetup, TestReportInSync, TestFixes732, TestGroupO12Dash, TestGroupO11, TestLogFile, TestAccessAndDashboardLog, TestPersonalChrome, TestQuickSmoke)
     only = os.environ.get("BRIDGE_SELFTEST_ONLY", "")             # lean workflow (section 0A): BRIDGE_SELFTEST_ONLY=TestSubmission,TestContextEngine runs just those classes
     for case in ((TestQuickSmoke,) if quick else tuple(c for c in all_cases if not only or c.__name__ in only.split(","))):
         suite.addTests(ld.loadTestsFromTestCase(case))
