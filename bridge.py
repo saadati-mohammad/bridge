@@ -166,7 +166,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.55"
+VERSION = "7.56"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -12907,9 +12907,7 @@ class Accounts:
         browser = bool(recipe) and (bool(recipe.get("unresolved")) and bool((recipe.get("ui") or {}).get("answer") or (recipe.get("ui") or {}).get("diff"))
                                     or not recipe.get("unresolved"))
         direct = lc_state(acct) == "stable_direct" or bool(recipe and recipe.get("tier") == "direct" and not recipe.get("unresolved"))
-        # Web login sessions stay on the browser-backed path by default. Direct transport is
-        # an explicit owner choice after verification; it must never silently replace web use.
-        return {"mode": str(acct.get("serving_mode") or "browser"), "browser": browser, "direct": direct, "automatic": True}
+        return {"mode": str(acct.get("serving_mode") or "auto"), "browser": browser, "direct": direct, "automatic": True}
 
     def set_serving_mode(self, aid: str, mode: str) -> Dict[str, Any]:
         """Persist the owner's transport preference; explicit direct is accepted only for a verified no-browser path."""
@@ -13144,7 +13142,7 @@ class Accounts:
         same = [x.get("label") for x in self.items if x.get("type") != "api" and (x.get("identity_host") or x.get("host")) == site["identity_host"]]
         acct = {"id": uuid.uuid4().hex[:8], "label": label or host, "host": host, "url": site["open_url"], "input": site["input"],
                 "identity_host": site["identity_host"], "state": "learning",
-                "tier": "", "created": now(), "requests": 0, "last_error": "", "cooldown_until": 0,
+                "tier": "", "serving_mode": "browser", "created": now(), "requests": 0, "last_error": "", "cooldown_until": 0,
                 "ok": 0, "fail": 0, "streak_fail": 0, "ema_ms": 0, "health": None}
         if same:
             acct["note"] = "you already have an account for this site (" + ", ".join(str(x) for x in same[:3]) + "); this one is separate"
@@ -14148,7 +14146,7 @@ class Accounts:
         return {"ok": True, "tier": "direct", "changed": True, "reason": "direct works; the browser is no longer used for answers"}
 
     def backend(self, acct: Dict[str, Any]) -> Any:
-        mode = str(acct.get("serving_mode") or "browser")
+        mode = str(acct.get("serving_mode") or "auto")
         if acct.get("type") == "api":
             return self._classic_backend(acct)
         if mode == "browser":
@@ -27626,6 +27624,7 @@ setTimeout(() => process.exit(0), 60000);
                     account, started = app.acc.add("https://new.example.com", "New site", learn=False)
                 self.assertIs(started, job)
                 self.assertNotIn("learn_budget", account)
+                self.assertEqual(account["serving_mode"], "browser")
                 self.assertEqual(start.call_args.args[1], "login-only")
                 account["state"] = "needs_learning"
                 self.assertEqual(lc_derive(account, False)[0], "degraded_fallback")
@@ -27662,7 +27661,8 @@ setTimeout(() => process.exit(0), 60000);
                          "unresolved": ["ui only"], "ui": {"answer": "div.answer"}}
             self.store.write("recipes/mode.test.json", ui_recipe)
             acc.browser = lambda _aid: object()  # type: ignore[assignment]
-            self.assertEqual(acc.serving_mode_view(a)["mode"], "browser")
+            self.assertEqual(acc.serving_mode_view(a)["mode"], "auto")  # legacy accounts keep their saved/default behavior
+            a["serving_mode"] = "browser"
             self.assertIsInstance(acc.backend(a), UIBackend)
             with self.assertRaises(BridgeError):
                 acc.set_serving_mode("mode1", "direct")
