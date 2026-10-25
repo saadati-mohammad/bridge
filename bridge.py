@@ -167,7 +167,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.66"
+VERSION = "7.67"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -4462,7 +4462,7 @@ def ui_type_and_send(page: Any, text: str, say: Optional[Callable[[str], None]] 
     host = _ui_host(page)
     ui_gate_check(host)
     try:
-        ui_wait_ready(page, say=say)
+        ui_wait_ready(page, say=say, poll_ms=150)
     except BridgeError as e:
         if e.kind == "challenge":
             wait = ui_gate_failed(host)
@@ -4496,7 +4496,7 @@ def ui_type_and_send(page: Any, text: str, say: Optional[Callable[[str], None]] 
     if state.get("blocked_by"):
         raise BridgeError(f"the chat composer became unavailable before sending ({state['blocked_by']}); nothing was sent", "ui", 503)
     page.keyboard.press("Enter")
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(200)
     try:
         post = ui_page_state(page)
     except Exception as e:
@@ -4881,7 +4881,7 @@ class UIBackend:
             else:
                 n0 = pg.locator(self.sel).count()
             ui_type_and_send(pg, prompt)
-            pg.wait_for_timeout(1200)
+            pg.wait_for_timeout(100)
             return n0
 
         def read(ctx: Any) -> Tuple[int, str, str, bool]:
@@ -4890,26 +4890,39 @@ class UIBackend:
             n = loc.count()
             return n, (loc.last.inner_text() if n else ""), pg.url, ui_generating(pg)
 
+        send_started = time.monotonic()
         n0 = self.ab.run(start, True, 120)
-        last, stable, sent, t0 = "", 0, "", time.time()
+        last, stable, sent, t0 = "", 0, "", time.monotonic()
+        first_text_at: Optional[float] = None
+        last_text_at = t0
         seen_generating = False                       # once the page has shown its 'stop' control, the control going away is the real end-of-answer signal
-        while time.time() - t0 < 600:
+        while time.monotonic() - t0 < 600:
             if cancel is not None and cancel.is_set():
                 return
-            time.sleep(0.4)
+            time.sleep(0.2)
             n, txt, url, generating = self.ab.run(page_text if self.diff else read, True, 120)
             seen_generating = seen_generating or generating
             if n > n0 and txt:
+                stamp = time.monotonic()
+                if first_text_at is None:
+                    first_text_at = stamp
                 if txt.startswith(sent):
                     d = txt[len(sent):]
                     if d:
                         yield d
                         sent = txt
+                if txt != last:
+                    last_text_at = stamp
                 stable = stable + 1 if (txt == last and not generating) else 0
                 last = txt
-                # A site that pauses mid-answer (thinking, a tool-call block, a slow chunk) must not be taken for finished: with a visible 'stop' control the answer ends when it is gone
-                # (2 s of calm); without any such control the text must stay unchanged for 8 s.
-                if stable >= (5 if seen_generating else 20):
+                # Poll quickly so text reaches streaming clients promptly. The stop control
+                # protects thinking pauses; without one, retain a conservative 1.6 s quiet window.
+                if stable >= (5 if seen_generating else 8):
+                    finished = time.monotonic()
+                    log(f"UI timing host={urllib.parse.urlsplit(url).hostname or 'unknown'} send_ms={int((t0-send_started)*1000)} "
+                        f"first_text_ms={int((first_text_at-send_started)*1000) if first_text_at else -1} "
+                        f"settle_ms={int((finished-last_text_at)*1000)} total_ms={int((finished-send_started)*1000)} "
+                        f"stop_seen={str(seen_generating).lower()}", "info")
                     conv["url"], conv["turn"] = url, conv["turn"] + 1
                     return
         raise BridgeError("UI tier timed out waiting for the answer", "ui", 504)
@@ -18295,9 +18308,13 @@ class Router:
             return out
         recipe = self.acc.recipe(acct["host"]) or {}
         fenced = getattr(backend, "fenced_tools", False)
-        rc = recipe.get("continuity", not bool(getattr(backend, "unlearned_ui", False)))
+        unlearned_ui = bool(getattr(backend, "unlearned_ui", False))
+        # A login-only UI account already keeps the same remote chat tab. Reuse that
+        # observed continuity so later Claude Code turns can send only their delta.
+        rc = recipe.get("continuity", "observed" if unlearned_ui else True)
         site_level = "verified" if rc is True else ("none" if rc in (False, "none", "no", "false", 0) else "observed")   # what the site proved at learn time
         use_cont = bool(self.cfg["continuity"] and site_level != "none")
+        prompt_cfg = _CfgOver(self.cfg, {"fixed_soft_chars": 1}) if unlearned_ui else self.cfg  # complete schemas, compact descriptions on slow UI paths
         sigs = [msg_sig(m) for m in req.messages]
         tsig = sha(jdump({n: (t["description"], t["input_schema"]) for n, t in req.tools.items()}))
         ssig = sha(req.system)
@@ -18338,12 +18355,12 @@ class Router:
                 conv = entry.conv
 
                 def mk(b: int, _t: Dict[str, Any] = trace, _n: int = n) -> str:
-                    c = _CfgOver(self.cfg, {"result_limit": max(1000, b // 4)}) if b else self.cfg
-                    return build_prompt(req, c, fenced, delta_from=_n, vault=self.vault, trace=_t)
+                    return build_prompt(req, _CfgOver(prompt_cfg, {"result_limit": max(1000, b // 4)}) if b else prompt_cfg,
+                                        fenced, delta_from=_n, vault=self.vault, trace=_t)
                 continued = True
                 prompt = mk(0)
                 try:                                                    # E7: a MEASUREMENT (characters), method stated in context_report()
-                    saved = len(build_prompt(req, self.cfg, fenced, handoff=req.handoff)) - len(prompt)
+                    saved = len(build_prompt(req, prompt_cfg, fenced, handoff=req.handoff)) - len(prompt)
                     if saved > 0:
                         self.bump("bytes_saved_continuity", saved)
                 except BridgeError:
@@ -18357,7 +18374,7 @@ class Router:
                 _cn = canary
 
                 def mk(b: int, _t: Dict[str, Any] = trace, _c: str = _cn) -> str:
-                    out_ = build_prompt(req, self.cfg, fenced, summary=self._summary(backend, req), handoff=req.handoff, vault=self.vault, trace=_t, budget=max(0, b - 140) if b else 0)
+                    out_ = build_prompt(req, prompt_cfg, fenced, summary=self._summary(backend, req), handoff=req.handoff, vault=self.vault, trace=_t, budget=max(0, b - 140) if b else 0)
                     return out_ + (f"\n\n[bridge session marker: {_c} - if you are later asked for the session marker, reply with exactly this]" if _c else "")
                 prompt = mk(wlimit or wlearn)                           # E3: the route's declared window (else the one learned from the site's own refusals) is the budget (0 = history_limit + fixed parts)
                 if wlimit and len(prompt) > wlimit:
@@ -22953,6 +22970,38 @@ def run_selftest(quick: bool = False) -> int:
             return build_prompt(self.req(messages, **kw), self.cfg, False, vault=self.rt.vault, trace=tr), tr
 
         U1 = {"role": "user", "content": "fix the failing test"}
+
+        def test_ui_fast_prompt_compacts_tool_prose_but_keeps_tool_schema(self) -> None:
+            req = self.req([self.U1])
+            trace: Dict[str, Any] = {}
+            prompt = build_prompt(req, _CfgOver(self.cfg, {"fixed_soft_chars": 1}), False, trace=trace)
+            self.assertTrue(any(r.get("kind") == "tool_descriptions_compacted" for r in trace["reductions"]))
+            self.assertIn('"command"', prompt)
+            self.assertIn('"required":["command"]', prompt)
+
+        def test_login_only_ui_reuses_remote_chat_and_sends_only_new_turn(self) -> None:
+            from unittest import mock
+            class Backend:
+                tier, fenced_tools, unlearned_ui = "ui", True, True
+                def __init__(self): self.convs, self.prompts = [], []
+                def new_conv(self, _model=None):
+                    conv = {"url": None, "turn": 0}; self.convs.append(conv); return conv
+                def ask(self, conv, prompt, _cancel=None, model=None):
+                    self.prompts.append((conv, prompt))
+                    yield "first answer" if len(self.prompts) == 1 else "second answer"
+            backend = Backend()
+            first = self.req([{"role": "user", "content": "first question"}], tools=False)
+            second = self.req([{"role": "user", "content": "first question"},
+                               {"role": "assistant", "content": "first answer"},
+                               {"role": "user", "content": "second question"}], tools=False)
+            with mock.patch.object(self.acc, "backend", return_value=backend):
+                self.assertEqual(self.rt._run(self.a1, first, lambda _t: None, threading.Event()).text, "first answer")
+                self.assertEqual(self.rt._run(self.a1, second, lambda _t: None, threading.Event()).text, "second answer")
+            self.assertEqual(len(backend.convs), 1)
+            self.assertIs(backend.prompts[0][0], backend.prompts[1][0])
+            self.assertIn("second question", backend.prompts[1][1])
+            self.assertNotIn("first question", backend.prompts[1][1])
+            self.assertNotIn("<system>", backend.prompts[1][1])
 
         # -- E3 + E4: the relevant line of a huge log survives, the full text is kept, a typed error replaces silent cutting ---------
         def test_error_line_from_the_middle_of_a_200k_log_reaches_the_model_and_nothing_is_lost(self) -> None:
