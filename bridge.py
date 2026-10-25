@@ -27007,7 +27007,7 @@ const chrome = {
   alarms: {create() {}, onAlarm: ev()}, action: {setBadgeText() {}, setBadgeBackgroundColor() {}, setTitle() {}},
 };
 const f2 = (u, o = {}) => fetch(u, Object.assign({}, o, {headers: Object.assign({}, o.headers, {Origin: ORIGIN})}));
-const sandbox = vm.createContext({chrome, fetch: f2, setTimeout, clearTimeout, AbortController, console});
+const sandbox = vm.createContext({chrome, fetch: f2, setTimeout, clearTimeout, AbortController, crypto: require('crypto').webcrypto, console});
 vm.runInContext(fs.readFileSync(bgPath, 'utf8'), sandbox, {filename: 'background.js'});
 setTimeout(() => handlers.msg({type: 'pair', port: +port, code}, {id: 'stubid'}, r => { console.log('pair', JSON.stringify(r)); }), 50);
 setTimeout(() => process.exit(0), 60000);
