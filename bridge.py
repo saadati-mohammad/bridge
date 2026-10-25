@@ -166,7 +166,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.59"
+VERSION = "7.60"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -19236,9 +19236,9 @@ code,pre{font-family:ui-monospace,Consolas,monospace;font-size:12px}pre{directio
 table{width:100%;border-collapse:collapse}td,th{text-align:start;padding:7px 6px;border-bottom:1px solid var(--line);vertical-align:middle}th{color:var(--mut);font-weight:500;font-size:12px}
 .b{display:inline-block;padding:0 9px;border-radius:99px;font-size:12px;border:1px solid var(--line);color:var(--mut)}
 .b.ready,.b.direct{color:var(--ok);border-color:var(--ok)}.b.learning,.b.page{color:var(--warn);border-color:var(--warn)}.b.ui{color:var(--acc);border-color:var(--acc)}
-.acc{border-inline-start:4px solid var(--line)}.acc.s-ready{border-inline-start-color:var(--ok)}.acc.s-learning,.acc.s-needs_you{border-inline-start-color:var(--warn)}.acc.s-failed,.acc.s-needs_login{border-inline-start-color:var(--bad)}
+.acc{border-inline-start:4px solid var(--line)}.acc.s-ready,.acc.s-needs_learning{border-inline-start-color:var(--ok)}.acc.s-learning,.acc.s-needs_you{border-inline-start-color:var(--warn)}.acc.s-failed,.acc.s-needs_login{border-inline-start-color:var(--bad)}
 .top{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.top .grow{flex:1;min-width:140px}.stt{font-weight:600}
-.s-ready .stt{color:var(--ok)}.s-learning .stt,.s-needs_you .stt{color:var(--warn)}.s-failed .stt,.s-needs_login .stt{color:var(--bad)}
+.s-ready .stt,.s-needs_learning .stt{color:var(--ok)}.s-learning .stt,.s-needs_you .stt{color:var(--warn)}.s-failed .stt,.s-needs_login .stt{color:var(--bad)}
 ol.steps{display:flex;list-style:none;padding:0;margin:14px 0 8px}ol.steps li{flex:1;text-align:center;position:relative;font-size:12px;color:var(--mut)}
 ol.steps i{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1px solid var(--line);font-style:normal;background:var(--bg);position:relative;z-index:1}
 ol.steps li:not(:last-child)::after{content:"";position:absolute;top:12px;inset-inline-start:calc(50% + 14px);inset-inline-end:calc(-50% + 14px);height:2px;background:var(--line)}
@@ -19452,7 +19452,7 @@ async function setServingMode(id,mode){try{await api('accounts/'+encodeURICompon
 async function setModelChoice(id,variant){try{if(variant)await api('accounts/'+encodeURIComponent(id)+'/model-choice','POST',{mode:'fixed',variant});else await api('accounts/'+encodeURIComponent(id)+'/model-choice','DELETE');await tick()}catch(e){alert(errMsg(e));await tick()}}
 async function setAccountProfile(id,clientId){try{await api('accounts/'+encodeURIComponent(id)+'/chrome-profile','POST',{client_id:clientId});$('strategy_status').textContent=t('profile_changed');await tick()}catch(e){alert(errMsg(e));await tick()}}
 function renderStrategy(){if(!S)return;const accts=S.accounts.filter(a=>!a.disabled),policies=(RC&&RC.config&&RC.config.policies)||{};const current=policies['user-claude-pool'];if(routePoolDraft===null)routePoolDraft=(current&&current.members||[]).map(x=>String(x).replace(/^acct:/,'').split('/')[0]);if(!routeKindDraft)routeKindDraft=current&&current.kind||'auto';const kind=$('strategy_kind');if(kind&&kind.value!==routeKindDraft)kind.value=routeKindDraft;
-$('strategy_accounts').innerHTML=accts.map(a=>`<label class="pool-item"><input type="checkbox" value="${esc(a.id)}" ${routePoolDraft.includes(a.id)?'checked':''} onchange="toggleRouteAccount(this)"><span><b>${esc(a.label)}</b><br><span class="mut ltr">${esc(a.host)}</span></span><span class="b ${a.state==='ready'?'ready':'learning'}">${esc(a.state||'')}</span></label>`).join('')||`<p class="mut">${esc(t('no_acc'))}</p>`;
+$('strategy_accounts').innerHTML=accts.map(a=>`<label class="pool-item"><input type="checkbox" value="${esc(a.id)}" ${routePoolDraft.includes(a.id)?'checked':''} onchange="toggleRouteAccount(this)"><span><b>${esc(a.label)}</b><br><span class="mut ltr">${esc(a.host)}</span></span><span class="b ${a.state==='ready'||a.state==='needs_learning'?'ready':'learning'}">${esc(a.state||'')}</span></label>`).join('')||`<p class="mut">${esc(t('no_acc'))}</p>`;
 const sel=$('strategy_kind');if(sel)routeKindDraft=sel.value;}
 function toggleRouteAccount(el){const id=el.value;routePoolDraft=routePoolDraft||[];routePoolDraft=el.checked?[...new Set([...routePoolDraft,id])]:routePoolDraft.filter(x=>x!==id)}
 async function saveStrategy(){const members=[...(routePoolDraft||[])].filter(id=>S.accounts.some(a=>a.id===id&&!a.disabled)).map(id=>'acct:'+id);if(!members.length){$('strategy_status').textContent=t('strategy_empty');return}const kind=$('strategy_kind').value;if(kind==='fixed'&&members.length!==1){$('strategy_status').textContent=t('strategy_choose_one');return}if((kind==='failover'||kind==='rotation')&&members.length<2){$('strategy_status').textContent=t('strategy_needs_two');return}const config={...(RC&&RC.config||{}),policies:{...((RC&&RC.config&&RC.config.policies)||{})}};let policy={kind,profile:'balanced',members};if(kind==='rotation'){policy={kind,profile:'balanced',members,strategy:'round_robin',unit:'conversation'}}else if(kind==='failover'){policy={kind,profile:'balanced',primary:members[0],backups:members.slice(1)}}config.policies['user-claude-pool']=policy;try{await api('routing','POST',config);RC={...(RC||{}),config};routePoolDraft=members.map(x=>x.replace(/^acct:/,''));routeKindDraft=kind;$('strategy_status').textContent=t('strategy_saved');renderStrategy();updateWorkspaceCommand()}catch(e){$('strategy_status').textContent=errMsg(e)}}
@@ -28042,6 +28042,9 @@ setTimeout(() => process.exit(0), 60000);
             self.assertIn("ANTHROPIC_MODEL", DASHBOARD_HTML)
             self.assertIn("pc_profiles_list", DASHBOARD_HTML)
             self.assertIn("typeof m==='object'", DASHBOARD_HTML)
+            self.assertIn(".acc.s-ready,.acc.s-needs_learning", DASHBOARD_HTML)
+            self.assertIn(".s-ready .stt,.s-needs_learning .stt", DASHBOARD_HTML)
+            self.assertIn("a.state==='needs_learning'?'ready'", DASHBOARD_HTML)
 
     class TestServingModesAndEvidence(unittest.TestCase):
         """Owner-selected serving path and credential-safe learning evidence exports; mock data only."""
