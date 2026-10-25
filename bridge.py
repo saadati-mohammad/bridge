@@ -183,7 +183,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.75"
+VERSION = "7.76"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -2512,13 +2512,22 @@ class PCHub:
 
     # -- persistent pairing state (only a hash of the token is stored) -----------------------------------------------------------------------------
     def _load(self) -> Dict[str, Any]:
-        try:
-            data = json.loads((self.root / "pairing.json").read_text("utf-8"))
-            if data.get("token_sha256") and not data.get("clients"):
-                data["clients"] = {"legacy": {"token_sha256": data["token_sha256"], "name": "Chrome profile", "paired_at": data.get("paired_at", 0)}}
-            return data
-        except Exception:
-            return {}
+        p = self.root / "pairing.json"
+        for cand in (p, p.with_suffix(".bak")):                                       # 7.76: a pairing file that exists but cannot be read is no longer silently 'not paired'
+            if not cand.exists():
+                continue
+            try:
+                data = json.loads(cand.read_text("utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("not an object")
+                if data.get("token_sha256") and not data.get("clients"):
+                    data["clients"] = {"legacy": {"token_sha256": data["token_sha256"], "name": "Chrome profile", "paired_at": data.get("paired_at", 0)}}
+                if cand is not p:
+                    log(f"personal chrome: {p.name} could not be read; the previous pairing was restored from {cand.name}", "warn")
+                return data
+            except Exception as e:
+                log(f"personal chrome: {cand.name} could not be read ({type(e).__name__})" + ("; trying the backup copy" if cand is p else "; starting unpaired"), "warn")
+        return {}
 
     def _save(self) -> None:
         p = self.root / "pairing.json"
@@ -2526,6 +2535,14 @@ class PCHub:
         tmp.write_text(json.dumps(self.state), "utf-8")
         try:
             os.chmod(tmp, 0o600)
+        except Exception:
+            pass
+        try:                                                                          # 7.76: keep the last paired state; an intentional unpair removes it
+            bak = p.with_suffix(".bak")
+            if self.state.get("clients") and p.exists():
+                shutil.copyfile(p, bak)
+            elif not self.state.get("clients") and bak.exists():
+                bak.unlink()
         except Exception:
             pass
         os.replace(tmp, p)
@@ -2636,6 +2653,9 @@ class PCHub:
                     c.error = "this Chrome profile was disconnected"
                     c.ev.set()
             self.cv.notify_all()
+        # 7.76: this is the ONLY code path that makes a paired bridge answer 'not paired yet' without a restart, so it must never be silent
+        log(f"personal Chrome: profile {client_id[:12]} was unpaired by the extension (its Disconnect button or a reset); "
+            + ("no profile is paired any more - pair again" if not clients else f"{len(clients)} other profile(s) stay paired"), "warn")
         self._fire({"k": "profile_unpaired", "client_id": client_id})
         return True
 
@@ -4571,6 +4591,69 @@ def ui_wait_ready(page: Any, timeout: float = UI_READY_TIMEOUT, say: Optional[Ca
     raise BridgeError(f"the chat page was not usable after {int(timeout)}s ({_UI_WHY.get(last, last)}); nothing was sent", "ui")
 
 
+UI_USER_BUBBLE_SELECTORS = ("[data-message-author-role='user']", "[data-role='user']", "[data-testid='user-message']", ".user-message")
+UI_RESEND_MIN_CHARS = 20000          # 7.76: only a really large paste is ever re-checked; a normal message is sent by the first Enter
+UI_RESEND_PATIENCE_MS = 20000        # 7.76: how long the page gets to take the message before the bridge presses send ONCE more
+UI_RESEND_AFTER_MS = 6000            # 7.76: how long to watch after that single extra press (it is never repeated)
+
+
+def ui_user_bubbles(page: Any) -> int:
+    """7.76: how many user messages the page shows, or -1 when no known marker matches (then this signal says nothing). Never raises."""
+    best = -1
+    try:
+        for sel in UI_USER_BUBBLE_SELECTORS:
+            n = page.locator(sel).count()
+            if n > 0:
+                best = max(best, n)
+    except Exception:
+        return -1
+    return best
+
+
+def ui_ensure_sent(text_len: int, composer_len: Callable[[], int], generating: Callable[[], bool], users: Callable[[], int], users_before: int,
+                   press_send: Callable[[], None], wait: Callable[[int], Any], say: Optional[Callable[[str], None]] = None,
+                   min_chars: int = UI_RESEND_MIN_CHARS, patience_ms: int = UI_RESEND_PATIENCE_MS, poll_ms: int = 500, after_ms: int = UI_RESEND_AFTER_MS) -> str:
+    """7.76: decide whether the first Enter really sent the message, and press send AT MOST ONCE more when it provably did not.
+    The page took the message when ANY of these is true: the composer is (nearly) empty, the site shows a 'stop generating' control, a new user bubble appeared.
+    Only a message of at least `min_chars` is ever re-pressed, and only after `patience_ms` of silence; a page that cannot be read is treated as 'sent'
+    (a duplicate message is worse than a late one). Returns: skipped | sent:<why> | resent:<why> | resent:unconfirmed."""
+    if text_len < min_chars:
+        return "skipped"
+
+    def took() -> str:
+        try:
+            if generating():
+                return "generating"
+            if users() > users_before:
+                return "new_bubble"
+            if composer_len() < 20:
+                return "composer_empty"
+        except Exception:
+            return "unreadable"
+        return ""
+    waited = 0
+    while waited < patience_ms:
+        why = took()
+        if why:
+            return "sent:" + why
+        wait(poll_ms)
+        waited += poll_ms
+    why = took()                                                                # the last look, right before acting
+    if why:
+        return "sent:" + why
+    if say:
+        say(f"the message ({text_len} chars) is still in the box {waited // 1000}s after Enter and the page shows no sign of sending - pressing send once")
+    press_send()                                                                # the one and only extra press for this message
+    waited = 0
+    while waited < after_ms:
+        wait(poll_ms)
+        waited += poll_ms
+        why = took()
+        if why:
+            return "resent:" + why
+    return "resent:unconfirmed"
+
+
 def ui_type_and_send(page: Any, text: str, say: Optional[Callable[[str], None]] = None) -> None:
     """Type the prompt into the chat box and send it - only when the box is really usable. Never forces text into a locked input."""
     host = _ui_host(page)
@@ -4609,6 +4692,7 @@ def ui_type_and_send(page: Any, text: str, say: Optional[Callable[[str], None]] 
             raise BridgeError(f"a bot check appeared while the message was being typed; it was not sent; backing off {int(wait)}s", "challenge", 503, retry_after=wait)
     if state.get("blocked_by"):
         raise BridgeError(f"the chat composer became unavailable before sending ({state['blocked_by']}); nothing was sent", "ui", 503)
+    users_before = ui_user_bubbles(page)
     page.keyboard.press("Enter")
     page.wait_for_timeout(200)
 
@@ -4623,23 +4707,17 @@ def ui_type_and_send(page: Any, text: str, say: Optional[Callable[[str], None]] 
                 return len((b_.inner_text(timeout=1500) or "").strip())
         except Exception:
             return 0
-    if len(text) > 200:                                                         # 7.75: a very long message is often not sent by the first Enter: check, then press the send button
-        for attempt_ in range(3):
-            for _ in range(10):
-                if _composer_len() < 20:
-                    break
-                page.wait_for_timeout(300)
-            else:
-                if say:
-                    say("the message is still in the box after Enter - pressing send")
-                if not ui_click_send(page):
-                    b2_ = find_input(page)
-                    if b2_ is not None:
-                        b2_.click(timeout=3000)
-                        page.keyboard.press("Enter")
-                page.wait_for_timeout(300)
-                continue
-            break
+    def _press_send() -> None:
+        if not ui_click_send(page):
+            b2_ = find_input(page)
+            if b2_ is not None:
+                b2_.click(timeout=3000)
+                page.keyboard.press("Enter")
+    # 7.76: 7.75 re-pressed up to 3 times after only 3 s, even for a 204-character message (possible duplicate sends). Now: very large messages only, a long wait,
+    # never when the composer is empty / generation started / a new user bubble appeared, and at most one extra press per message.
+    verdict_ = ui_ensure_sent(len(text), _composer_len, lambda: ui_generating(page), lambda: ui_user_bubbles(page), users_before, _press_send, page.wait_for_timeout, say)
+    if say and verdict_.startswith("resent"):
+        say(f"send check: {verdict_}")
     try:
         post = ui_page_state(page)
     except Exception as e:
@@ -16001,6 +16079,32 @@ def outcome_sig(text: str, calls: List[Dict[str, Any]]) -> str:
                     [{"type": "tool_use", "name": c["name"], "input": c["input"]} for c in calls]})
 
 
+def msg_desc(m: Dict[str, Any]) -> str:
+    """7.76: a short description of one message for the continuity log: role, block kinds and sizes, e.g. 'assistant[text:57,tool_use:Bash:23]'.
+    It never contains message text (only whether a text block starts with a system-reminder tag)."""
+    try:
+        parts: List[str] = []
+        for b in m.get("content") or []:
+            t = str(b.get("type"))
+            if t == "text":
+                tx = str(b.get("text", ""))
+                parts.append(f"text:{len(tx)}" + (":system-reminder" if tx.lstrip().startswith("<system-reminder>") else ""))
+            elif t == "tool_use":
+                parts.append(f"tool_use:{b.get('name')}:{len(jdump(b.get('input') or {}))}")
+            elif t == "tool_result":
+                parts.append(f"tool_result:{len(_result_text(b))}")
+            else:
+                parts.append(t)
+        return f"{m.get('role')}[{','.join(parts)}]"
+    except Exception:
+        return "?"
+
+
+def outcome_desc(text: str, calls: List[Dict[str, Any]]) -> str:
+    return msg_desc({"role": "assistant", "content": ([{"type": "text", "text": text}] if text.strip() else []) +
+                     [{"type": "tool_use", "name": c["name"], "input": c["input"]} for c in calls]})
+
+
 def minify_schema(s: Any, depth: int = 0, full: bool = False) -> Any:
     if isinstance(s, dict):
         out = {}
@@ -19689,6 +19793,9 @@ class ConvEntry:
         self.conv, self.sigs, self.tools_sig, self.sys_sig, self.used = conv, sigs, tools_sig, sys_sig, now()
         self.trust, self.turns, self.created, self.last_check = trust, turns, created or now(), 0.0
         self.canary, self.probed = "", 0                         # E1 canary (opt-in): a marker given to the remote chat at its start; `probed` = the turn count at the last successful probe
+        self.descs: List[str] = []                               # 7.76: content-free description per remembered message (memory only; for the continuity log)
+        self.shape: Optional[List[str]] = None                   # 7.76: tool names of the last answer the bridge gave (memory only; None = unknown, no tolerance)
+        self.tolerated_at: Optional[int] = None                  # 7.76: set by Router._take when the client's echo of that answer differed
 
 
 class Router:
@@ -19768,20 +19875,75 @@ class Router:
                     e.trust = "broken"
         self._cont_save()
 
-    def _take(self, aid: str, sigs: List[str], tsig: str, ssig: str) -> Tuple[Optional[ConvEntry], int]:
+    @staticmethod
+    def _tool_names(m: Dict[str, Any]) -> List[str]:
+        return [str(b.get("name")) for b in (m.get("content") or []) if isinstance(b, dict) and b.get("type") == "tool_use"]
+
+    def _echo_tolerated(self, e: ConvEntry, have: List[str], want: List[str], msgs: Optional[List[Dict[str, Any]]], n: int) -> bool:
+        """7.76: the ONLY mismatch is the client's copy of the answer the bridge gave last (index n-1): same role, same tool names in the same order.
+        The remote chat already holds what the model really wrote, so only the new messages after it have to be sent; the differing copy can only be the client
+        normalising text / tool inputs. Anything else (an earlier message, another tool, a user message) is still a real break."""
+        if msgs is None or e.shape is None or n < 2 or n > len(msgs) or have[:n - 1] != want[:n - 1]:
+            return False
+        m = msgs[n - 1]
+        return m.get("role") == "assistant" and self._tool_names(m) == e.shape
+
+    def _take(self, aid: str, sigs: List[str], tsig: str, ssig: str, msgs: Optional[List[Dict[str, Any]]] = None) -> Tuple[Optional[ConvEntry], int]:
         k = self.SIGN
         want = [x[:k] for x in sigs]
         with self.lock:
-            best, blen = None, 0
+            best, blen, tol = None, 0, False
             if self._demoted(aid):                                  # E1: doubt -> rebuild the context locally
                 return None, 0
             for e in self.convs.get(aid, []):
                 n = len(e.sigs)
-                if e.trust in ("verified", "observed", "uncertain") and e.tools_sig == tsig and e.sys_sig == ssig and 0 < n < len(sigs) and [x[:k] for x in e.sigs] == want[:n] and n > blen:
-                    best, blen = e, n
+                if not (e.trust in ("verified", "observed", "uncertain") and e.tools_sig == tsig and e.sys_sig == ssig and 0 < n < len(sigs) and n > blen):
+                    continue
+                have = [x[:k] for x in e.sigs]
+                if have == want[:n]:
+                    best, blen, tol = e, n, False
+                elif self._echo_tolerated(e, have, want, msgs, n):
+                    best, blen, tol = e, n, True
             if best:
+                best.tolerated_at = (blen - 1) if tol else None
                 self.convs[aid].remove(best)
             return best, blen
+
+    def _why_no_entry(self, aid: str, sigs: List[str], tsig: str, ssig: str, msgs: List[Dict[str, Any]]) -> str:
+        """7.76 (step A): exactly which check made _take() return nothing. Only indexes, kinds and sizes - never message text."""
+        k = self.SIGN
+        with self.lock:
+            if self._demoted(aid):
+                st = self.cont_state.get(aid, {})
+                return f"demoted ({len(st.get('breaks', []))} rejected continuation(s) in the window; last reason: {str(st.get('reason', ''))[:80]}) - rebuilding locally"
+            lst = list(self.convs.get(aid, []))
+        if not lst:
+            return "no remembered chat for this account/model (first request, a restart, or the chat was already taken)"
+
+        def common(e: ConvEntry) -> int:
+            c = 0
+            for a_, b_ in zip(e.sigs, sigs):
+                if a_[:k] != b_[:k]:
+                    break
+                c += 1
+            return c
+        e = max(lst, key=common)
+        c, n = common(e), len(e.sigs)
+        bits: List[str] = []
+        if e.trust not in ("verified", "observed", "uncertain"):
+            bits.append(f"trust={e.trust}")
+        if e.tools_sig != tsig:
+            bits.append("tools_sig differs (the tool list, a description or a schema changed)")
+        if e.sys_sig != ssig:
+            bits.append("sys_sig differs (the system prompt changed)")
+        if n >= len(sigs):
+            bits.append(f"request has {len(sigs)} message(s) but the remembered chat already covers {n} (history shortened or rewound)")
+        if c < min(n, len(sigs)):
+            old = e.descs[c] if c < len(e.descs) else "(not recorded)"
+            bits.append(f"messages differ from index {c} of {n} remembered: remembered {old} vs now {msg_desc(msgs[c])}")
+        if not bits:
+            bits.append("no check failed on the closest remembered chat (unexpected)")
+        return f"closest remembered chat has {n} messages, trust={e.trust}, turns={e.turns}: " + "; ".join(bits)
 
     def _put(self, aid: str, e: ConvEntry) -> None:
         with self.lock:
@@ -20347,7 +20509,17 @@ class Router:
         ssig = sha(req.system)
         vmodel = req.variant_native or ""
         cid = acct["id"] + ("|" + vmodel if vmodel else "")           # remote chat memory is per (account, selected model)
-        entry, n = (self._take(cid, sigs, tsig, ssig) if use_cont else (None, 0))
+        entry, n = (self._take(cid, sigs, tsig, ssig, req.messages) if use_cont else (None, 0))
+        if use_cont:                                                     # 7.76 (step A): say WHY the whole history is re-sent (indexes and sizes only, no text)
+            try:
+                if entry is None:
+                    log(f"continuity: full history re-sent to {acct['label']} ({len(sigs)} messages): {self._why_no_entry(cid, sigs, tsig, ssig, req.messages)}", "info" if len(sigs) > 1 else "debug")
+                elif entry.tolerated_at is not None:
+                    self.bump("continuity_echo_tolerated")
+                    log(f"continuity: {acct['label']} continued although the client's copy of answer #{entry.tolerated_at} differs from the bridge's record "
+                        f"(remembered {entry.descs[entry.tolerated_at] if entry.tolerated_at < len(entry.descs) else '?'} vs now {msg_desc(req.messages[entry.tolerated_at])}); only the new messages are sent", "info")
+            except Exception as ex_:
+                log(f"continuity log failed: {type(ex_).__name__}", "debug")
         prev_turns = (entry.turns, entry.created) if entry is not None else None
         canary_on = bool(self.cfg["continuity_canary"]) and use_cont
         canary, prev_probed, probe_result = (entry.canary if entry is not None else ""), (entry.probed if entry is not None else 0), None
@@ -20543,6 +20715,10 @@ class Router:
         self.bump("chars_out", len(text))
         if use_cont:
             ne = ConvEntry(conv, sigs + [outcome_sig(clean, calls)], tsig, ssig, "uncertain", 1)
+            try:
+                ne.descs, ne.shape = [msg_desc(m_) for m_ in req.messages] + [outcome_desc(clean, calls)], [str(c_["name"]) for c_ in calls]
+            except Exception:
+                ne.descs, ne.shape = [], None
             ne.canary, ne.probed = (canary if canary_on or canary else ""), prev_probed
             if continued and prev_turns:
                 ne.turns, ne.created = prev_turns[0] + 1, prev_turns[1]
@@ -20587,6 +20763,8 @@ def http_error_parts(e: BridgeError) -> Tuple[int, str]:
         return 413, "request_too_large"
     if e.kind == "approval_required":
         return 409, "approval_required"
+    if e.kind == "setup" and (e.status >= 500 or e.status in (408, 409, 429)):
+        return 400, "invalid_request_error"                         # 7.76: Claude Code retries 408/409/429/5xx up to 10 times; a missing local setup cannot fix itself by retrying, and a 4xx shows the message at once
     if e.kind in ("setup", "login", "client"):
         return 400 if e.status in (400, 408, 503) else e.status, "invalid_request_error"
     return 502, "api_error"
@@ -32303,10 +32481,333 @@ setTimeout(() => process.exit(0), 60000);
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
 
-    all_cases = (TestFixes725, TestResolver, TestHashing, TestStreamDecoder, TestRouterCore, TestHTTP, TestPersistence, TestSecurityHelpers, TestApiBackend, TestCatalog, TestRouting, TestResolutionCatalog,
+    class TestRelease776(unittest.TestCase):
+        """7.76: send verification (task 1), continuity diagnostics + echo tolerance (task 2), pairing robustness (task 3), setup status (task 4).
+        Everything here is offline: a fake page object and a fake site backend. Nothing in this class has run against a real browser or site."""
+
+        _n = [0]
+
+        # ---- task 1: a fake page -----------------------------------------------------------------
+        class FakePage:
+            """Just enough of a Playwright page for ui_type_and_send: a textarea, a clock that only advances when the code waits, and a site that
+            reacts to Enter in a scripted way. mode: 'clear_after' (Enter works, the composer empties after `delay` ms) | 'ignore_enter' (Enter does nothing; the send button works)
+            | 'generate_after' (the site starts generating after `delay` ms but keeps the text in the box)."""
+
+            def __init__(self, host: str, mode: str, delay: int = 0) -> None:
+                self.url, self.mode, self.delay = f"https://{host}/", mode, delay
+                self.t, self.composer, self.enters, self.send_clicks, self.sent, self.bubbles, self.generating = 0, "", 0, 0, 0, 0, False
+                self.enter_at: Optional[int] = None
+                self.keyboard = self
+
+            # keyboard
+            def press(self, key: str) -> None:
+                if key != "Enter":
+                    return
+                self.enters += 1
+                if self.mode == "ignore_enter":
+                    return
+                if self.enter_at is None:
+                    self.enter_at = self.t
+
+            def insert_text(self, text: str) -> None:
+                self.composer = text
+
+            # clock + events
+            def wait_for_timeout(self, ms: int) -> None:
+                self.t += int(ms)
+                self._tick()
+
+            def _tick(self) -> None:
+                if self.enter_at is not None and self.t - self.enter_at >= self.delay:
+                    if self.mode == "clear_after" and self.composer:
+                        self._deliver()
+                    elif self.mode == "generate_after":
+                        self.generating = True
+
+            def _deliver(self) -> None:
+                self.sent += 1
+                self.bubbles += 1
+                self.composer = ""
+
+            def evaluate(self, js: str, arg: Any = None) -> Dict[str, Any]:
+                return {"has_input": True, "enabled": True, "editable": True, "title": "", "scope_text": "", "widget": False}
+
+            # locators
+            def locator(self, sel: str) -> Any:
+                page = self
+
+                class Loc:
+                    def __init__(self, n: int) -> None:
+                        self.n = n
+
+                    def count(self) -> int:
+                        return self.n
+
+                    @property
+                    def last(self) -> Any:
+                        return page._box() if sel.startswith("textarea") else self
+
+                    @property
+                    def first(self) -> Any:
+                        return self.last
+
+                    def click(self, timeout: int = 0) -> None:
+                        if "submit" in sel:
+                            page.send_clicks += 1
+                            if page.composer:
+                                page._deliver()
+                if sel.startswith("textarea"):
+                    return Loc(1)
+                if "stop" in sel:
+                    return Loc(1 if self.generating else 0)
+                if sel == "[data-message-author-role='user']":
+                    return Loc(self.bubbles)
+                if sel == "button[type='submit']:visible":
+                    return Loc(1)
+                return Loc(0)
+
+            def _box(self) -> Any:
+                page = self
+
+                class Box:
+                    def click(self, timeout: int = 0) -> None:
+                        return None
+
+                    def fill(self, text: str, timeout: int = 0) -> None:
+                        page.composer = text
+
+                    def input_value(self, timeout: int = 0) -> str:
+                        return page.composer
+
+                    def inner_text(self, timeout: int = 0) -> str:
+                        return page.composer
+                return Box()
+
+        def _page(self, mode: str, delay: int = 0) -> Any:
+            TestRelease776._n[0] += 1
+            return TestRelease776.FakePage(f"fake{TestRelease776._n[0]}.test", mode, delay)
+
+        def test_a_204_character_message_is_never_pressed_twice_however_slow_the_site_is(self) -> None:
+            p = self._page("clear_after", 37000)                                  # the real log: send_ms=37398 for a 204-char message
+            ui_type_and_send(p, "x" * 204)
+            self.assertEqual((p.enters, p.send_clicks), (1, 0))
+
+        def test_a_huge_message_that_the_site_takes_slowly_is_not_pressed_again(self) -> None:
+            p = self._page("clear_after", 9000)
+            ui_type_and_send(p, "y" * 52140)
+            self.assertEqual((p.enters, p.send_clicks, p.sent), (1, 0, 1))
+
+        def test_a_huge_message_the_site_ignored_gets_exactly_one_extra_press_after_a_long_wait(self) -> None:
+            p = self._page("ignore_enter")
+            ui_type_and_send(p, "z" * 52140)
+            self.assertEqual((p.enters, p.send_clicks, p.sent), (1, 1, 1))         # one send button press, one delivered message
+            self.assertGreaterEqual(p.t, UI_RESEND_PATIENCE_MS)                     # it waited before pressing
+
+        def test_no_extra_press_when_generation_started_even_if_the_text_is_still_in_the_box(self) -> None:
+            p = self._page("generate_after", 3000)
+            ui_type_and_send(p, "w" * 52140)
+            self.assertEqual((p.enters, p.send_clicks, p.sent), (1, 0, 0))
+
+        def _verify(self, **kw: Any) -> Tuple[str, Dict[str, int]]:
+            st = {"t": 0, "presses": 0}
+            ev = kw.get("events", {})
+
+            def wait(ms: int) -> None:
+                st["t"] += ms
+            verdict = ui_ensure_sent(kw.get("n", 52140), lambda: 0 if ev.get("composer_empty_at", 10 ** 9) <= st["t"] else 500,
+                                     lambda: ev.get("generating_at", 10 ** 9) <= st["t"], lambda: 1 if ev.get("bubble_at", 10 ** 9) <= st["t"] else 0, 0,
+                                     lambda: st.__setitem__("presses", st["presses"] + 1), wait)
+            return verdict, st
+
+        def test_send_check_acts_only_for_very_large_messages(self) -> None:
+            self.assertEqual(self._verify(n=UI_RESEND_MIN_CHARS - 1), ("skipped", {"t": 0, "presses": 0}))
+            v, st = self._verify(n=UI_RESEND_MIN_CHARS)
+            self.assertEqual((v, st["presses"]), ("resent:unconfirmed", 1))
+
+        def test_send_check_never_presses_when_the_composer_is_empty_generation_started_or_a_bubble_appeared(self) -> None:
+            for ev, why in (({"composer_empty_at": 4000}, "composer_empty"), ({"generating_at": 4000}, "generating"), ({"bubble_at": 4000}, "new_bubble")):
+                v, st = self._verify(events=ev)
+                self.assertEqual((v, st["presses"]), ("sent:" + why, 0))
+
+        def test_send_check_presses_at_most_once_and_only_after_the_patience_time(self) -> None:
+            v, st = self._verify()
+            self.assertEqual(st["presses"], 1)
+            self.assertEqual(st["t"], UI_RESEND_PATIENCE_MS + UI_RESEND_AFTER_MS)
+            v2, st2 = self._verify(events={"composer_empty_at": UI_RESEND_PATIENCE_MS + 1000})      # the site finally took it after the single extra press
+            self.assertEqual((v2, st2["presses"]), ("resent:composer_empty", 1))
+
+        def test_send_check_treats_an_unreadable_page_as_sent(self) -> None:
+            def boom() -> int:
+                raise RuntimeError("page closed")
+            n_press = [0]
+            v = ui_ensure_sent(60000, boom, lambda: False, lambda: 0, 0, lambda: n_press.__setitem__(0, 1), lambda ms: None)
+            self.assertEqual((v, n_press[0]), ("sent:unreadable", 0))
+
+        # ---- task 2: continuity -------------------------------------------------------------------
+        U1 = {"role": "user", "content": "fix the failing test in app.py"}
+        CALL = '<tool_call>{"name": "Bash", "arguments": {"command": "ls"}}</tool_call>'
+
+        def setUp(self) -> None:
+            self.tmp, self.store, self.cfg, self.app = mk_env({"cache_seconds": 0})
+            self.acc, self.rt = self.app.acc, self.app.router
+            self.a1 = add_acct(self.app, "a1", "Alpha", "alpha.test")
+            self.rt.clock = lambda: 1000.0
+
+        def tearDown(self) -> None:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+        def backend(self, script: List[Any]) -> Any:
+            class BE:
+                tier = "direct"
+                fenced_tools = False
+
+                def __init__(self) -> None:
+                    self.prompts: List[str] = []
+                    self.convs = 0
+
+                def new_conv(self, model: Optional[str] = None) -> Dict[str, Any]:
+                    self.convs += 1
+                    return {"n": self.convs}
+
+                def ask(self, conv: Any, prompt: str, cancel: Any = None, model: str = "") -> Iterator[str]:
+                    self.prompts.append(prompt)
+                    yield script.pop(0) if script else "done"
+            be = BE()
+            self.acc.backend = lambda acct: be                                      # type: ignore[assignment]
+            return be
+
+        def req(self, messages: List[Dict[str, Any]], system: str = "You are a coding agent.", desc: str = "run a command") -> NormReq:
+            return normalize_anthropic({"model": "bridge-auto", "max_tokens": 50, "system": system, "messages": messages,
+                                        "tools": [{"name": "Bash", "description": desc, "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}]})
+
+        def go(self, messages: List[Dict[str, Any]], **kw: Any) -> Outcome:
+            return self.rt.handle(self.req(messages, **kw), lambda t: None, "", threading.Event(), scope="k")
+
+        @staticmethod
+        def echo(out: Outcome, call_id: str, tweak: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+            """What Claude Code sends back for the answer it received: the assistant message, then the tool result."""
+            blocks: List[Dict[str, Any]] = ([{"type": "text", "text": out.text}] if out.text else []) + [{"type": "tool_use", "id": call_id, "name": c["name"], "input": dict(c["input"])} for c in out.calls]
+            if tweak:
+                blocks = [tweak(b) for b in blocks]
+            return [{"role": "assistant", "content": blocks}, {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call_id, "content": "file1\nfile2"}]}]
+
+        def captured(self) -> Tuple[List[str], Callable[[], None]]:
+            lines: List[str] = []
+            g = globals()
+            old = g["log"]
+            g["log"] = lambda msg, level="info", *a, **k: lines.append(str(msg))
+            return lines, lambda: g.__setitem__("log", old)
+
+        def test_a_plain_conversation_continues_with_only_the_new_messages(self) -> None:
+            be = self.backend([self.CALL, self.CALL, "all done"])
+            hist = [self.U1]
+            for i in range(3):
+                out = self.go(hist)
+                hist = hist + self.echo(out, f"c{i}") if out.calls else hist
+            self.assertEqual(be.convs, 1)                                           # ONE remote chat for all three turns
+            self.assertNotIn("<conversation>", be.prompts[1])
+
+        def test_regression_a_client_that_normalises_the_echoed_tool_input_does_not_force_a_full_resend(self) -> None:
+            # Hypothesis for the real log: the client's copy of the assistant message (tool input after its own validation / defaults) differs from the bridge's record.
+            be = self.backend([self.CALL, self.CALL, "all done"])
+            lines, restore = self.captured()
+            try:
+                hist = [self.U1]
+                out = self.go(hist)
+                hist = hist + self.echo(out, "c0", lambda b: ({**b, "input": {**b["input"], "timeout": 120000}} if b["type"] == "tool_use" else b))
+                out = self.go(hist)
+                hist = hist + self.echo(out, "c1", lambda b: ({**b, "input": {**b["input"], "description": "list"}} if b["type"] == "tool_use" else b))
+                self.go(hist)
+            finally:
+                restore()
+            self.assertEqual(be.convs, 1)
+            self.assertEqual(self.rt.stats.get("continuity_echo_tolerated"), 2)
+            self.assertTrue(any("differs from the bridge's record" in x and "tool_use:Bash" in x for x in lines))
+
+        def test_a_real_break_is_still_a_break_and_the_log_says_which_check_failed(self) -> None:
+            for label, mutate, want in (
+                    ("an earlier user message changed", lambda h: [{"role": "user", "content": "fix the OTHER test"}] + h[1:], "messages differ from index 0"),
+                    ("the echoed answer calls another tool", lambda h: h[:1] + [{"role": "assistant", "content": [{"type": "tool_use", "id": "c0", "name": "Read", "input": {}}]}] + h[2:],
+                     "messages differ from index 1"),
+                    ("the history was rewound", lambda h: h[:2], "history shortened or rewound")):
+                self.rt.convs.clear()
+                be = self.backend([self.CALL, "ok", "ok"])
+                lines, restore = self.captured()
+                try:
+                    hist = [self.U1]
+                    out = self.go(hist)
+                    hist = hist + self.echo(out, "c0")
+                    self.go(mutate(hist))
+                finally:
+                    restore()
+                self.assertEqual(be.convs, 2, label)
+                self.assertTrue(any("continuity: full history re-sent" in x and want in x for x in lines), (label, lines))
+
+        def test_log_names_a_changed_tool_list_and_a_changed_system_prompt(self) -> None:
+            be = self.backend([self.CALL, "ok", "ok"])
+            lines, restore = self.captured()
+            try:
+                hist = [self.U1]
+                out = self.go(hist)
+                hist = hist + self.echo(out, "c0")
+                self.go(hist, desc="run a command (v2)")
+                self.go(hist + [{"role": "assistant", "content": "ok"}, {"role": "user", "content": "next"}], system="You are another agent.")
+            finally:
+                restore()
+            self.assertEqual(be.convs, 3)
+            self.assertTrue(any("tools_sig differs" in x for x in lines))
+            self.assertTrue(any("sys_sig differs" in x for x in lines))
+
+        def test_continuity_log_never_contains_message_text(self) -> None:
+            self.backend([self.CALL, "ok"])
+            lines, restore = self.captured()
+            try:
+                secret = {"role": "user", "content": "my password is hunter2-SECRET"}
+                out = self.go([secret])
+                self.go([{"role": "user", "content": "other SECRET2"}] + self.echo(out, "c0"))
+            finally:
+                restore()
+            joined = "\n".join(lines)
+            self.assertIn("continuity:", joined)
+            self.assertNotIn("SECRET", joined)
+
+        # ---- task 3: pairing ----------------------------------------------------------------------
+        def test_pairing_file_that_cannot_be_read_falls_back_to_the_backup_and_unpairing_is_logged(self) -> None:
+            root = Path(self.tmp) / "pc"
+            hub = PCHub(root, port=0)
+            hub.state = {"origin": "chrome-extension://abc", "clients": {"p1": {"token_sha256": "x", "name": "Work", "paired_at": 1}}, "paired_at": 1, "version": PC_VERSION}
+            hub._save()
+            hub.state["clients"]["p1"]["name"] = "Work2"
+            hub._save()                                                              # the second save keeps the first state as pairing.bak
+            (root / "pairing.json").write_text("{ this is not json", "utf-8")       # e.g. a half-written file after a crash
+            lines, restore = self.captured()
+            try:
+                h2 = PCHub(root, port=0)
+                self.assertTrue(h2.paired())
+                self.assertEqual(h2.state["clients"]["p1"]["name"], "Work")
+                self.assertTrue(any("restored from pairing.bak" in x for x in lines))
+                lines.clear()
+                self.assertTrue(h2.unpair("p1"))
+                self.assertTrue(any("was unpaired by the extension" in x and "pair again" in x for x in lines))
+            finally:
+                restore()
+            self.assertFalse(h2.paired())
+            self.assertFalse((root / "pairing.bak").exists())                        # an intentional unpair leaves no stale backup behind
+            self.assertFalse(PCHub(root, port=0).paired())
+
+        # ---- task 4: setup errors ------------------------------------------------------------------
+        def test_a_setup_failure_is_a_4xx_so_the_client_does_not_retry_it_and_other_errors_keep_their_status(self) -> None:
+            self.assertEqual(http_error_parts(BridgeError("could not prepare the runtime", "setup", 502)), (400, "invalid_request_error"))
+            self.assertEqual(http_error_parts(BridgeError("npm timed out", "setup", 504))[0], 400)
+            self.assertEqual(http_error_parts(BridgeError("no recorded model-list call", "setup", 404))[0], 404)    # unchanged
+            self.assertEqual(http_error_parts(BridgeError("down", "upstream", 502))[0], 502)                       # a real upstream failure is still retryable
+            self.assertEqual(http_error_parts(BridgeError("slow down", "rate_limit", 429))[0], 429)
+            self.assertEqual(classify_error(BridgeError("could not prepare the runtime", "setup", 502)).category, "setup_required")   # classification is untouched
+
+    all_cases = (TestRelease776, TestFixes725, TestResolver, TestHashing, TestStreamDecoder, TestRouterCore, TestHTTP, TestPersistence, TestSecurityHelpers, TestApiBackend, TestCatalog, TestRouting, TestResolutionCatalog,
                  TestErrorsAndLimits, TestTaskStateAndFailover, TestContextEngine, TestSubmission, TestGroupO, TestGroupOSetup, TestGroupOCapture, TestGroupO5, TestGroupO17, TestGroupO18, TestGroupO19, TestGroupO8, TestGroupO9, TestGroupO9Supervisor, TestGroupO827, TestGroupO827b, TestGroupO21Link, TestGroupO14, TestGroupO13, TestGroupO15, TestGroupO25, TestGroupO26, TestGroupO27, TestGroupO28, TestWorkspaceAndOptionalLearning, TestServingModesAndEvidence, TestAutomaticDependencySetup, TestReportInSync, TestFixes732, TestGroupO12Dash, TestGroupO11, TestLogFile, TestAccessAndDashboardLog, TestPersonalChrome, TestToolCallParser, TestUIWait, TestUIAnswerReader, TestReliability771, TestQuickSmoke)
     only = os.environ.get("BRIDGE_SELFTEST_ONLY", "")             # lean workflow (section 0A): BRIDGE_SELFTEST_ONLY=TestSubmission,TestContextEngine runs just those classes
-    for case in ((TestQuickSmoke, TestToolCallParser, TestUIWait) if quick else tuple(c for c in all_cases if not only or c.__name__ in only.split(","))):
+    for case in ((TestQuickSmoke, TestToolCallParser, TestUIWait, TestRelease776) if quick else tuple(c for c in all_cases if not only or c.__name__ in only.split(","))):
         suite.addTests(ld.loadTestsFromTestCase(case))
     print(f"AI Web Bridge {VERSION} self-test  (python {sys.version.split()[0]}; offline; temporary data folders)")
     res = unittest.TextTestRunner(verbosity=2, stream=sys.stdout).run(suite)
