@@ -166,7 +166,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.57"
+VERSION = "7.58"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -2060,7 +2060,7 @@ def build_evidence(probes: List[Dict[str, Any]], storage: Dict[str, Any], secret
 # The user's own Chrome is the browser. A Manifest-V3 extension (embedded below, extracted at run time) executes commands that the bridge sends over an
 # authenticated loopback channel; a small Playwright-shaped compatibility layer (PCContext / PCPage / PCLocator / PCCdpSession) keeps every existing call site working.
 # ============================================================================
-PC_VERSION = "1.1.0"
+PC_VERSION = "1.2.0"
 
 PC_BACKGROUND_JS = r"""'use strict';
 // AI Web Bridge - Personal Chrome extension (service worker). Talks ONLY to http://127.0.0.1:<port>/pc/* with a bearer token obtained by one-time pairing.
@@ -2068,12 +2068,22 @@ const ALLOWED_DOMAINS = ['Page', 'Runtime', 'Network', 'Input', 'DOM', 'Debugger
 const BLOCKED_METHODS = new Set(['Network.getAllCookies', 'Network.clearBrowserCookies', 'Network.deleteCookies', 'Runtime.compileScript']);
 const SID = Date.now().toString(36) + Math.random().toString(36).slice(2);   // changes whenever the worker restarts: the bridge then re-validates its tabs
 const POLL_MS = 20000, FLUSH_MS = 120, MAX_BATCH = 400, RESULT_CACHE = 300;
-let cfg = null;                          // {port, token}
+let cfg = null;                          // {port, token, clientId}
+let identity = null;                     // stable per Chrome profile, isolated by chrome.storage.local
 let cmdCache = new Map();                // command id -> result (duplicate-command protection: a re-delivered command is never executed twice)
 let attached = new Map();                // tabId -> {owned, sinceMs}
 let evq = [], flushTimer = null, polling = false, lastError = '', lastOk = 0, inspecting = 0;
 
-async function loadCfg() { if (!cfg) { const s = await chrome.storage.local.get(['port', 'token']); cfg = (s.port && s.token) ? {port: s.port, token: s.token} : null; } return cfg; }
+async function getIdentity() {
+  if (!identity) {
+    const s = await chrome.storage.local.get(['clientId', 'profileName', 'token']);
+    const clientId = s.clientId || (s.token ? 'legacy' : (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2)));
+    identity = {clientId, profileName: s.profileName || ('Chrome ' + clientId.slice(0, 8))};
+    if (!s.clientId) await chrome.storage.local.set({clientId: identity.clientId});
+  }
+  return identity;
+}
+async function loadCfg() { if (!cfg) { const [s, i] = await Promise.all([chrome.storage.local.get(['port', 'token']), getIdentity()]); cfg = (s.port && s.token) ? {port: s.port, token: s.token, clientId: i.clientId} : null; } return cfg; }
 async function owned() { const s = await chrome.storage.session.get('owned'); return new Set(s.owned || []); }
 async function setOwned(set) { await chrome.storage.session.set({owned: [...set]}); }
 async function consented() { const s = await chrome.storage.session.get('consent'); return new Set(s.consent || []); }
@@ -2082,7 +2092,8 @@ function badge() { chrome.action.setBadgeText({text: attached.size ? String(atta
 
 async function api(path, body, signal) {
   const c = await loadCfg(); if (!c) throw new Error('not paired');
-  const r = await fetch('http://127.0.0.1:' + c.port + path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Bridge-PC-Token': c.token}, body: JSON.stringify(body || {}), signal});
+  const payload = Object.assign({}, body || {}, {client_id: c.clientId});
+  const r = await fetch('http://127.0.0.1:' + c.port + path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Bridge-PC-Token': c.token}, body: JSON.stringify(payload), signal});
   if (r.status === 401 || r.status === 403) { cfg = null; await chrome.storage.local.remove('token'); throw new Error('rejected by the bridge (pair again)'); }
   if (!r.ok) throw new Error('bridge http ' + r.status);
   return r.json();
@@ -2168,17 +2179,41 @@ chrome.runtime.onMessage.addListener((msg, sender, send) => {
   (async () => {
     if (msg.type === 'pair') {
       try {
-        const r = await fetch('http://127.0.0.1:' + msg.port + '/pc/pair', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({code: msg.code})});
+        const ident = await getIdentity();
+        const r = await fetch('http://127.0.0.1:' + msg.port + '/pc/pair', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({code: msg.code, client_id: ident.clientId, client_name: String(msg.profileName || ident.profileName || '').slice(0, 80)})});
         const j = await r.json(); if (!r.ok) throw new Error(j.error || ('http ' + r.status));
-        await chrome.storage.local.set({port: msg.port, token: j.token}); cfg = null; pollLoop(); send({ok: true});
+        identity = Object.assign(ident, {profileName: String(msg.profileName || ident.profileName || '')});
+        await chrome.storage.local.set({port: msg.port, token: j.token, profileName: identity.profileName}); cfg = null; pollLoop(); send({ok: true, clientId: ident.clientId});
       } catch (e) { send({ok: false, error: String(e.message || e)}); }
     } else if (msg.type === 'status') {
-      const c = await loadCfg(), o = await owned(), allow = await consented(); send({paired: !!c, port: c && c.port, attached: [...attached.keys()], ownedTabs: [...o], allowedTabs: [...new Set([...o, ...allow])], lastError, lastOk, polling});
+      const c = await loadCfg(), i = await getIdentity(), o = await owned(), allow = await consented(), login = await chrome.storage.local.get(['loginAccountId', 'loginTabId']); send({paired: !!c, port: c && c.port, clientId: i.clientId, profileName: i.profileName, hasLogin: !!login.loginAccountId, loginAccountId: login.loginAccountId || '', loginTabId: login.loginTabId || null, attached: [...attached.keys()], ownedTabs: [...o], allowedTabs: [...new Set([...o, ...allow])], lastError, lastOk, polling});
+    } else if (msg.type === 'profile_name') {
+      const i = await getIdentity(); i.profileName = String(msg.name || '').replace(/[\x00-\x1f\x7f]/g, '').trim().slice(0, 80) || ('Chrome ' + i.clientId.slice(0, 8)); identity = i; await chrome.storage.local.set({profileName: i.profileName});
+      try { if (await loadCfg()) await api('/pc/profile-name', {name: i.profileName}); } catch (e) { lastError = String(e.message || e); }
+      send({ok: true, profileName: i.profileName});
+    } else if (msg.type === 'login_requests') {
+      try { const r = await api('/pc/login-requests', {}); send({ok: true, requests: r.requests || []}); } catch (e) { send({ok: false, error: String(e.message || e), requests: []}); }
+    } else if (msg.type === 'claim_login') {
+      try {
+        const r = await api('/pc/login-claim', {account_id: String(msg.accountId || '')});
+        const tab = await chrome.tabs.create({url: r.url, active: true}); const o = await owned(); o.add(tab.id); await setOwned(o);
+        await chrome.storage.local.set({loginAccountId: r.account_id, loginTabId: tab.id}); send({ok: true, tab: tab.id});
+      } catch (e) { send({ok: false, error: String(e.message || e)}); }
+    } else if (msg.type === 'confirm_login') {
+      try {
+        const s = await chrome.storage.local.get(['loginAccountId', 'loginTabId']);
+        const [active] = await chrome.tabs.query({active: true, currentWindow: true});
+        if (!s.loginAccountId || !active || active.id !== s.loginTabId) throw new Error('Return to the site tab opened for this account, then confirm again.');
+        const tab = await chrome.tabs.get(s.loginTabId);
+        const r = await api('/pc/login-confirm', {account_id: s.loginAccountId, tab: tab.id, url: tab.url || tab.pendingUrl || ''});
+        await chrome.storage.local.remove(['loginAccountId', 'loginTabId']); send({ok: true, result: r});
+      } catch (e) { send({ok: false, error: String(e.message || e)}); }
     } else if (msg.type === 'allow_tab') {
       const c = await consented(); c.add(msg.tab); await setConsent(c); send({ok: true});
     } else if (msg.type === 'revoke_tab') {
       const c = await consented(); c.delete(msg.tab); await setConsent(c); if (attached.has(msg.tab)) await OPS['cdp.detach']({tab: msg.tab}); send({ok: true});
     } else if (msg.type === 'unpair') {
+      try { if (await loadCfg()) await api('/pc/unpair', {}); } catch (e) {}
       for (const t of [...attached.keys()]) await OPS['cdp.detach']({tab: t}); await chrome.storage.local.remove(['token', 'port']); cfg = null; send({ok: true});
     } else send({ok: false, error: 'unknown message'});
   })();
@@ -2197,15 +2232,16 @@ PC_POPUP_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><
 <section class="status-card"><div class="status-line"><i id="dot" class="dot"></i><div><strong id="state-title">Checking connection…</strong><p id="state-detail" class="muted"></p></div></div>
 <div class="metrics"><div><b id="tab-count">0</b><span data-i="tabs_shared">tabs shared</span></div><div><b id="port-value">—</b><span data-i="local_port">local port</span></div></div></section>
 <section id="pairbox" class="panel" hidden><h2 data-i="pair_title">Connect to your bridge</h2><p class="muted" data-i="pair_hint">Enter the one-time code shown in the Bridge dashboard.</p>
-<label class="field"><span data-i="port_label">Port</span><input id="port" inputmode="numeric" value="18765" maxlength="5"></label><label class="field"><span data-i="code_label">One-time code</span><input id="code" autocomplete="one-time-code" maxlength="8" placeholder="8 characters"></label><button id="pair" class="primary" data-i="connect">Connect securely</button><p id="pair-error" class="error" hidden></p></section>
+<label class="field"><span data-i="profile_label">Chrome profile name</span><input id="profile-name" maxlength="80" placeholder="Work, personal…"></label><label class="field"><span data-i="port_label">Port</span><input id="port" inputmode="numeric" value="18765" maxlength="5"></label><label class="field"><span data-i="code_label">One-time code</span><input id="code" autocomplete="one-time-code" maxlength="8" placeholder="8 characters"></label><button id="pair" class="primary" data-i="connect">Connect securely</button><p id="pair-error" class="error" hidden></p></section>
 <section id="tabbox" class="panel" hidden><div class="section-heading"><h2 data-i="this_tab">This tab</h2><span id="tab-badge" class="tag"></span></div><p id="tab-title" class="tab-title"></p><p id="tab-host" class="muted ltr"></p><p id="tab-note" class="muted note"></p>
 <button id="allow" class="primary" data-i="allow">Allow this tab</button><button id="revoke" class="secondary" data-i="revoke">Stop sharing</button></section>
+<section id="loginbox" class="panel" hidden><div class="section-heading"><h2 data-i="login_requests">Accounts waiting for login</h2><span id="profile-tag" class="tag"></span></div><label class="field"><span data-i="profile_label">Chrome profile name</span><input id="profile-name-active" maxlength="80"></label><button id="profile-save" class="secondary" data-i="save_profile">Save profile name</button><div id="login-list"></div><button id="login-confirm" class="primary" data-i="confirm_login" disabled>I'm signed in — confirm</button><p id="login-note" class="muted note"></p></section>
 <details class="privacy"><summary data-i="privacy_title">A small privacy promise</summary><p data-i="privacy_body">Only tabs opened by Bridge or tabs you allow here can be inspected. The link stays on this computer. Chrome shows its own notice while a tab is being inspected.</p></details>
 <footer><span class="local-mark"><i></i><span data-i="local_only">Private · this computer only</span></span><button id="unpair" class="link-button" data-i="disconnect" hidden>Disconnect</button></footer><script src="popup.js"></script></body></html>"""
 
 PC_POPUP_JS = r"""const $ = id => document.getElementById(id);
 const send = m => new Promise((resolve, reject) => chrome.runtime.sendMessage(m, r => { if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message)); else resolve(r || {}); }));
-const words = {en:{tagline:'Your browser, with permission.',tabs_shared:'tabs shared',local_port:'local port',pair_title:'Connect to your bridge',pair_hint:'Enter the one-time code shown in the Bridge dashboard.',port_label:'Port',code_label:'One-time code',connect:'Connect securely',this_tab:'This tab',allow:'Allow this tab',revoke:'Stop sharing',privacy_title:'A small privacy promise',privacy_body:'Only tabs opened by Bridge or tabs you allow here can be inspected. The link stays on this computer. Chrome shows its own notice while a tab is being inspected.',local_only:'Private · this computer only',disconnect:'Disconnect',checking:'Checking connection…',not_paired:'Not connected yet',connect_hint:'Use the one-time code from the Bridge dashboard.',connected:'Connected',waiting:'Bridge is reconnecting',waiting_hint:'Keep the Bridge app running on this computer.',tab_owned:'Bridge opened this tab',tab_allowed:'You allowed this tab',tab_not_shared:'Only you can see this tab',internal:'Chrome does not allow extensions to inspect this page.',tab_hint:'Bridge can use this tab only after you allow it.',allow_done:'This tab is shared with Bridge.',revoke_done:'Bridge no longer has access to this tab.',bad_pair:'Could not connect: ',pair_ok:'Connected securely.',pair_invalid:'Enter a valid port and 8-character code.',disconnect_confirm:'Disconnect this browser from Bridge?',disconnected:'Disconnected.',error:'Something went wrong. Try again.'},fa:{tagline:'مرورگر خودت، با اجازه‌ی خودت.',tabs_shared:'زبانه‌ی در دسترس',local_port:'درگاه محلی',pair_title:'اتصال به Bridge',pair_hint:'کد یک‌بارمصرف را از داشبورد Bridge وارد کن.',port_label:'درگاه',code_label:'کد یک‌بارمصرف',connect:'اتصال امن',this_tab:'این زبانه',allow:'اجازه‌ی دسترسی',revoke:'قطع دسترسی',privacy_title:'قول کوچک حریم خصوصی',privacy_body:'فقط زبانه‌هایی که Bridge باز کرده یا خودت اجازه داده‌ای قابل بررسی‌اند. ارتباط فقط روی همین کامپیوتر است. هنگام بررسی زبانه، Chrome اعلان خودش را نشان می‌دهد.',local_only:'خصوصی · فقط همین کامپیوتر',disconnect:'قطع اتصال',checking:'در حال بررسی اتصال…',not_paired:'هنوز متصل نشده',connect_hint:'کد یک‌بارمصرف را از داشبورد Bridge بردار.',connected:'متصل است',waiting:'Bridge در حال اتصال دوباره است',waiting_hint:'برنامه‌ی Bridge را روی همین کامپیوتر باز نگه دار.',tab_owned:'Bridge این زبانه را باز کرده',tab_allowed:'خودت اجازه داده‌ای',tab_not_shared:'فقط خودت به این زبانه دسترسی داری',internal:'افزونه‌ها اجازه‌ی بررسی این صفحه‌ی داخلی Chrome را ندارند.',tab_hint:'Bridge فقط پس از اجازه‌ی تو می‌تواند از این زبانه استفاده کند.',allow_done:'این زبانه با Bridge به‌اشتراک گذاشته شد.',revoke_done:'دسترسی Bridge به این زبانه قطع شد.',bad_pair:'اتصال برقرار نشد: ',pair_ok:'اتصال امن برقرار شد.',pair_invalid:'درگاه معتبر و کد ۸ حرفی را وارد کن.',disconnect_confirm:'اتصال این مرورگر با Bridge قطع شود؟',disconnected:'اتصال قطع شد.',error:'مشکلی پیش آمد. دوباره تلاش کن.'}};
+const words = {en:{tagline:'Your browser, with permission.',tabs_shared:'tabs shared',local_port:'local port',pair_title:'Connect to your bridge',pair_hint:'Enter the one-time code shown in the Bridge dashboard.',profile_label:'Chrome profile name',save_profile:'Save profile name',login_requests:'Accounts waiting for login',login_open:'Open login page',confirm_login:"I'm signed in — confirm",login_none:'No account is waiting for this profile.',login_done:'Login confirmed. Bridge is saving this account.',login_claimed:'Assigned to this Chrome profile',port_label:'Port',code_label:'One-time code',connect:'Connect securely',this_tab:'This tab',allow:'Allow this tab',revoke:'Stop sharing',privacy_title:'A small privacy promise',privacy_body:'Only tabs opened by Bridge or tabs you allow here can be inspected. The link stays on this computer. Chrome shows its own notice while a tab is being inspected.',local_only:'Private · this computer only',disconnect:'Disconnect',checking:'Checking connection…',not_paired:'Not connected yet',connect_hint:'Use the one-time code from the Bridge dashboard.',connected:'Connected',waiting:'Bridge is reconnecting',waiting_hint:'Keep the Bridge app running on this computer.',tab_owned:'Bridge opened this tab',tab_allowed:'You allowed this tab',tab_not_shared:'Only you can see this tab',internal:'Chrome does not allow extensions to inspect this page.',tab_hint:'Bridge can use this tab only after you allow it.',allow_done:'This tab is shared with Bridge.',revoke_done:'Bridge no longer has access to this tab.',bad_pair:'Could not connect: ',pair_ok:'Connected securely.',pair_invalid:'Enter a valid port and 8-character code.',disconnect_confirm:'Disconnect this browser from Bridge?',disconnected:'Disconnected.',error:'Something went wrong. Try again.'},fa:{tagline:'مرورگر خودت، با اجازه‌ی خودت.',tabs_shared:'زبانه‌ی در دسترس',local_port:'درگاه محلی',pair_title:'اتصال به Bridge',pair_hint:'کد یک‌بارمصرف را از داشبورد Bridge وارد کن.',profile_label:'نام این پروفایل Chrome',save_profile:'ذخیره‌ی نام پروفایل',login_requests:'حساب‌های منتظر ورود',login_open:'باز کردن صفحه‌ی ورود',confirm_login:'وارد شدم — تأیید',login_none:'حسابی برای این پروفایل منتظر ورود نیست.',login_done:'ورود تأیید شد؛ Bridge در حال ذخیره‌ی حساب است.',login_claimed:'به این پروفایل Chrome اختصاص دارد',port_label:'درگاه',code_label:'کد یک‌بارمصرف',connect:'اتصال امن',this_tab:'این زبانه',allow:'اجازه‌ی دسترسی',revoke:'قطع دسترسی',privacy_title:'قول کوچک حریم خصوصی',privacy_body:'فقط زبانه‌هایی که Bridge باز کرده یا خودت اجازه داده‌ای قابل بررسی‌اند. ارتباط فقط روی همین کامپیوتر است. هنگام بررسی زبانه، Chrome اعلان خودش را نشان می‌دهد.',local_only:'خصوصی · فقط همین کامپیوتر',disconnect:'قطع اتصال',checking:'در حال بررسی اتصال…',not_paired:'هنوز متصل نشده',connect_hint:'کد یک‌بارمصرف را از داشبورد Bridge بردار.',connected:'متصل است',waiting:'Bridge در حال اتصال دوباره است',waiting_hint:'برنامه‌ی Bridge را روی همین کامپیوتر باز نگه دار.',tab_owned:'Bridge این زبانه را باز کرده',tab_allowed:'خودت اجازه داده‌ای',tab_not_shared:'فقط خودت به این زبانه دسترسی داری',internal:'افزونه‌ها اجازه‌ی بررسی این صفحه‌ی داخلی Chrome را ندارند.',tab_hint:'Bridge فقط پس از اجازه‌ی تو می‌تواند از این زبانه استفاده کند.',allow_done:'این زبانه با Bridge به‌اشتراک گذاشته شد.',revoke_done:'دسترسی Bridge به این زبانه قطع شد.',bad_pair:'اتصال برقرار نشد: ',pair_ok:'اتصال امن برقرار شد.',pair_invalid:'درگاه معتبر و کد ۸ حرفی را وارد کن.',disconnect_confirm:'اتصال این مرورگر با Bridge قطع شود؟',disconnected:'اتصال قطع شد.',error:'مشکلی پیش آمد. دوباره تلاش کن.'}};
 const lang=(navigator.language||'en').toLowerCase().startsWith('fa')?'fa':'en', t=k=>(words[lang]||words.en)[k]||words.en[k]||k;
 document.documentElement.lang=lang;document.documentElement.dir=lang==='fa'?'rtl':'ltr';document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));
 let currentTab=null, busy=false;const isInternal=url=>/^(chrome|edge|about|devtools|chrome-extension):/.test(url||'')||/chromewebstore\.google\.com/.test(url||'');
@@ -2219,11 +2255,18 @@ async function refresh(){if(busy)return;try{const [s]=await Promise.all([send({t
   $('tab-badge').textContent=internal?'':owned?t('tab_owned'):allowed?t('tab_allowed'):t('tab_not_shared');$('tab-badge').className='tag '+(owned||allowed?'tag-on':'');
   $('tab-note').textContent=internal?t('internal'):(owned||allowed?'':t('tab_hint'));
   $('allow').hidden=internal||owned||allowed;$('revoke').hidden=internal||(!allowed&&!attached);$('allow').disabled=!id;$('revoke').disabled=!id;
+  $('loginbox').hidden=!paired;$('profile-tag').textContent=s.profileName||('Chrome '+String(s.clientId||'').slice(0,8));
+  const pn=$('profile-name-active');if(document.activeElement!==pn)pn.value=s.profileName||'';
+  $('login-confirm').disabled=!s.hasLogin;$('login-note').textContent=s.hasLogin?t('login_done'):'';
+  try{const lr=await send({type:'login_requests'});renderLoginRequests(lr.requests||[])}catch(e){renderLoginRequests([])}
 }catch(e){$('state-title').textContent=t('not_paired');$('state-detail').textContent=t('error')} }
 $('pair').onclick=async()=>{const port=Number($('port').value),code=$('code').value.trim().toUpperCase(),err=$('pair-error');err.hidden=true;if(!Number.isInteger(port)||port<1||port>65535||!/^[A-HJ-NP-Z2-9]{8}$/.test(code)){err.textContent=t('pair_invalid');err.hidden=false;return}
-  $('pair').disabled=true;try{const r=await send({type:'pair',port,code});if(!r.ok)throw new Error(r.error||t('error'));$('code').value='';$('state-detail').textContent=t('pair_ok');await refresh()}catch(e){err.textContent=t('bad_pair')+e.message;err.hidden=false}finally{$('pair').disabled=false}};
+  $('pair').disabled=true;try{const r=await send({type:'pair',port,code,profileName:$('profile-name').value.trim()});if(!r.ok)throw new Error(r.error||t('error'));$('code').value='';$('state-detail').textContent=t('pair_ok');await refresh()}catch(e){err.textContent=t('bad_pair')+e.message;err.hidden=false}finally{$('pair').disabled=false}};
 $('code').addEventListener('input',()=>{$('code').value=$('code').value.toUpperCase().replace(/[^A-HJ-NP-Z2-9]/g,'').slice(0,8)});
 $('allow').onclick=async()=>{if(currentTab)await send({type:'allow_tab',tab:currentTab.id});await refresh()};$('revoke').onclick=async()=>{if(currentTab)await send({type:'revoke_tab',tab:currentTab.id});await refresh()};
+function renderLoginRequests(rows){const box=$('login-list');box.textContent='';if(!rows.length){const p=document.createElement('p');p.className='muted';p.textContent=t('login_none');box.appendChild(p);return}for(const row of rows){const card=document.createElement('div');card.className='request-row';const text=document.createElement('div'),name=document.createElement('strong'),host=document.createElement('p'),btn=document.createElement('button');name.textContent=row.label||row.host;host.className='muted ltr';host.textContent=row.host||'';btn.className='secondary';btn.textContent=row.claimed?t('login_claimed'):t('login_open');btn.disabled=!!row.claimed;if(!row.claimed)btn.onclick=async()=>{btn.disabled=true;try{const r=await send({type:'claim_login',accountId:row.id});if(!r.ok)throw new Error(r.error||t('error'));window.close()}catch(e){$('login-note').textContent=e.message;btn.disabled=false;await refresh()}};text.append(name,host);card.append(text,btn);box.appendChild(card)}}
+$('profile-save').onclick=async()=>{const r=await send({type:'profile_name',name:$('profile-name-active').value});if(r.ok){$('profile-tag').textContent=r.profileName||'Chrome';$('login-note').textContent=t('save_profile')}};
+$('login-confirm').onclick=async()=>{const b=$('login-confirm');b.disabled=true;try{const r=await send({type:'confirm_login'});if(!r.ok)throw new Error(r.error||t('error'));$('login-note').textContent=t('login_done');await refresh()}catch(e){$('login-note').textContent=e.message;await refresh()}};
 $('unpair').onclick=async()=>{if(!confirm(t('disconnect_confirm')))return;await send({type:'unpair'});$('state-detail').textContent=t('disconnected');await refresh()};
 refresh();setInterval(refresh,2500);"""
 
@@ -2382,10 +2425,10 @@ def pc_validate_command(op: str, args: Dict[str, Any]) -> None:
 
 
 class _PCCmd:
-    __slots__ = ("id", "op", "args", "state", "result", "error", "ev", "safe", "t_sent", "cancelled")
+    __slots__ = ("id", "op", "args", "client_id", "state", "result", "error", "ev", "safe", "t_sent", "cancelled")
 
-    def __init__(self, op: str, args: Dict[str, Any]):
-        self.id, self.op, self.args = uuid.uuid4().hex, op, args
+    def __init__(self, op: str, args: Dict[str, Any], client_id: str = "legacy"):
+        self.id, self.op, self.args, self.client_id = uuid.uuid4().hex, op, args, client_id
         self.state, self.result, self.error, self.ev, self.t_sent, self.cancelled = "queued", None, None, threading.Event(), 0.0, False
         self.safe = op in PC_SAFE_OPS or (op == "cdp.send" and str(args.get("method")) in PC_SAFE_CDP)
 
@@ -2403,18 +2446,25 @@ class PCHub:
         self.queue: deque = deque()
         self.srv: Optional[ThreadingHTTPServer] = None
         self.last_poll = 0.0
-        self._sid = ""                                                       # id of the extension worker that polled last (changes on every worker restart)
+        self._sid_by_client: Dict[str, str] = {}
+        self._last_poll_by_client: Dict[str, float] = {}
         self.epoch = 0
         self.grace = PC_CONNECT_GRACE
         self.listeners: List[Callable[[Dict[str, Any]], None]] = []
         self.pair_code, self.pair_until, self.pair_fails = "", 0.0, 0
+        self.login_requests_provider: Optional[Callable[[str], List[Dict[str, Any]]]] = None
+        self.login_claim_handler: Optional[Callable[[str, Dict[str, Any]], Tuple[int, Dict[str, Any]]]] = None
+        self.login_confirm_handler: Optional[Callable[[str, Dict[str, Any]], Tuple[int, Dict[str, Any]]]] = None
         self.state = self._load()
         self.stats = {"events": 0, "commands": 0, "rejected": 0, "dupe_results": 0}
 
     # -- persistent pairing state (only a hash of the token is stored) -----------------------------------------------------------------------------
     def _load(self) -> Dict[str, Any]:
         try:
-            return json.loads((self.root / "pairing.json").read_text("utf-8"))
+            data = json.loads((self.root / "pairing.json").read_text("utf-8"))
+            if data.get("token_sha256") and not data.get("clients"):
+                data["clients"] = {"legacy": {"token_sha256": data["token_sha256"], "name": "Chrome profile", "paired_at": data.get("paired_at", 0)}}
+            return data
         except Exception:
             return {}
 
@@ -2429,23 +2479,108 @@ class PCHub:
         os.replace(tmp, p)
 
     def new_pairing(self) -> str:
-        """A one-time code, valid ten minutes. A successful pairing replaces the stored token and the pinned extension id."""
+        """Create a one-time code for adding one independent Chrome profile."""
         with self.lock:
             self.pair_code = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
             self.pair_until, self.pair_fails = time.time() + 600, 0
             return self.pair_code                                                    # the previous pairing stays valid until a new one succeeds
 
     def paired(self) -> bool:
-        return bool(self.state.get("token_sha256") and self.state.get("origin"))
+        return bool(self.state.get("origin") and (self.state.get("clients") or self.state.get("token_sha256")))
 
-    def connected(self) -> bool:
-        return self.paired() and (time.time() - self.last_poll) < self.grace
+    def client_for_token(self, origin: str, token: str) -> str:
+        if not origin or origin != self.state.get("origin") or not token:
+            return ""
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        for cid, rec in (self.state.get("clients") or {}).items():
+            if hmac.compare_digest(digest, str(rec.get("token_sha256") or "")):
+                return str(cid)
+        if hmac.compare_digest(digest, str(self.state.get("token_sha256") or "")):
+            return "legacy"
+        return ""
+
+    def connected(self, client_id: str = "") -> bool:
+        if not self.paired():
+            return False
+        if client_id:
+            return client_id in (self.state.get("clients") or {}) and time.time() - self._last_poll_by_client.get(client_id, 0) < self.grace
+        return any(time.time() - t < self.grace for t in self._last_poll_by_client.values())
+
+    def default_client_id(self) -> str:
+        clients = self.state.get("clients") or {}
+        if "legacy" in clients:
+            return "legacy"
+        return next(iter(clients), "legacy")
+
+    def profiles(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            return [{"id": cid, "name": str(rec.get("name") or "Chrome profile")[:80], "paired": True, "connected": self.connected(cid),
+                     "last_seen": round(self._last_poll_by_client.get(cid, 0), 3) or None}
+                    for cid, rec in (self.state.get("clients") or {}).items()]
+
+    def rename_profile(self, client_id: str, name: str) -> Dict[str, Any]:
+        clean = re.sub(r"[\x00-\x1f\x7f]", "", str(name or "")).strip()[:80] or "Chrome profile"
+        with self.lock:
+            clients = dict(self.state.get("clients") or {})
+            if client_id not in clients:
+                raise BridgeError("Chrome profile is not paired", "client", 404)
+            clients[client_id] = {**clients[client_id], "name": clean}
+            self.state["clients"] = clients
+            self._save()
+        return {"ok": True, "client_id": client_id, "name": clean}
+
+    def login_requests(self, client_id: str) -> List[Dict[str, Any]]:
+        try:
+            return list(self.login_requests_provider(client_id) or []) if self.login_requests_provider else []
+        except Exception as e:
+            log(f"personal Chrome login request list failed: {type(e).__name__}", "warn")
+            return []
+
+    def login_claim(self, client_id: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        if not self.login_claim_handler:
+            return 503, {"error": "login requests are not available"}
+        try:
+            return self.login_claim_handler(client_id, body)
+        except BridgeError as e:
+            return e.status, {"error": str(e)}
+        except Exception as e:
+            log(f"personal Chrome login claim failed: {type(e).__name__}", "warn")
+            return 500, {"error": "login request could not be opened"}
+
+    def login_confirm(self, client_id: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        if not self.login_confirm_handler:
+            return 503, {"error": "login confirmation is not available"}
+        try:
+            return self.login_confirm_handler(client_id, body)
+        except BridgeError as e:
+            return e.status, {"error": str(e)}
+        except Exception as e:
+            log(f"personal Chrome login confirmation failed: {type(e).__name__}", "warn")
+            return 500, {"error": "login could not be confirmed"}
+
+    def unpair(self, client_id: str) -> bool:
+        with self.cv:
+            clients = dict(self.state.get("clients") or {})
+            if client_id not in clients:
+                return False
+            clients.pop(client_id, None)
+            self.state["clients"] = clients
+            if not clients:
+                self.state = {}
+            self._save()
+            for c in self.cmds.values():
+                if c.client_id == client_id and c.state != "done":
+                    c.error = "this Chrome profile was disconnected"
+                    c.ev.set()
+            self.cv.notify_all()
+        self._fire({"k": "profile_unpaired", "client_id": client_id})
+        return True
 
     def status(self) -> Dict[str, Any]:
         with self.lock:
             return {"mode": pc_mode(), "listening": self.srv is not None, "port": self.port, "paired": self.paired(), "connected": self.connected(), "epoch": self.epoch,
                     "pending_commands": len(self.queue), "last_poll_age": round(time.time() - self.last_poll, 1) if self.last_poll else None, "stats": dict(self.stats),
-                    "pairing_code_active": bool(self.pair_code and time.time() < self.pair_until)}
+                    "pairing_code_active": bool(self.pair_code and time.time() < self.pair_until), "profiles": self.profiles()}
 
     # -- server ------------------------------------------------------------------------------------------------------------------------------------
     def start(self) -> bool:
@@ -2520,12 +2655,25 @@ class PCHub:
                         log_every("pc:auth:" + why_, 60, f"personal chrome channel: extension request rejected - {why_} (the extension must be paired again: python bridge.py --pc-pair)", "warn")
                         time.sleep(0.2)
                         return self._reply(401, {"error": "unauthorized"})
+                    client_id = hub.client_for_token(origin, tok)
+                    if not client_id:
+                        return self._reply(401, {"error": "unauthorized"})
                     if path == "/pc/poll":
-                        return self._reply(200, {"commands": hub._poll(min(float(body.get("wait_ms") or 20000), 25000) / 1000.0, str(body.get("sid") or "")[:64])})
+                        return self._reply(200, {"commands": hub._poll(min(float(body.get("wait_ms") or 20000), 25000) / 1000.0, str(body.get("sid") or "")[:64], client_id)})
                     if path == "/pc/result":
-                        return self._reply(200, hub._result(body))
+                        return self._reply(200, hub._result(body, client_id))
                     if path == "/pc/events":
-                        return self._reply(200, hub._events(body))
+                        return self._reply(200, hub._events(body, client_id))
+                    if path == "/pc/login-requests":
+                        return self._reply(200, {"requests": hub.login_requests(client_id)})
+                    if path == "/pc/login-claim":
+                        return self._reply(*hub.login_claim(client_id, body))
+                    if path == "/pc/login-confirm":
+                        return self._reply(*hub.login_confirm(client_id, body))
+                    if path == "/pc/profile-name":
+                        return self._reply(200, hub.rename_profile(client_id, str(body.get("name") or "")))
+                    if path == "/pc/unpair":
+                        return self._reply(200, {"ok": hub.unpair(client_id)})
                     return self._reply(404, {"error": "not found"})
                 except (BrokenPipeError, ConnectionResetError):
                     pass
@@ -2580,21 +2728,18 @@ class PCHub:
 
     # -- request handlers --------------------------------------------------------------------------------------------------------------------------
     def _auth(self, origin: str, token: str) -> bool:
-        st = self.state
-        if not (st.get("token_sha256") and st.get("origin")) or not origin or origin != st["origin"]:
-            return False
-        return hmac.compare_digest(hashlib.sha256(token.encode("utf-8")).hexdigest(), st["token_sha256"])
+        return bool(self.client_for_token(origin, token))
 
     def _auth_why(self, origin: str, token: str) -> str:
         """The reason a request was refused, for the log (never the token itself)."""
         st = self.state
-        if not (st.get("token_sha256") and st.get("origin")):
+        if not self.paired():
             return "not paired yet"
         if not origin:
             return "no Origin header (not sent by the extension)"
         if origin != st["origin"]:
             return "the extension id differs from the paired one (the extension was reinstalled or is another copy)"
-        return "wrong or missing token"
+        return "wrong or missing profile token"
 
     def _pair(self, origin: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         with self.lock:
@@ -2611,41 +2756,55 @@ class PCHub:
                     self.pair_code = ""
                 time.sleep(0.3)
                 return 403, {"error": "wrong code"}
+            client_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(body.get("client_id") or "legacy"))[:64] or "legacy"
+            name = re.sub(r"[\x00-\x1f\x7f]", "", str(body.get("client_name") or "Chrome profile")).strip()[:80] or "Chrome profile"
+            if self.state.get("origin") and self.state["origin"] != origin:
+                return 403, {"error": "extension id differs from the paired extension"}
+            clients = dict(self.state.get("clients") or {})
+            if client_id not in clients and len(clients) >= 100:
+                return 429, {"error": "profile limit reached (100)"}
             token = secrets.token_urlsafe(32)
-            self.state = {"token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(), "origin": origin, "paired_at": time.time(), "version": PC_VERSION}
+            clients[client_id] = {"token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(), "name": name,
+                                  "paired_at": (clients.get(client_id) or {}).get("paired_at") or time.time(), "last_repaired_at": time.time()}
+            self.state = {"clients": clients, "origin": origin, "paired_at": self.state.get("paired_at") or time.time(), "version": PC_VERSION}
             self.pair_code = ""
             self._save()
         log("personal Chrome extension paired", "ok")
         return 200, {"token": token}
 
-    def _poll(self, wait: float, sid: str = "") -> List[Dict[str, Any]]:
+    def _poll(self, wait: float, sid: str = "", client_id: str = "legacy") -> List[Dict[str, Any]]:
         end = time.time() + wait
         with self.cv:
-            new_worker = bool(sid) and bool(getattr(self, "_sid", "")) and sid != self._sid          # the worker restarted faster than the grace time: its tabs must still be re-validated
+            client_id = client_id or "legacy"
+            old_sid = self._sid_by_client.get(client_id, "")
+            new_worker = bool(sid) and bool(old_sid) and sid != old_sid
             if sid:
-                self._sid = sid
-            if time.time() - self.last_poll > self.grace or new_worker:
+                self._sid_by_client[client_id] = sid
+            if time.time() - self._last_poll_by_client.get(client_id, 0) > self.grace or new_worker:
                 self.epoch += 1                                              # a new connection: listeners re-validate tabs
-                self._fire({"k": "reconnected", "epoch": self.epoch})
-            self.last_poll = time.time()
+                self._fire({"k": "reconnected", "epoch": self.epoch, "client_id": client_id})
+            self._last_poll_by_client[client_id] = self.last_poll = time.time()
             while True:
                 out = []
-                while self.queue:
+                for _ in range(len(self.queue)):
                     c = self.queue.popleft()
+                    if c.client_id != client_id:
+                        self.queue.append(c)
+                        continue
                     if c.cancelled:
                         continue
                     c.state, c.t_sent = "sent", time.time()
                     out.append({"id": c.id, "op": c.op, "args": c.args})
                 if out or time.time() >= end or self.srv is None:
-                    self.last_poll = time.time()
+                    self._last_poll_by_client[client_id] = self.last_poll = time.time()
                     return out
                 self.cv.wait(timeout=min(1.0, max(0.05, end - time.time())))
-                self.last_poll = time.time()
+                self._last_poll_by_client[client_id] = self.last_poll = time.time()
 
-    def _result(self, body: Dict[str, Any]) -> Dict[str, Any]:
+    def _result(self, body: Dict[str, Any], client_id: str = "legacy") -> Dict[str, Any]:
         with self.cv:
             c = self.cmds.get(str(body.get("id") or ""))
-            if c is None:
+            if c is None or c.client_id != client_id:
                 return {"ok": False}
             if body.get("ack"):
                 if c.state == "sent":
@@ -2664,7 +2823,7 @@ class PCHub:
             c.ev.set()
             return {"ok": True}
 
-    def _events(self, body: Dict[str, Any]) -> Dict[str, Any]:
+    def _events(self, body: Dict[str, Any], client_id: str = "legacy") -> Dict[str, Any]:
         evs = body.get("events")
         if not isinstance(evs, list):
             return {"ok": False}
@@ -2674,7 +2833,7 @@ class PCHub:
                 if e.get("k") == "detached":
                     log_every(f"pc:detached:{e.get('tab')}", 10, f"personal chrome: the debugger was detached from tab {e.get('tab')} (reason: {str(e.get('reason'))[:80]}) - "
                               "'canceled_by_user' means the yellow 'debugging this browser' bar was closed", "warn")
-                self._fire(e)
+                self._fire({**e, "client_id": client_id})
         return {"ok": True}
 
     def _fire(self, ev: Dict[str, Any]) -> None:
@@ -2693,17 +2852,18 @@ class PCHub:
             self.listeners.remove(fn)
 
     # -- commands (called from bridge threads) -----------------------------------------------------------------------------------------------------
-    def call(self, op: str, args: Optional[Dict[str, Any]] = None, timeout: float = 30.0, cancel: Optional[threading.Event] = None, connect_wait: float = 0.0) -> Any:
+    def call(self, op: str, args: Optional[Dict[str, Any]] = None, timeout: float = 30.0, cancel: Optional[threading.Event] = None, connect_wait: float = 0.0, client_id: str = "") -> Any:
         args = args or {}
         pc_validate_command(op, args)
+        client_id = str(client_id or self.default_client_id())
         t_end = time.time() + connect_wait
-        while not self.connected():
+        while not self.connected(client_id):
             if time.time() >= t_end:
-                why_ = self.not_ready_reason()
-                log_every("pc:notready:" + why_[:50], 30, f"personal chrome: command '{op}' could not be sent - {why_}", "warn")
+                why_ = self.not_ready_reason(client_id)
+                log_every("pc:notready:" + client_id + ":" + why_[:50], 30, f"personal chrome: command '{op}' could not be sent - {why_}", "warn")
                 raise PCError(why_)
             time.sleep(0.25)
-        c = _PCCmd(op, args)
+        c = _PCCmd(op, args, client_id)
         with self.cv:
             self.cmds[c.id] = c
             self.queue.append(c)
@@ -2720,7 +2880,7 @@ class PCHub:
                     c.cancelled = True
                     raise PCError(f"{op} timed out after {timeout:g}s" + ("" if c.state == "queued" else "; the browser may or may not have executed it"),
                                   unknown_outcome=c.state != "queued" and not c.safe)
-                if not self.connected():                                      # extension went away while the command was in flight
+                if not self.connected(client_id):                             # this account's profile went away while the command was in flight
                     with self.cv:
                         if c.state in ("sent", "acked") and c.safe:
                             c.state = "queued"
@@ -2743,11 +2903,16 @@ class PCHub:
             with self.cv:
                 self.cmds.pop(c.id, None)
 
-    def not_ready_reason(self) -> str:
+    def not_ready_reason(self, client_id: str = "") -> str:
         if not self.srv:
             return "the personal-Chrome channel is not listening (port busy?); set BRIDGE_PC_PORT or close the program using it"
         if not self.paired():
             return "the Chrome extension is not paired yet: " + pc_instructions(self)
+        if client_id and client_id not in (self.state.get("clients") or {}):
+            return "the Chrome profile assigned to this account is not paired; pair that profile in the Bridge dashboard"
+        if client_id and not self.connected(client_id):
+            label = next((str(x.get("name") or cid) for cid, x in (self.state.get("clients") or {}).items() if cid == client_id), client_id)
+            return f"Chrome profile '{label}' is paired but not connected; open that Chrome profile and enable the Bridge extension"
         return "your Chrome is not connected to the bridge (is Chrome open with the 'AI Web Bridge - Personal Chrome' extension enabled?)"
 
 
@@ -3432,8 +3597,10 @@ class PCContext:
     """Plays the role of the Playwright BrowserContext for one account: the tabs it opens in the user's own Chrome (never other tabs), cookie access for the
     site, init scripts, bindings, CDP sessions. Closing it closes only the tabs it opened."""
 
-    def __init__(self, hub: PCHub, acct_id: str = "", background: bool = True):
-        self.hub, self.acct_id, self.background = hub, acct_id, background
+    def __init__(self, hub: PCHub, acct_id: str = "", background: bool = True, client_id: str = "", login_tab: Optional[int] = None):
+        self.client_id = str(client_id or hub.default_client_id())
+        self.hub, self.acct_id, self.background = _PCProfileClient(hub, self.client_id), acct_id, background
+        self.login_tab = login_tab
         self.cancel = threading.Event()
         self._pages: Dict[int, PCPage] = {}
         self._handlers: Dict[str, List[Callable[..., Any]]] = {}
@@ -3485,7 +3652,7 @@ class PCContext:
             return
         with self._lock:
             st = self._read_state()
-            st[self.acct_id] = [{"tab": p.tab_id, "host": (urllib.parse.urlsplit(p._url).hostname or "")} for p in self._pages.values() if not p._closed]
+            st[self.acct_id] = [{"tab": p.tab_id, "host": (urllib.parse.urlsplit(p._url).hostname or ""), "client_id": self.client_id} for p in self._pages.values() if not p._closed]
             tmp = self._state_path().with_suffix(".tmp")
             tmp.write_text(json.dumps(st), "utf-8")
             os.replace(tmp, self._state_path())
@@ -3494,7 +3661,10 @@ class PCContext:
         """After a bridge restart the tabs this account opened earlier are re-adopted - only if the browser still has them, they are still bridge-owned, and the site matches."""
         if not self.acct_id or not self.hub.connected():
             return
-        saved = {int(x["tab"]): x.get("host", "") for x in (self._read_state().get(self.acct_id) or []) if isinstance(x, dict) and isinstance(x.get("tab"), int)}
+        saved = {int(x["tab"]): x.get("host", "") for x in (self._read_state().get(self.acct_id) or []) if isinstance(x, dict) and isinstance(x.get("tab"), int)
+                 and str(x.get("client_id") or "legacy") == self.client_id}
+        if isinstance(self.login_tab, int):
+            saved.setdefault(self.login_tab, "")
         if not saved:
             return
         try:
@@ -3578,6 +3748,36 @@ class PCContext:
         r = pg._cdp("Network.getCookies", {"urls": want}) or {}
         return [{"name": c["name"], "value": c["value"], "domain": c.get("domain", ""), "path": c.get("path", "/"), "expires": c.get("expires", -1), "httpOnly": c.get("httpOnly", False),
                  "secure": c.get("secure", False), "sameSite": c.get("sameSite", "Lax")} for c in r.get("cookies", [])]
+
+
+class _PCProfileClient:
+    """A profile-bound view of the shared local hub. It never receives commands/events for another Chrome profile."""
+    def __init__(self, hub: PCHub, client_id: str):
+        self._hub, self.client_id = hub, client_id
+        self._listeners: Dict[Callable[[Dict[str, Any]], None], Callable[[Dict[str, Any]], None]] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._hub, name)
+
+    def call(self, op: str, args: Optional[Dict[str, Any]] = None, **kw: Any) -> Any:
+        return self._hub.call(op, args, client_id=self.client_id, **kw)
+
+    def connected(self) -> bool:
+        return self._hub.connected(self.client_id)
+
+    def add_listener(self, fn: Callable[[Dict[str, Any]], None]) -> None:
+        if fn in self._listeners:
+            return
+        def filtered(ev: Dict[str, Any]) -> None:
+            if ev.get("client_id") == self.client_id:
+                fn(ev)
+        self._listeners[fn] = filtered
+        self._hub.add_listener(filtered)
+
+    def remove_listener(self, fn: Callable[[Dict[str, Any]], None]) -> None:
+        wrapped = self._listeners.pop(fn, None)
+        if wrapped:
+            self._hub.remove_listener(wrapped)
 
     def add_cookies(self, cookies: List[Dict[str, Any]]) -> None:
         pg = next(iter(self.pages), None) or self.new_page()
@@ -3774,8 +3974,9 @@ class AccountBrowser:
     """One persistent browser profile per account, owned by one thread (Playwright sync API is thread-bound).
     Closes itself after an idle period so it does not hold RAM."""
 
-    def __init__(self, acct_id: str, profile: Path, idle: float = 90):
+    def __init__(self, acct_id: str, profile: Path, idle: float = 90, pc_client_id: str = "", login_tab: Optional[int] = None):
         self.acct_id, self.profile, self.idle = acct_id, profile, idle
+        self.pc_client_id, self.login_tab = str(pc_client_id or ""), login_tab
         self.q: "queue.Queue" = queue.Queue()
         self.thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
@@ -3803,9 +4004,11 @@ class AccountBrowser:
     def _open(self, pw: Any, headless: bool) -> Any:
         if pc_mode() == "personal_chrome":                      # the user's own Chrome: a context that owns only the tabs it opens (headless=True -> background tabs)
             hub = pc_hub(self.profile.parent.parent)
-            if not hub.connected():
-                hub = pc_ensure_ready(self.profile.parent.parent)
-            return PCContext(hub, self.acct_id, background=bool(headless))
+            if hub.srv is None:
+                hub.start()
+            cid = self.pc_client_id or hub.default_client_id()
+            login_tab, self.login_tab = self.login_tab, None
+            return PCContext(hub, self.acct_id, background=bool(headless), client_id=cid, login_tab=login_tab)
         self.profile.mkdir(parents=True, exist_ok=True)
         last: Optional[Exception] = None
         for ch in ("chrome", "msedge", None):
@@ -13052,7 +13255,9 @@ class Accounts:
     def browser(self, aid: str) -> AccountBrowser:
         with self.lock:
             if aid not in self.browsers:
-                self.browsers[aid] = AccountBrowser(aid, self.store.path("profiles", aid), self.cfg["headless_idle_seconds"])
+                acct = self.get(aid) or {}
+                self.browsers[aid] = AccountBrowser(aid, self.store.path("profiles", aid), self.cfg["headless_idle_seconds"],
+                                                   str(acct.get("pc_client_id") or ""), acct.get("pc_login_tab"))
             return self.browsers[aid]
 
     def public(self) -> List[Dict[str, Any]]:
@@ -13135,15 +13340,16 @@ class Accounts:
                 return str(e)
             raise
 
-    def add(self, url: str, label: str, learn: bool = True) -> Tuple[Dict[str, Any], Job]:
+    def add(self, url: str, label: str, learn: bool = True, defer_login: bool = False, pc_client_id: str = "") -> Tuple[Dict[str, Any], Optional[Job]]:
         site = normalize_site_input(url)                         # O2: raises a plain-language BridgeError for junk / non-http(s)
         note = self.site_guard(site["open_url"])
         host = site["host"]
         same = [x.get("label") for x in self.items if x.get("type") != "api" and (x.get("identity_host") or x.get("host")) == site["identity_host"]]
         acct = {"id": uuid.uuid4().hex[:8], "label": label or host, "host": host, "url": site["open_url"], "input": site["input"],
-                "identity_host": site["identity_host"], "state": "learning",
+                "identity_host": site["identity_host"], "state": "login_pending" if defer_login else "learning",
                 "tier": "", "serving_mode": "browser", "created": now(), "requests": 0, "last_error": "", "cooldown_until": 0,
-                "ok": 0, "fail": 0, "streak_fail": 0, "ema_ms": 0, "health": None}
+                "ok": 0, "fail": 0, "streak_fail": 0, "ema_ms": 0, "health": None,
+                "pc_client_id": str(pc_client_id or ""), "login_client_id": str(pc_client_id or ""), "login_learn": bool(learn) if defer_login else False}
         if same:
             acct["note"] = "you already have an account for this site (" + ", ".join(str(x) for x in same[:3]) + "); this one is separate"
         elif note:
@@ -13152,10 +13358,85 @@ class Accounts:
         with self.lock:
             self.items.append(acct)
             self.save()
+        if defer_login:
+            acct["login_requested_at"] = now()
+            acct["login_claimed_at"] = 0
+            self.save()
+            self.lc(acct["id"], "needs_login", "choose this account in the Chrome extension, log in, then confirm")
+            return acct, None
         self.lc(acct["id"], "logging_in", "a visible browser opens so the owner can log in")
         if learn:
             self.begin_learn(acct["id"], "learn")
         return acct, self.start_job(acct, "login" if learn else "login-only")
+
+    def browser_login_requests(self, client_id: str) -> List[Dict[str, Any]]:
+        with self.lock:
+            rows = []
+            for a in self.items:
+                if a.get("type") == "api" or a.get("state") not in ("login_pending", "login_claimed"):
+                    continue
+                target = str(a.get("login_client_id") or "")
+                if target and target != client_id:
+                    continue
+                rows.append({"id": a["id"], "label": str(a.get("label") or a.get("host") or "Account")[:80], "host": a.get("host", ""),
+                             "url": a.get("url", ""), "claimed": bool(target), "created": a.get("login_requested_at", a.get("created", 0))})
+            return rows[:100]
+
+    def claim_browser_login(self, client_id: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        aid = str(body.get("account_id") or "")[:80]
+        with self.lock:
+            a = self.get(aid)
+            if not a or a.get("type") == "api" or a.get("state") not in ("login_pending", "login_claimed"):
+                return 404, {"error": "login request is no longer available"}
+            target = str(a.get("login_client_id") or "")
+            if target and target != client_id:
+                return 409, {"error": "this account is assigned to a different Chrome profile"}
+            a["login_client_id"], a["state"], a["login_claimed_at"] = client_id, "login_claimed", now()
+            a["pc_client_id"] = client_id
+            self.save()
+            return 200, {"account_id": aid, "label": str(a.get("label") or a["host"])[:80], "url": a["url"], "host": a["host"]}
+
+    def confirm_browser_login(self, client_id: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        aid, tab = str(body.get("account_id") or "")[:80], body.get("tab")
+        url = str(body.get("url") or "")[:2048]
+        if not isinstance(tab, int) or isinstance(tab, bool) or tab < 0:
+            return 400, {"error": "a valid tab id is required"}
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return 400, {"error": "the confirmed tab must be a web page"}
+        with self.lock:
+            a = self.get(aid)
+            if not a or a.get("type") == "api" or a.get("state") != "login_claimed":
+                return 404, {"error": "login request is no longer available"}
+            if str(a.get("login_client_id") or "") != client_id:
+                return 409, {"error": "this account belongs to a different Chrome profile"}
+            want = str(a.get("identity_host") or a.get("host") or "").lower().rstrip(".")
+            got = parsed.hostname.lower().rstrip(".")
+            if got != want:
+                return 400, {"error": f"open {want} in this profile before confirming; current tab is {got}"}
+            a["pc_client_id"], a["pc_login_tab"] = client_id, tab
+            a["state"], a["last_error"] = "logging_in", ""
+            learn = bool(a.pop("login_learn", False))
+            a.pop("login_claimed_at", None)
+            self.save()
+        self.lc(aid, "logging_in", "owner confirmed login from the assigned Chrome profile")
+        job = self.start_job(a, "login" if learn else "login-only", owner_confirmed=True)
+        return 200, {"ok": True, "account_id": aid, "job": job.id}
+
+    def request_browser_login(self, aid: str, relearn: bool = False) -> Dict[str, Any]:
+        with self.lock:
+            a = self.get(aid)
+            if not a or a.get("type") == "api":
+                raise BridgeError("unknown browser account", "client", 404)
+            if any(not j.done and j.account == aid for j in self.jobs.values()):
+                raise BridgeError("this account already has a running job", "client", 409)
+            a["state"], a["login_learn"] = "login_pending", bool(relearn)
+            a["login_client_id"] = str(a.get("pc_client_id") or "")
+            a["login_requested_at"], a["login_claimed_at"] = now(), 0
+            a.pop("pc_login_tab", None)
+            self.save()
+        self.lc(aid, "needs_login", "choose this account in its Chrome extension, log in, then confirm")
+        return {"ok": True, "pending": True, "account_id": aid, "pc_client_id": a.get("login_client_id", "")}
 
     def add_api(self, kind: str, base: str, key: str, model: str, label: str) -> Dict[str, Any]:
         if kind not in ("openai", "anthropic") or not base.startswith("http") or not key:
@@ -13330,9 +13611,10 @@ class Accounts:
                 self.lc(a["id"], "needs_login", "the learned recipe was forgotten")
         self.save()
 
-    def start_job(self, acct: Dict[str, Any], kind: str, headless: Optional[bool] = None, login_timeout: int = 600) -> Job:
+    def start_job(self, acct: Dict[str, Any], kind: str, headless: Optional[bool] = None, login_timeout: int = 600, owner_confirmed: bool = False) -> Job:
         job = Job(kind, acct["label"])
         job.account = acct["id"]
+        job.user_done = bool(owner_confirmed)
         if kind in ("login", "login-only", "relearn"):
             acct["login_run"] = uuid.uuid4().hex[:8]                 # O3: one login run = one acceptance (see finish_login)
         job.headless, job.login_timeout = headless, login_timeout
@@ -13372,6 +13654,12 @@ class Accounts:
             job.clear_owner()
             if job.ok:
                 job.set_stage("finish", "done")
+            self.save()
+            acct.pop("pc_login_tab", None)
+            try:
+                self.browser(acct["id"]).login_tab = None
+            except Exception:
+                pass
             self.save()
             try:
                 if self.get(acct["id"]) is not None:
@@ -18012,6 +18300,10 @@ class App:
         self.engine = RoutingEngine(store, cfg, self.acc)
         self.router = Router(self.acc, cfg, self.engine)
         self.acc.on_learned = self._after_learn
+        self.pc_hub = pc_hub(store.home, start=False)
+        self.pc_hub.login_requests_provider = self.acc.browser_login_requests
+        self.pc_hub.login_claim_handler = self.acc.claim_browser_login
+        self.pc_hub.login_confirm_handler = self.acc.confirm_browser_login
         self.started = now()
         want = str(cfg["tokenizer"])
         if set_tokenizer(want) != want:                          # E3: an unknown plugin name is not fatal; the conservative built-in is used and the choice is visible in /api/context
@@ -18050,7 +18342,7 @@ def pick_workspace_directory() -> str:
         raise BridgeError(f"Windows folder picker could not open: {type(e).__name__}: {e}", "client", 500)
 
 
-def open_workspace_tool(app_name: str, folder: str, port: int, api_key: str) -> Dict[str, Any]:
+def open_workspace_tool(app_name: str, folder: str, port: int, api_key: str, model: str = "") -> Dict[str, Any]:
     """Launch one supported local tool in a user-selected folder without invoking a shell."""
     p = Path(folder).expanduser().resolve()
     if not p.is_dir():
@@ -18069,6 +18361,11 @@ def open_workspace_tool(app_name: str, folder: str, port: int, api_key: str) -> 
             raise BridgeError("select an API key for Claude Code first", "client", 400)
         env.update(ANTHROPIC_BASE_URL=f"http://127.0.0.1:{int(port)}", ANTHROPIC_API_KEY=api_key,
                    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
+        if model:
+            model = str(model)[:100]
+            if not re.fullmatch(r"[A-Za-z0-9._:/-]+", model):
+                raise BridgeError("invalid Claude Code model or pool name", "client", 400)
+            env["ANTHROPIC_MODEL"] = model
     elif app_name in ("vscode", "cursor"):
         args.append(str(p))
     elif app_name == "powershell":
@@ -18453,8 +18750,9 @@ class Handler(BaseHTTPRequestHandler):
             body_ = self._body()
             key_id = str(body_.get("key_id") or "")
             selected_key = next((str(k.get("key") or "") for k in cfg["keys"] if k.get("id") == key_id), "")
+            selected_model = str(body_.get("model") or "")[:100]
             try:
-                result_ = open_workspace_tool(str(body_.get("app") or ""), str(body_.get("folder") or ""), int(cfg["port"]), selected_key)
+                result_ = open_workspace_tool(str(body_.get("app") or ""), str(body_.get("folder") or ""), int(cfg["port"]), selected_key, selected_model)
             except BridgeError as e_:
                 return self._json(e_.status, {"error": str(e_)})
             return self._json(200, result_)
@@ -18495,7 +18793,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "keys": cfg["keys"], "default_account": cfg["default_account"], "presets": PRESETS,
                                     "settings": {k: cfg[k] for k in ("continuity", "tool_desc_limit", "system_limit", "result_limit",
                                                                      "history_limit", "headless_idle_seconds", "health_interval_min", "cache_seconds", "summarize_history")},
-                                    "stats": app.router.stats, "jobs": [j.public() for j in list(acc.jobs.values())[-8:]],
+                                    "stats": app.router.stats, "jobs": [j.public() for j in list(acc.jobs.values())[-8:]], "pc_profiles": app.pc_hub.profiles(),
                                     "home": str(app.store.home)})
         if parts == ["log"]:
             return self._json(200, {"lines": list(_LOG)[-250:], "file": str(_LOGFILE["path"] or "")})
@@ -18588,8 +18886,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"account": a})
             if not d.get("url"):
                 raise BridgeError("url required", "client", 400)
-            a, job = acc.add(d["url"], d.get("label", ""), learn=bool(d.get("learn", True)))
-            return self._json(200, {"account": a, "job": job.id})
+            client_id_ = str(d.get("pc_client_id") or "")[:64]
+            if d.get("manual_login") and client_id_ and client_id_ not in (app.pc_hub.state.get("clients") or {}):
+                raise BridgeError("Chrome profile is no longer paired; choose a connected profile and try again", "client", 409)
+            a, job = acc.add(d["url"], d.get("label", ""), learn=bool(d.get("learn", True)), defer_login=bool(d.get("manual_login", False)), pc_client_id=client_id_)
+            return self._json(200, {"account": a, "job": job.id if job else None, "login_pending": bool(d.get("manual_login", False))})
         if len(parts) >= 2 and parts[0] == "accounts":
             aid = parts[1]
             if parts[2:] == ["serving-mode"] and method == "POST":
@@ -18598,11 +18899,39 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, acc.set_serving_mode(aid, str(body_.get("mode") or "")))
                 except BridgeError as e_:
                     return self._json(e_.status, {"error": str(e_)})
+            if parts[2:] == ["chrome-profile"] and method == "POST":
+                body_ = self._body()
+                try:
+                    a_ = acc.get(aid)
+                    if not a_ or a_.get("type") == "api":
+                        raise BridgeError("unknown browser account", "client", 404)
+                    client_id_ = str(body_.get("client_id") or "")[:64]
+                    if client_id_ and client_id_ not in (app.pc_hub.state.get("clients") or {}):
+                        raise BridgeError("Chrome profile is not paired yet", "client", 409)
+                    if any(not j.done and j.account == aid for j in acc.jobs.values()) or acc.inflight.get(aid, 0):
+                        raise BridgeError("cannot change profile while an account job is running", "client", 409)
+                    browser_ = acc.browser(aid)
+                    browser_.close()
+                    tabs_state_ = app.store.read("personal_chrome/tabs.json", {}) or {}
+                    tabs_state_.pop(aid, None)
+                    app.store.write("personal_chrome/tabs.json", tabs_state_, private=True)
+                    a_["pc_client_id"] = client_id_
+                    if a_.get("state") in ("login_pending", "login_claimed"):
+                        a_["login_client_id"] = client_id_
+                        a_["state"] = "login_pending"
+                        a_["login_claimed_at"] = 0
+                    acc.save()
+                    browser_.pc_client_id = client_id_
+                    return self._json(200, {"ok": True, "client_id": client_id_})
+                except BridgeError as e_:
+                    return self._json(e_.status, {"error": str(e_)})
             if method == "DELETE" and len(parts) == 2:
                 acc.remove(aid)
                 return self._json(200, {"ok": True})
             if parts[2:] in (["relogin"], ["relearn"]) and method == "POST":
-                return self._json(200, {"job": acc.relogin(aid, parts[2] == "relearn").id})
+                if parts[2] == "relogin":
+                    return self._json(200, acc.request_browser_login(aid, False))
+                return self._json(200, {"job": acc.relogin(aid, True).id})
             if parts[2:] == ["human-done"] and method == "POST":              # O7: "I solved it"
                 try:
                     return self._json(200, acc.human_done(aid))
@@ -18899,8 +19228,8 @@ h2{font-size:14px;margin:0 0 10px}h3{font-size:13px;margin:14px 0 6px;color:var(
 button,input,select{font:inherit;color:var(--tx);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 10px}
 button{cursor:pointer}button:hover{border-color:var(--acc)}button.p{background:var(--acc);color:#fff;border-color:var(--acc)}button.d:hover{border-color:var(--bad);color:var(--bad)}.sm{font-size:12px;padding:3px 9px}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}.row>input{flex:1;min-width:140px}
-.workspace-tools{display:grid;grid-template-columns:minmax(150px,1fr) minmax(210px,1.35fr) auto auto;gap:8px;align-items:stretch;margin-top:10px}
-.workspace-tools select{min-width:0;width:100%;max-width:none}.workspace-tools button{white-space:nowrap}
+.workspace-tools{display:grid;grid-template-columns:minmax(160px,1fr) minmax(210px,1.35fr) auto auto;gap:8px;align-items:end;margin-top:10px}
+.workspace-key-wrap{display:grid;gap:3px;min-width:0;font-size:11px}.workspace-key-wrap select{min-width:0;width:100%;max-width:none}.workspace-tools>select{min-width:0;width:100%;max-width:none}.workspace-tools button{white-space:nowrap;min-height:38px}
 .mut{color:var(--mut)}.ltr{direction:ltr;unicode-bidi:plaintext;text-align:left}.k{font-family:ui-monospace,Consolas,monospace;font-size:12px;word-break:break-all;direction:ltr;text-align:left}
 code,pre{font-family:ui-monospace,Consolas,monospace;font-size:12px}pre{direction:ltr;text-align:left;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;max-height:280px;margin:8px 0 0;white-space:pre-wrap;word-break:break-all}
 table{width:100%;border-collapse:collapse}td,th{text-align:start;padding:7px 6px;border-bottom:1px solid var(--line);vertical-align:middle}th{color:var(--mut);font-weight:500;font-size:12px}
@@ -18922,8 +19251,9 @@ ol.steps li.bad i{background:var(--bad);border-color:var(--bad);color:#fff}ol.st
 .mini{max-height:120px;font-size:11px;margin-top:6px}details{margin-top:10px}summary{cursor:pointer;color:var(--mut);font-size:13px}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:4px 18px}label.f{display:flex;align-items:center;gap:6px;margin:5px 0}input[type=number]{width:96px}
 .acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
-@media(max-width:760px){.workspace-tools{grid-template-columns:1fr 1fr}.workspace-tools select{grid-column:span 2}.workspace-tools button{width:100%}}
-@media(max-width:640px){header{padding:10px 12px}nav{padding:0 6px}nav button{padding:9px 11px}main{padding:10px}.row>*{max-width:100%}.row>input,.row>select{min-width:0;flex:1 1 100%}.workspace-tools{grid-template-columns:1fr}.workspace-tools select,.workspace-tools button{grid-column:auto;width:100%;min-height:42px}table{display:block;overflow-x:auto;white-space:nowrap}.steps li{font-size:10px!important}.card{border-radius:13px}}
+.pool-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:8px;margin:10px 0}.pool-item{display:flex;align-items:center;gap:9px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--surface-2,#fff)}.pool-item input{accent-color:var(--accent)}.pool-item .mut{margin-inline-start:auto}.profile-assign{min-width:min(100%,250px)}
+@media(max-width:760px){.workspace-tools{grid-template-columns:1fr 1fr}.workspace-tools>select,.workspace-key-wrap{grid-column:span 2}.workspace-tools button{width:100%}}
+@media(max-width:640px){header{padding:10px 12px}nav{padding:0 6px}nav button{padding:9px 11px}main{padding:10px}.row>*{max-width:100%}.row>input,.row>select{min-width:0;flex:1 1 100%}.workspace-tools{grid-template-columns:1fr}.workspace-tools>select,.workspace-key-wrap,.workspace-tools button{grid-column:auto;width:100%;min-height:42px}table{display:block;overflow-x:auto;white-space:nowrap}.steps li{font-size:10px!important}.card{border-radius:13px}}
 @media(min-width:1600px){main{max-width:1480px}}
 </style></head><body>
 <header><h1>AI Web Bridge <span class="mut ltr">v__VERSION__</span></h1><span class="pill ltr" id="st">…</span><span class="pill ltr" id="sts"></span><span class="sp"></span><select id="theme" aria-label="Theme" onchange="setTheme(this.value)"><option value="system">System</option><option value="light">Light</option><option value="mint">Mint</option><option value="berry">Berry</option></select><button class="sm" id="langbtn" onclick="setLang(lang=='fa'?'en':'fa')"></button></header>
@@ -18932,19 +19262,22 @@ ol.steps li.bad i{background:var(--bad);border-color:var(--bad);color:#fff}ol.st
 <div class="view on" id="v_accounts">
 <div class="card" id="pcsetup"><h2 data-i="pc_title"></h2><p class="mut" data-i="pc_intro"></p>
 <div class="row" style="margin-top:8px"><button class="p" id="pc_start" onclick="startPcSetup()" data-i="pc_start"></button><span id="pc_state" class="mut"></span></div>
+<p class="mut" id="pc_profile_status"></p>
 <div id="pc_steps" hidden><ol class="steps"><li class="done"><i>1</i><br><span data-i="pc_step1"></span></li><li><i>2</i><br><span data-i="pc_step2"></span></li><li><i>3</i><br><span data-i="pc_step3"></span></li></ol>
 <div class="att"><b data-i="pc_code_label"></b> <code class="ltr" id="pc_code"></code> <button class="sm" onclick="copyPcCode()" data-i="pc_copy"></button><br><span class="mut" data-i="pc_code_note"></span></div>
 <p class="mut"><span data-i="pc_port_label"></span> <code class="ltr" id="pc_port"></code></p><p class="mut"><span data-i="pc_folder_label"></span> <code class="ltr" id="pc_folder"></code></p><p class="mut" data-i="pc_security"></p><a href="chrome://extensions" target="_blank" rel="noreferrer" data-i="pc_open_link"></a></div></div>
 <div class="card"><h2 data-i="add_title"></h2>
-<div class="row" style="margin-top:0"><select id="preset"></select><input id="url" class="ltr" data-ph="url_ph" oninput="urlPrev()"><input id="label" data-ph="label_ph"><button class="p" onclick="addAcc()" data-i="add_btn"></button></div>
+<div class="row" style="margin-top:0"><select id="preset"></select><input id="url" class="ltr" data-ph="url_ph" oninput="urlPrev()"><input id="label" data-ph="label_ph"><select id="account_profile" aria-label="Chrome profile"></select><button class="p" onclick="addAcc()" data-i="add_btn"></button></div>
 <label class="f"><input type="checkbox" id="learn_on_add"><span data-i="learn_on_add"></span></label>
 <p class="mut" id="urlprev" style="margin:6px 0 0"></p><p class="mut" id="urlhint" style="margin:6px 0 0" data-i="add_hint"></p>
 <details><summary data-i="api_title"></summary><div class="row"><select id="akind"><option value="openai">OpenAI-compatible</option><option value="anthropic">Anthropic-compatible</option></select>
 <input id="abase" class="ltr" placeholder="https://api.deepseek.com"><input id="akey" class="ltr" type="password" placeholder="API key"><input id="amodel" class="ltr" placeholder="model id"><input id="alabel" data-ph="label_ph"><button class="p" onclick="addApi()" data-i="api_btn"></button></div></details></div>
+<div class="card" id="poolcard"><h2 data-i="strategy_title"></h2><p class="mut" data-i="strategy_hint"></p><div id="strategy_accounts" class="pool-list"></div><div class="row"><label class="mut" for="strategy_kind" data-i="strategy_policy"></label><select id="strategy_kind" onchange="renderStrategy()"><option value="auto" data-i="strategy_auto"></option><option value="rotation" data-i="strategy_rotation"></option><option value="failover" data-i="strategy_failover"></option><option value="lowest_latency" data-i="strategy_latency"></option><option value="best_fit" data-i="strategy_best_fit"></option><option value="manual_approval" data-i="strategy_manual"></option><option value="fixed" data-i="strategy_fixed"></option></select><button class="p" onclick="saveStrategy()" data-i="strategy_save"></button></div><p class="mut" id="strategy_status"></p></div>
+<div class="card" id="profiles_card"><h2 data-i="pc_profiles"></h2><div id="pc_profiles_list" class="pool-list"></div></div>
 <div id="acc"></div>
 <div class="card" id="workspacecard"><h2 data-i="workspace_title"></h2><p class="mut" data-i="workspace_hint"></p>
 <div class="row"><input id="workspace_path" class="ltr" data-ph="workspace_ph" readonly><button class="sm" onclick="selectWorkspace()" data-i="workspace_select"></button></div>
-<div class="workspace-tools"><select id="workspace_app" aria-label="Application" onchange="updateWorkspaceCommand()"><option value="claude">Claude Code</option><option value="vscode">Visual Studio Code</option><option value="cursor">Cursor</option><option value="powershell">PowerShell</option><option value="cmd">Command Prompt</option></select><select id="workspace_key" aria-label="API key" onchange="updateWorkspaceCommand()"></select><button class="p" onclick="openWorkspace()" data-i="workspace_open"></button><button class="sm" onclick="copyWorkspaceCommand()" data-i="workspace_copy"></button></div>
+<div class="workspace-tools"><select id="workspace_app" aria-label="Application" onchange="updateWorkspaceCommand()"><option value="claude">Claude Code</option><option value="vscode">Visual Studio Code</option><option value="cursor">Cursor</option><option value="powershell">PowerShell</option><option value="cmd">Command Prompt</option></select><label class="workspace-key-wrap"><span class="mut" data-i="workspace_key_label"></span><select id="workspace_key" aria-label="API key" onchange="updateWorkspaceCommand()"></select></label><button class="p" onclick="openWorkspace()" data-i="workspace_open"></button><button class="sm" onclick="copyWorkspaceCommand()" data-i="workspace_copy"></button></div>
 <pre id="workspace_command" class="mini"></pre><span id="workspace_status" class="mut"></span></div></div>
 
 <div class="view" id="v_connect">
@@ -19050,11 +19383,14 @@ b_relogin:'ورود دوباره',b_relearn:'یادگیری دوباره',b_star
 req:'درخواست',fails:'خطا',healthy:'سالم',unhealthy:'ناسالم',
 c_copy:'کپی',c_revoke:'ابطال',docs:'مستندات',tool:'ابزار',export:'خروجی',forget:'فراموش کن',yes:'بله',no:'خیر',any_acc:'هر حسابی',running:'اجرا روی پورت ',errors:'خطا',
 cf_rm:'این حساب و پروفایل مرورگرش حذف شود؟',cf_forget:'recipe یادگرفته‌شده‌ی این سایت فراموش شود؟ در ورود بعدی دوباره یاد گرفته می‌شود.'}};
+L.en.add_btn='Add web account';L.en.add_hint='The account is saved as soon as you confirm login in the selected Chrome profile. Learning is optional and can be started later.';L.en.account_profile='Chrome profile';L.en.profile_any='Any paired profile';L.en.profile_unpaired='No paired Chrome profiles yet';L.en.pc_profiles='Chrome profiles';L.en.profile_assign='Use in profile';L.en.login_queued='Login request queued. Open the AI Web Bridge extension in the selected Chrome profile.';L.en.strategy_title='Claude Code account pool';L.en.strategy_hint='Choose the accounts Claude Code may use and how it selects among them. Only enabled, eligible accounts in this list are considered.';L.en.strategy_save='Save routing strategy';L.en.strategy_fixed='Fixed account';L.en.strategy_auto='Automatic selection';L.en.strategy_rotation='Rotate conversations through selected accounts';L.en.strategy_failover='Primary, then retry-safe failover';L.en.strategy_latency='Lowest measured latency';L.en.strategy_best_fit='Best fit for the request';L.en.strategy_manual='Ask before changing account';L.en.strategy_policy='Selection strategy';L.en.strategy_saved='Routing strategy saved.';L.en.strategy_empty='Select at least one account.';L.en.strategy_choose_one='Fixed routing requires exactly one selected account.';L.en.strategy_needs_two='This strategy needs at least two selected accounts.';L.en.profile_disconnected='Disconnected';L.en.profile_connected='Connected';L.en.profile_none='No Chrome profiles paired. Set one up above.';L.en.profile_changed='Account profile saved.';
+L.fa.add_btn='افزودن حساب وب';L.fa.add_hint='پس از تأیید ورود در افزونه‌ی پروفایل انتخاب‌شده، حساب بلافاصله ذخیره و قابل استفاده است. یادگیری اختیاری است و بعداً جداگانه آغاز می‌شود.';L.fa.account_profile='پروفایل Chrome';L.fa.profile_any='هر پروفایل متصل';L.fa.profile_unpaired='هنوز پروفایل Chrome متصل نیست';L.fa.pc_profiles='پروفایل‌های Chrome';L.fa.profile_assign='پروفایل استفاده';L.fa.login_queued='درخواست ورود ثبت شد؛ افزونه‌ی AI Web Bridge را در پروفایل Chrome انتخاب‌شده باز کنید.';L.fa.strategy_title='حساب‌های قابل استفاده در Claude Code';L.fa.strategy_hint='حساب‌هایی را که Claude Code اجازه‌ی استفاده از آن‌ها را دارد و روش انتخاب را مشخص کنید. فقط حساب‌های فعال و واجدشرایط همین فهرست بررسی می‌شوند.';L.fa.strategy_save='ذخیره‌ی سیاست استفاده';L.fa.strategy_fixed='یک حساب ثابت';L.fa.strategy_auto='انتخاب خودکار';L.fa.strategy_rotation='چرخش گفت‌وگوها میان حساب‌های انتخاب‌شده';L.fa.strategy_failover='حساب اصلی، سپس جایگزینی امن در خطای قابل‌تکرار';L.fa.strategy_latency='کمترین زمان پاسخ اندازه‌گیری‌شده';L.fa.strategy_best_fit='انتخاب مناسب‌تر برای درخواست';L.fa.strategy_manual='پیش از تغییر حساب تأیید بگیر';L.fa.strategy_policy='روش انتخاب حساب';L.fa.strategy_saved='سیاست مسیریابی ذخیره شد.';L.fa.strategy_empty='حداقل یک حساب انتخاب کنید.';L.fa.strategy_choose_one='مسیریابی ثابت به دقیقاً یک حساب نیاز دارد.';L.fa.strategy_needs_two='این روش حداقل به دو حساب انتخاب‌شده نیاز دارد.';L.fa.profile_disconnected='قطع';L.fa.profile_connected='متصل';L.fa.profile_none='هنوز پروفایل Chrome جفت نشده است؛ ابتدا از بالا یکی را وصل کنید.';L.fa.profile_changed='پروفایل حساب ذخیره شد.';
+L.en.workspace_key_label='Bridge API key';L.fa.workspace_key_label='کلید API در Bridge';
 let lang=localStorage.lang||'fa';const t=k=>(L[lang]&&L[lang][k])??L.en[k]??k;
 function setTheme(v){if(v==='system')document.documentElement.removeAttribute('data-theme');else document.documentElement.dataset.theme=v;localStorage.setItem('theme',v)}
 const STAGES=['open','login','learn','analyse','verify','finish'];
 const VIEWS=[['accounts','accounts'],['connect','connect'],['sites','sites'],['settings','settings'],['log','log']];let view='accounts';
-let S=null,C=null,O=null,O12E='',tab='claude-ps',editing=false,openDet=new Set();
+let S=null,C=null,O=null,O12E='',RC=null,routePoolDraft=null,routeKindDraft='',tab='claude-ps',editing=false,openDet=new Set();
 function setLang(l){lang=l;localStorage.lang=l;document.documentElement.lang=l;document.documentElement.dir=l=='fa'?'rtl':'ltr';$('langbtn').textContent=l=='fa'?'English':'فارسی';
 document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));document.querySelectorAll('[data-ph]').forEach(e=>e.placeholder=t(e.dataset.ph));
 if(S&&S.presets&&$('preset').options.length)$('preset').options[0].textContent=t('preset');navRender();render();renderCtx()}
@@ -19070,11 +19406,12 @@ function jobOf(a){const js=(S.jobs||[]).filter(j=>j.account===a.id);return js[js
 function stepper(j){const cur=Math.max(0,STAGES.indexOf(j.stage)),fin=j.done&&j.ok;
 return '<ol class="steps">'+STAGES.map((s,i)=>{let c=fin||i<cur?'done':(i==cur?(j.done?'bad':'cur'):'');return `<li class="${c}"><i>${c=='done'?'✓':(c=='bad'?'✕':i+1)}</i><div>${esc(t('st_'+s))}</div></li>`}).join('')+'</ol>'}
 function failHint(e){e=String(e||'');if(/verification step|human check|not completed in time/i.test(e))return t('h_check');if(/closed|TargetClosed/i.test(e))return t('h_closed');return t('h_generic')}
+function profileOptions(current){const ps=S.pc_profiles||[];return `<option value="">${esc(t('profile_any'))}</option>`+ps.map(p=>`<option value="${esc(p.id)}" ${current===p.id?'selected':''}>${esc(p.name)}${p.connected?' · '+esc(t('profile_connected')):''}</option>`).join('')+(current&&!ps.some(p=>p.id===current)?`<option value="${esc(current)}" selected>${esc(current)} · ${esc(t('profile_disconnected'))}</option>`:'')}
 function accCard(a){const j=jobOf(a),run=j&&!j.done,fail=j&&j.done&&!j.ok&&a.state!=='ready',att=run&&j.attention&&j.attention.kind?j.attention:null;
 let s;if(run)s=att?'needs_you':'learning';else if(a.human)s='needs_you';else if(fail)s='failed';else if(a.state==='ready')s=a.cooling?'cooling':'ready';else if(a.state==='login_required')s='needs_login';else if(a.state==='needs_learning')s='needs_learning';else if(a.state==='learning')s='learning';else s=a.state||'learning';
 const label=t('s_'+s)==='s_'+s?s:t('s_'+s);let h=`<div class="card acc s-${esc(s)}"><div class="top"><div class="grow"><b>${esc(a.label)}</b> <span class="mut ltr">${esc(a.host)}</span> ${S.default_account==a.id?`<span class="b">${esc(t('def'))}</span>`:''}</div>`+
 (a.tier?`<span class="b ${esc(a.tier)}" title="${esc(t('m_'+a.tier))}">${esc(t('m_'+a.tier))}</span>`:'')+`<span class="stt">● ${esc(label)}${a.cooling?' '+esc(a.cooling)+'s':''}</span></div>`;
-if(a.type!=='api'){const v=a.serving||{mode:'auto',browser:false,direct:false};h+=`<div class="row"><label class="mut">${esc(t('transport'))}</label><select aria-label="${esc(t('transport'))}" onchange="setServingMode(${escJ(a.id)},this.value)"><option value="auto" ${v.mode==='auto'?'selected':''}>${esc(t('mode_auto'))}</option><option value="browser" ${v.mode==='browser'?'selected':''} ${!v.browser&&v.mode!=='browser'?'disabled':''}>${esc(t('mode_browser'))}</option><option value="direct" ${v.mode==='direct'?'selected':''} ${!v.direct&&v.mode!=='direct'?'disabled':''}>${esc(t('mode_direct'))}</option></select>${!v.direct?`<span class="mut">${esc(t('mode_unavailable'))}</span>`:''}<label class="f mut"><input type="checkbox" ${a.disabled?'':'checked'} onchange="o12Toggle(${escJ(a.id)},this.checked)"> ${esc(t('b_use'))}</label></div>`}
+if(a.type!=='api'){const v=a.serving||{mode:'auto',browser:false,direct:false};h+=`<div class="row"><label class="mut">${esc(t('transport'))}</label><select aria-label="${esc(t('transport'))}" onchange="setServingMode(${escJ(a.id)},this.value)"><option value="auto" ${v.mode==='auto'?'selected':''}>${esc(t('mode_auto'))}</option><option value="browser" ${v.mode==='browser'?'selected':''} ${!v.browser&&v.mode!=='browser'?'disabled':''}>${esc(t('mode_browser'))}</option><option value="direct" ${v.mode==='direct'?'selected':''} ${!v.direct&&v.mode!=='direct'?'disabled':''}>${esc(t('mode_direct'))}</option></select>${!v.direct?`<span class="mut">${esc(t('mode_unavailable'))}</span>`:''}<label class="f mut"><input type="checkbox" ${a.disabled?'':'checked'} onchange="o12Toggle(${escJ(a.id)},this.checked)"> ${esc(t('b_use'))}</label><label class="mut">${esc(t('profile_assign'))}</label><select class="profile-assign" aria-label="${esc(t('profile_assign'))}" onchange="setAccountProfile(${escJ(a.id)},this.value)">${profileOptions(a.pc_client_id||'')}</select></div>`}
 else h+=`<div class="row"><label class="f mut"><input type="checkbox" ${a.disabled?'':'checked'} onchange="o12Toggle(${escJ(a.id)},this.checked)"> ${esc(t('b_use'))}</label></div>`;
 const mc=a.model_choice||{},ms=mc.selector||{},choice=mc.choice||{};if(ms.present){h+=`<div class="row"><label class="mut">${esc(t('choose_model'))}</label><select aria-label="${esc(t('choose_model'))}" onchange="setModelChoice(${escJ(a.id)},this.value)"><option value="" ${choice.mode==='fixed'?'':'selected'}>${esc(t('default_model'))}</option>${ms.options.map(o=>`<option value="${esc(o.id)}" ${choice.mode==='fixed'&&choice.variant===o.id?'selected':''}>${esc(o.display)} · ${esc(o.mode||'default')}</option>`).join('')}</select></div>`}
 if(run){h+=stepper(j);const p=j.progress||{};const info=(j.stage=='learn'&&p.total)?`${t('probe')} ${p.cur}/${p.total}`:(j.stage=='analyse'&&p.total?`${t('round')} ${p.cur}/${p.total}`:'');
@@ -19095,10 +19432,14 @@ h+=`<div class="acts">`+(a.type=='api'?'':`<button class="sm" onclick="act(${esc
 function togDet(el){const id=el.dataset.id;if(el.open)openDet.add(id);else openDet.delete(id)}
 function render(){if(!S)return;$('st').textContent=t('running')+S.port;$('sts').textContent=S.stats.requests+' requests · '+S.stats.errors+' '+t('errors');
 $('acc').innerHTML=S.accounts.map(accCard).join('')||`<div class="card mut">${esc(t('no_acc'))}</div>`;
+const profiles=S.pc_profiles||[];$('pc_profile_status').textContent=profiles.length?profiles.map(p=>`${p.name}: ${p.connected?t('profile_connected'):t('profile_disconnected')}`).join(' · '):t('profile_none');
+$('pc_profiles_list').innerHTML=profiles.map(p=>`<div class="pool-item"><b>${esc(p.name)}</b><span class="mut ltr">${esc(p.id.slice(0,12))}</span><span class="b ${p.connected?'ready':'learning'}">${esc(t(p.connected?'profile_connected':'profile_disconnected'))}</span></div>`).join('')||`<p class="mut">${esc(t('profile_none'))}</p>`;
+const ap=$('account_profile'),oldProfile=ap.value;ap.innerHTML=profileOptions('');if(oldProfile)ap.value=oldProfile;else if(profiles.length)ap.value=profiles[0].id;
+renderStrategy();
 if(!editing){const ks=$('keysel'),cur=ks.value;ks.innerHTML=S.keys.map(k=>`<option value="${esc(k.key)}">${esc(k.label)}</option>`).join('');if(cur)ks.value=cur;
 $('kacc').innerHTML=`<option value="">${esc(t('any_acc'))}</option>`+S.accounts.map(a=>`<option value="${esc(a.id)}">${esc(a.label)}</option>`).join('')}
 $('keys').innerHTML=S.keys.map(k=>`<tr><td><b>${esc(k.label)}</b>${k.account?` <span class="b">→ ${esc((S.accounts.find(a=>a.id==k.account)||{}).label||k.account)}</span>`:''}<div class="k">${esc(k.key)}</div></td><td style="text-align:end"><button class="sm" onclick="navigator.clipboard.writeText(${escJ(k.key)})">${esc(t('c_copy'))}</button> <button class="sm d" onclick="delKey(${escJ(k.id)})">${esc(t('c_revoke'))}</button></td></tr>`).join('');
-$('workspace_key').innerHTML=(S.keys.length?S.keys.map(k=>`<option value="${esc(k.id)}">${esc(k.label)} · ${esc(k.key.slice(0,8))}…</option>`).join(''):`<option value="">${esc(t('workspace_key_none'))}</option>`);
+ $('workspace_key').innerHTML=(S.keys.length?S.keys.map(k=>{const pin=k.account?(S.accounts.find(a=>a.id===k.account)||{}).label:'';return `<option value="${esc(k.id)}">${esc(k.label)}${pin?' · '+esc(pin):''} · ${esc(k.key.slice(0,8))}…</option>`}).join(''):`<option value="">${esc(t('workspace_key_none'))}</option>`);
 if(!$('workspace_key').value&&S.keys.length)$('workspace_key').value=S.keys[0].id;
 $('workspace_app').value=localStorage.workspaceApp||'claude';$('workspace_path').value=localStorage.workspacePath||'';updateWorkspaceCommand();
 $('rec').innerHTML=S.recipes.map(r=>`<tr><td class="ltr">${esc(r.host)}</td><td><span class="b ${esc(r.tier)}">${esc(r.tier)}</span></td><td>${r.continuity?t('yes'):t('no')}</td><td style="text-align:end"><button class="sm" onclick="showDoc(${escJ(r.host)})">${esc(t('docs'))}</button> <button class="sm" onclick="getTool(${escJ(r.host)})">${esc(t('tool'))}</button> <button class="sm" onclick="expRec(${escJ(r.host)})">${esc(t('export'))}</button> <button class="sm d" onclick="delRec(${escJ(r.host)})">${esc(t('forget'))}</button></td></tr>`).join('')||`<tr><td class="mut" colspan="4">-</td></tr>`;
@@ -19108,6 +19449,12 @@ const s=S.settings;if(document.activeElement.tagName!='INPUT'){$('s_cont').check
 $('home').textContent='Data folder: '+S.home}
 async function setServingMode(id,mode){try{await api('accounts/'+encodeURIComponent(id)+'/serving-mode','POST',{mode});await tick()}catch(e){alert(errMsg(e));await tick()}}
 async function setModelChoice(id,variant){try{if(variant)await api('accounts/'+encodeURIComponent(id)+'/model-choice','POST',{mode:'fixed',variant});else await api('accounts/'+encodeURIComponent(id)+'/model-choice','DELETE');await tick()}catch(e){alert(errMsg(e));await tick()}}
+async function setAccountProfile(id,clientId){try{await api('accounts/'+encodeURIComponent(id)+'/chrome-profile','POST',{client_id:clientId});$('strategy_status').textContent=t('profile_changed');await tick()}catch(e){alert(errMsg(e));await tick()}}
+function renderStrategy(){if(!S)return;const accts=S.accounts.filter(a=>!a.disabled),policies=(RC&&RC.config&&RC.config.policies)||{};const current=policies['user-claude-pool'];if(routePoolDraft===null)routePoolDraft=(current&&current.members||[]).map(x=>String(x).replace(/^acct:/,'').split('/')[0]);if(!routeKindDraft)routeKindDraft=current&&current.kind||'auto';const kind=$('strategy_kind');if(kind&&kind.value!==routeKindDraft)kind.value=routeKindDraft;
+$('strategy_accounts').innerHTML=accts.map(a=>`<label class="pool-item"><input type="checkbox" value="${esc(a.id)}" ${routePoolDraft.includes(a.id)?'checked':''} onchange="toggleRouteAccount(this)"><span><b>${esc(a.label)}</b><br><span class="mut ltr">${esc(a.host)}</span></span><span class="b ${a.state==='ready'?'ready':'learning'}">${esc(a.state||'')}</span></label>`).join('')||`<p class="mut">${esc(t('no_acc'))}</p>`;
+const sel=$('strategy_kind');if(sel)routeKindDraft=sel.value;}
+function toggleRouteAccount(el){const id=el.value;routePoolDraft=routePoolDraft||[];routePoolDraft=el.checked?[...new Set([...routePoolDraft,id])]:routePoolDraft.filter(x=>x!==id)}
+async function saveStrategy(){const members=[...(routePoolDraft||[])].filter(id=>S.accounts.some(a=>a.id===id&&!a.disabled)).map(id=>'acct:'+id);if(!members.length){$('strategy_status').textContent=t('strategy_empty');return}const kind=$('strategy_kind').value;if(kind==='fixed'&&members.length!==1){$('strategy_status').textContent=t('strategy_choose_one');return}if((kind==='failover'||kind==='rotation')&&members.length<2){$('strategy_status').textContent=t('strategy_needs_two');return}const config={...(RC&&RC.config||{}),policies:{...((RC&&RC.config&&RC.config.policies)||{})}};let policy={kind,profile:'balanced',members};if(kind==='rotation'){policy={kind,profile:'balanced',members,strategy:'round_robin',unit:'conversation'}}else if(kind==='failover'){policy={kind,profile:'balanced',primary:members[0],backups:members.slice(1)}}config.policies['user-claude-pool']=policy;try{await api('routing','POST',config);RC={...(RC||{}),config};routePoolDraft=members.map(x=>x.replace(/^acct:/,''));routeKindDraft=kind;$('strategy_status').textContent=t('strategy_saved');renderStrategy();updateWorkspaceCommand()}catch(e){$('strategy_status').textContent=errMsg(e)}}
  $('rep_show').onclick=async()=>{let h=$('rep_host').value.trim();if(!h)return;try{if(/^https?:\/\//i.test(h))h=new URL(h).hostname;if(!/^[a-z0-9.:[\]-]+$/i.test(h)||h.includes('..'))throw new Error('Enter a site hostname or URL, such as claude.ai');$('rep_host').value=h;$('rep_out').style.display='block';const r=await api('analysis/'+encodeURIComponent(h)+'/report');$('rep_out').textContent=r.markdown||'no report yet for this site'}catch(e){$('rep_out').style.display='block';$('rep_out').textContent='✘ '+e.message}};
 let reqOffset=0,reqTotal=0;async function showRequests(offset=0){let h=$('rep_host').value.trim();if(!h)return;if(/^https?:\/\//i.test(h))h=new URL(h).hostname;$('rep_host').value=h;reqOffset=Math.max(0,offset);try{const r=await api('analysis/'+encodeURIComponent(h)+'/requests?offset='+reqOffset+'&limit=100');reqTotal=r.total||0;$('req_out').style.display='block';$('req_nav').hidden=false;$('req_page').textContent=(reqTotal?`${reqOffset+1}-${Math.min(reqOffset+r.rows.length,reqTotal)}`:'0')+' / '+reqTotal;$('req_prev').disabled=reqOffset===0;$('req_next').disabled=reqOffset+r.rows.length>=reqTotal;$('req_out').innerHTML=(r.rows||[]).map(x=>`<details class="card"><summary><b>#${esc(x.seq??'')} ${esc(x.method)} ${esc(x.status||'')}</b> <span class="ltr mut">${esc(x.url)}</span> <span class="mut">${esc(x.type)} · ${esc(x.duration_s??'')}s</span></summary><div class="ltr"><b>Request (${esc(x.request_format)}):</b><pre class="mini">${esc(x.request||'(no text preview)')}</pre><b>Response (${esc(x.response_format)}):</b><pre class="mini">${esc(x.response||'(no text preview)')}</pre>${x.failed?'<div class="err">'+esc(x.failed)+'</div>':''}</div></details>`).join('')||'<p class="mut">No captured requests for this site.</p>'}catch(e){$('req_out').style.display='block';$('req_out').textContent='✘ '+errMsg(e)}}
 $('req_show').onclick=()=>showRequests(0);$('req_prev').onclick=()=>showRequests(reqOffset-100);$('req_next').onclick=()=>showRequests(reqOffset+100);
@@ -19120,7 +19467,7 @@ $('dir_meta').textContent=D.label;const cs=$('dir_cat');if(cs.options.length<2){
 const q=$('dir_q').value.trim().toLowerCase(),cat=cs.value;
 const L=D.entries.filter(e=>(!cat||e.category==cat)&&(!q||(e.name+' '+e.host+' '+(e.notes||'')).toLowerCase().includes(q)));
 $('dir_rows').innerHTML=L.map(e=>`<tr><td class="k">${esc(e.name)}<br><span class="mut ltr">${esc(e.url)}</span>${e.notes?'<br><span class="mut">'+esc(e.notes)+'</span>':''}</td><td>${esc(e.category)}</td><td><span class="b ${e.status=='added'?'ready':(e.status=='needs login'?'direct':'learning')}">${esc(e.status)}</span><br><span class="mut">verified: ${esc(e.verified_at||'not verified')}</span></td><td class="mut">${esc(e.how_to_add)}</td><td>${e.category=='api_compatible'||e.status!='not added'?'':`<button class="sm p" onclick="dirStart('${esc(e.id)}')">Add account</button> `}<button class="sm" onclick="dirDel('${esc(e.id)}')">Remove</button></td></tr>`).join('')||'<tr><td class="mut" colspan="5">No sites match</td></tr>'}
-async function dirStart(id){const e=(D.entries||[]).find(x=>x.id==id);if(!e)return;try{await api('accounts','POST',{url:e.url,label:e.name,learn:false})}catch(x){alert(errMsg(x))}loadDir();tick()}
+async function dirStart(id){const e=(D.entries||[]).find(x=>x.id==id);if(!e)return;try{await api('accounts','POST',{url:e.url,label:e.name,learn:false,manual_login:true,pc_client_id:$('account_profile').value})}catch(x){alert(errMsg(x))}loadDir();tick()}
 async function dirDel(id){if(!confirm('Remove this entry from the directory? (accounts are not touched)'))return;try{await api('directory/'+encodeURIComponent(id),'DELETE')}catch(x){alert(errMsg(x))}loadDir()}
 async function dirAdd(){try{await api('directory','POST',{name:$('dir_name').value,url:$('dir_url').value,category:$('dir_newcat').value});$('dir_name').value='';$('dir_url').value=''}catch(x){alert(errMsg(x))}loadDir()}
 const fmtT=t=>t?new Date(t*1000).toLocaleString():'-';
@@ -19150,18 +19497,19 @@ const el=$('ctx_disc');el.style.display='block';el.textContent='Running 3 probe 
 try{const r=await api('accounts/'+encodeURIComponent(id)+'/paste-discover','POST');el.textContent='Requests used: '+r.requests_used+(r.ran?'':' (did not run)')+'\nApplied: '+(r.applied?'yes':'no')+(r.suggestion?'\nSuggested signal: '+JSON.stringify(r.suggestion):'')+(r.reason?'\n'+r.reason:'')}catch(e){el.textContent='Failed: '+e.message}
 tick()}
 let busy=false;
-async function tick(){if(busy)return;busy=true;try{S=await api('state');try{C=await api('context')}catch(e){}try{O=await api('o12');O12E=''}catch(e){O12E=errMsg(e)}try{RD=await api('decisions?n=30');RDE=''}catch(e){RD=null;RDE=errMsg(e)}
+async function tick(){if(busy)return;busy=true;try{S=await api('state');try{C=await api('context')}catch(e){}try{O=await api('o12');O12E=''}catch(e){O12E=errMsg(e)}try{RD=await api('decisions?n=30');RDE=''}catch(e){RD=null;RDE=errMsg(e)}try{RC=await api('routing')}catch(e){}
 if(!$('preset').options.length){$('preset').innerHTML='<option value="">'+esc(t('preset'))+'</option>'+S.presets.map(p=>`<option value="${esc(p.url)}" data-n="${esc(p.name)}">${esc(p.name)}</option>`).join('');$('preset').onchange=()=>{$('url').value=$('preset').value;$('label').value=$('preset').selectedOptions[0].dataset.n||'';urlPrev()}}
 if(view=='log'||!$('log').textContent){const lg=await api('log');const hide=$('hidetech').checked;let ls=lg.lines;if(hide)ls=ls.filter(l=>!/ DEBUG /.test(l)).map(l=>String(l).split('\n')[0]);const el=$('log'),atEnd=el.scrollTop+el.clientHeight>=el.scrollHeight-20;el.textContent=(lg.file?'Log file: '+lg.file+'\n':'')+ls.join('\n');if(atEnd)el.scrollTop=el.scrollHeight}
 render();renderCtx();renderO12();renderDecisions()}catch(e){$('st').textContent='disconnected'}finally{busy=false}}
-async function addAcc(){const url=$('url').value.trim();if(!url)return alert(t('url_ph'));try{await api('accounts','POST',{url,label:$('label').value.trim(),learn:$('learn_on_add').checked});$('url').value='';$('label').value='';$('urlprev').textContent='';tick()}catch(e){alert(errMsg(e))}}
+async function addAcc(){const url=$('url').value.trim();if(!url)return alert(t('url_ph'));try{await api('accounts','POST',{url,label:$('label').value.trim(),learn:$('learn_on_add').checked,manual_login:true,pc_client_id:$('account_profile').value});$('url').value='';$('label').value='';$('urlprev').textContent='';tick()}catch(e){alert(errMsg(e))}}
 async function selectWorkspace(){try{const r=await api('workspace/select','POST',{});if(r.folder){$('workspace_path').value=r.folder;localStorage.workspacePath=r.folder;$('workspace_status').textContent=t('workspace_ready')}else $('workspace_status').textContent=t('workspace_cancel');updateWorkspaceCommand()}catch(e){$('workspace_status').textContent=t('workspace_error')+errMsg(e)}}
-function updateWorkspaceCommand(){const app=$('workspace_app').value,folder=$('workspace_path').value,keyValue=(S&&S.keys.find(k=>k.id===$('workspace_key').value)||{}).key||'',base='http://127.0.0.1:'+(S?S.port:'8788');localStorage.workspaceApp=app;let cmd='';const psPath="'"+folder.replace(/'/g,"''")+"'";
-if(!folder)cmd=t('workspace_ph');else if(app==='claude'&&!keyValue)cmd=t('workspace_key_required');else if(app==='claude')cmd=`$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_API_KEY="${keyValue}"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nSet-Location -LiteralPath ${psPath}\nclaude`;
+function workspaceModel(){const key=(S&&S.keys.find(k=>k.id===$('workspace_key').value))||{},hasPool=!!(RC&&RC.config&&RC.config.policies&&RC.config.policies['user-claude-pool']);return key.account?'acct:'+key.account:(hasPool?'bridge-pool/user-claude-pool':'bridge-auto')}
+function updateWorkspaceCommand(){const app=$('workspace_app').value,folder=$('workspace_path').value,keyValue=(S&&S.keys.find(k=>k.id===$('workspace_key').value)||{}).key||'',base='http://127.0.0.1:'+(S?S.port:'8788'),policy=workspaceModel();localStorage.workspaceApp=app;let cmd='';const psPath="'"+folder.replace(/'/g,"''")+"'";
+if(!folder)cmd=t('workspace_ph');else if(app==='claude'&&!keyValue)cmd=t('workspace_key_required');else if(app==='claude')cmd=`$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_API_KEY="${keyValue}"\n$env:ANTHROPIC_MODEL="${policy}"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nSet-Location -LiteralPath ${psPath}\nclaude`;
 else if(app==='vscode')cmd=`code "${folder}"`;else if(app==='cursor')cmd=`cursor "${folder}"`;else if(app==='cmd')cmd=`cd /d "${folder}"`;else cmd=`Set-Location -LiteralPath ${psPath}`;
 $('workspace_command').textContent=cmd||'Select a workspace folder to prepare the command.'}
 async function copyWorkspaceCommand(){updateWorkspaceCommand();const cmd=$('workspace_command').textContent;if(!cmd||cmd===t('workspace_ph')||cmd===t('workspace_key_required'))return;try{await navigator.clipboard.writeText(cmd);$('workspace_status').textContent=t('workspace_copied')}catch(e){$('workspace_status').textContent=cmd}}
-async function openWorkspace(){const folder=$('workspace_path').value;if(!folder)return alert(t('workspace_ph'));if($('workspace_app').value==='claude'&&!(S&&S.keys.some(k=>k.id===$('workspace_key').value)))return alert(t('workspace_key_required'));try{const r=await api('workspace/open','POST',{app:$('workspace_app').value,folder,key_id:$('workspace_key').value});$('workspace_status').textContent=t('workspace_opened')+' (PID '+r.pid+')'}catch(e){$('workspace_status').textContent=t('workspace_error')+errMsg(e)}}
+async function openWorkspace(){const folder=$('workspace_path').value;if(!folder)return alert(t('workspace_ph'));if($('workspace_app').value==='claude'&&!(S&&S.keys.some(k=>k.id===$('workspace_key').value)))return alert(t('workspace_key_required'));try{const r=await api('workspace/open','POST',{app:$('workspace_app').value,folder,key_id:$('workspace_key').value,model:workspaceModel()});$('workspace_status').textContent=t('workspace_opened')+' (PID '+r.pid+')'}catch(e){$('workspace_status').textContent=t('workspace_error')+errMsg(e)}}
 async function startPcSetup(){const b=$('pc_start'),s=$('pc_state');b.disabled=true;s.textContent=t('pc_opening');try{const r=await api('personal-chrome/setup','POST',{});$('pc_code').textContent=r.code;$('pc_port').textContent=r.port;$('pc_folder').textContent=r.extension_dir;$('pc_steps').hidden=false;s.textContent=t('pc_ready')}catch(e){s.textContent=t('pc_error')+errMsg(e)}finally{b.disabled=false}}
 async function copyPcCode(){try{await navigator.clipboard.writeText($('pc_code').textContent);$('pc_state').textContent=t('pc_copied')}catch(e){$('pc_state').textContent=$('pc_code').textContent}}
 let _up=0;async function urlPrev(){const v=$('url').value.trim(),el=$('urlprev'),my=++_up;if(!v){el.textContent='';return}try{const r=await api('sites/normalize','POST',{input:v});if(my===_up)el.textContent='→ '+r.open_url+'  ·  '+r.identity_host+(r.notes.length?'  ·  '+r.notes.join('; '):'')}catch(e){if(my===_up)el.textContent='✘ '+errMsg(e)}}
@@ -20646,6 +20994,13 @@ def run_selftest(quick: bool = False) -> int:
             with self.assertRaises(ApprovalRequired) as cx2:
                 self.plan(m2)
             self.assertEqual(cx2.exception.kind, "approval_required")
+
+        def test_explicit_rotation_pool_uses_only_the_accounts_the_owner_selected(self) -> None:
+            name = self.setup_policy("user-claude-pool", kind="rotation", members=["acct:a1", "acct:b2"], strategy="round_robin", unit="request")
+            first = self.plan(name)[0]["acct"]["id"]
+            second = self.plan(name)[0]["acct"]["id"]
+            self.assertEqual({first, second}, {"a1", "b2"})
+            self.assertNotIn("c3", {first, second})
 
         def test_policy_auto_ranks_eligible_routes(self) -> None:
             self.acc.inflight["a1"] = 3
@@ -27603,6 +27958,11 @@ setTimeout(() => process.exit(0), 60000);
                 self.assertFalse(kw.get("shell", False))
                 self.assertEqual(kw["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8788")
                 self.assertEqual(kw["env"]["ANTHROPIC_API_KEY"], "bridge-key")
+                with mock.patch("shutil.which", return_value="C:/Tools/claude.exe"), mock.patch("subprocess.Popen", popen):
+                    open_workspace_tool("claude", str(tmp), 8788, "bridge-key", "bridge-pool/user-claude-pool")
+                self.assertEqual(popen.call_args.kwargs["env"]["ANTHROPIC_MODEL"], "bridge-pool/user-claude-pool")
+                with self.assertRaises(BridgeError):
+                    open_workspace_tool("claude", str(tmp), 8788, "bridge-key", 'bad model; exit')
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
 
@@ -27635,6 +27995,31 @@ setTimeout(() => process.exit(0), 60000);
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
 
+        def test_profile_bound_login_is_separate_from_optional_learning(self) -> None:
+            from unittest import mock
+            tmp, store, cfg, app = mk_env()
+            try:
+                with mock.patch.object(app.acc, "site_guard", return_value=""):
+                    account, job = app.acc.add("https://claude.ai", "Personal Claude", learn=False, defer_login=True, pc_client_id="profile-a")
+                self.assertIsNone(job)
+                self.assertEqual(account["state"], "login_pending")
+                self.assertNotIn("learn_budget", account)
+                self.assertEqual([r["id"] for r in app.acc.browser_login_requests("profile-a")], [account["id"]])
+                self.assertEqual(app.acc.browser_login_requests("profile-b"), [])
+                status, _ = app.acc.claim_browser_login("profile-b", {"account_id": account["id"]})
+                self.assertEqual(status, 409)
+                status, _ = app.acc.claim_browser_login("profile-a", {"account_id": account["id"]})
+                self.assertEqual(status, 200)
+                with mock.patch.object(app.acc, "start_job", return_value=types.SimpleNamespace(id="login-job")) as start:
+                    status, result = app.acc.confirm_browser_login("profile-a", {"account_id": account["id"], "tab": 9, "url": "https://claude.ai/"})
+                self.assertEqual((status, result["job"]), (200, "login-job"))
+                self.assertEqual(start.call_args.args[1], "login-only")
+                self.assertTrue(start.call_args.kwargs["owner_confirmed"])
+                self.assertEqual(account["pc_client_id"], "profile-a")
+                self.assertEqual(account["pc_login_tab"], 9)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
         def test_dashboard_integrates_advanced_panels_and_workspace_picker(self) -> None:
             self.assertIn("workspace/select", DASHBOARD_HTML)
             self.assertIn("workspace/open", DASHBOARD_HTML)
@@ -27648,6 +28033,10 @@ setTimeout(() => process.exit(0), 60000);
             self.assertIn("b_use", DASHBOARD_HTML)
             self.assertIn("setModelChoice", DASHBOARD_HTML)
             self.assertIn("ms.options.map", DASHBOARD_HTML)
+            self.assertIn("/pc/login-claim", PC_BACKGROUND_JS)
+            self.assertIn("function saveStrategy()", DASHBOARD_HTML)
+            self.assertIn("ANTHROPIC_MODEL", DASHBOARD_HTML)
+            self.assertIn("pc_profiles_list", DASHBOARD_HTML)
 
     class TestServingModesAndEvidence(unittest.TestCase):
         """Owner-selected serving path and credential-safe learning evidence exports; mock data only."""
@@ -27939,9 +28328,9 @@ setTimeout(() => process.exit(0), 60000);
             except Exception:
                 return r.status, data
 
-        def pair(self) -> str:
+        def pair(self, client_id: str = "legacy", client_name: str = "Chrome profile") -> str:
             code = self.hub.new_pairing()
-            st, j = self.post("/pc/pair", {"code": code}, origin=self.ORIGIN)
+            st, j = self.post("/pc/pair", {"code": code, "client_id": client_id, "client_name": client_name}, origin=self.ORIGIN)
             self.assertEqual(st, 200)
             return j["token"]
 
@@ -28047,6 +28436,31 @@ setTimeout(() => process.exit(0), 60000);
             self.assertEqual(c.getresponse().status, 405)
             c.close()
             self.assertGreaterEqual(self.hub.stats["rejected"], 3)
+
+        def test_multiple_chrome_profiles_are_isolated_and_can_repair_independently(self) -> None:
+            tok_a = self.pair("profile-a", "Personal")
+            tok_b = self.pair("profile-b", "Work")
+            self.assertEqual(self.hub.client_for_token(self.ORIGIN, tok_a), "profile-a")
+            self.assertEqual(self.hub.client_for_token(self.ORIGIN, tok_b), "profile-b")
+            a, b = _PCCmd("ping", {}, "profile-a"), _PCCmd("ping", {}, "profile-b")
+            with self.hub.cv:
+                self.hub.cmds[a.id], self.hub.cmds[b.id] = a, b
+                self.hub.queue.extend((a, b))
+            got = self.hub._poll(0, "worker-a", "profile-a")
+            self.assertEqual([x["id"] for x in got], [a.id])
+            self.assertFalse(self.hub._result({"id": a.id, "ok": True, "result": {}}, "profile-b")["ok"])
+            self.assertTrue(self.hub._result({"id": a.id, "ok": True, "result": {}}, "profile-a")["ok"])
+            status, renamed = self.post("/pc/profile-name", {"name": "Personal Dev"}, origin=self.ORIGIN, token=tok_a)
+            self.assertEqual(status, 200)
+            self.assertEqual(renamed["name"], "Personal Dev")
+            code = self.hub.new_pairing()
+            status, repaired = self.post("/pc/pair", {"code": code, "client_id": "profile-a", "client_name": "Personal Dev"}, origin=self.ORIGIN)
+            self.assertEqual(status, 200)
+            self.assertIsNone(self.hub.client_for_token(self.ORIGIN, tok_a))
+            self.assertEqual(self.hub.client_for_token(self.ORIGIN, repaired["token"]), "profile-a")
+            self.assertEqual(self.hub.client_for_token(self.ORIGIN, tok_b), "profile-b")
+            self.assertEqual(self.hub.profiles()[1]["name"], "Work")
+
 
         def test_pairing_rules(self) -> None:
             code = self.hub.new_pairing()

@@ -4,6 +4,6 @@ Single-file local bridge that presents web-model and compatible API accounts thr
 
 ## Current verification status
 
-Version 7.57 keeps web login separate from optional learning. Newly added web accounts default to browser-backed serving; previously saved accounts keep their current transport setting. Chrome setup no longer opens the default browser profile automatically, so the owner can choose the profile before loading the extension. The workspace key selector now shows an explicit empty state, and workspace controls have responsive sizing. A fresh login for an unknown site is saved without probes, but Claude Code needs a site protocol recipe before it can send requests. No live-site, owner-Chrome, or model run is recorded.
+Version 7.58 adds independent Chrome-profile identities and extension pairings, profile-bound login requests that the owner confirms in the extension, and per-account Chrome-profile assignment. Login stays separate from optional learning. The integrated dashboard manages enabled accounts and an explicit Claude Code account pool with fixed, automatic, rotation, failover, measured-latency, best-fit, and manual-approval strategies. The workspace picker, API-key selector, selected pool model, direct app launch, and copyable command are included. Implementation has been pushed before tests; the 7.58 suite is pending. No live Chrome profile, real site, or model request has yet been verified.
 
 See `HANDOFF_REPORT.md` for the evidence ledger, known gaps, and verification status.
