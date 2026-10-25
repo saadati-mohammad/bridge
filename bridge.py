@@ -18879,7 +18879,7 @@ $('tabs').innerHTML=Object.keys(names).map(x=>`<button class="sm ${x==tab?'p':''
 $('snip').textContent=snippets($('keysel').value||(S.keys[0]||{}).key||'',S.port)[tab];
 const s=S.settings;if(document.activeElement.tagName!='INPUT'){$('s_cont').checked=s.continuity;$('s_tool').value=s.tool_desc_limit;$('s_sys').value=s.system_limit;$('s_res').value=s.result_limit;$('s_his').value=s.history_limit;$('s_idle').value=s.headless_idle_seconds;$('s_sum').checked=s.summarize_history;$('s_hc').value=s.health_interval_min;$('s_cache').value=s.cache_seconds}
 $('home').textContent='Data folder: '+S.home}
-$('rep_show').onclick=async()=>{const h=$('rep_host').value.trim();if(!h)return;$('rep_out').style.display='block';try{const r=await api('analysis/'+encodeURIComponent(h)+'/report');$('rep_out').textContent=r.markdown||'no report yet for this site'}catch(e){$('rep_out').textContent='✘ '+e.message}};
+ $('rep_show').onclick=async()=>{let h=$('rep_host').value.trim();if(!h)return;try{if(/^https?:\/\//i.test(h))h=new URL(h).hostname;if(!/^[a-z0-9.:[\]-]+$/i.test(h)||h.includes('..'))throw new Error('Enter a site hostname or URL, such as claude.ai');$('rep_host').value=h;$('rep_out').style.display='block';const r=await api('analysis/'+encodeURIComponent(h)+'/report');$('rep_out').textContent=r.markdown||'no report yet for this site'}catch(e){$('rep_out').style.display='block';$('rep_out').textContent='✘ '+e.message}};
 const kindB=k=>k=='measured'?'ready':(k=='estimated'?'learning':'direct');
 let D=null,DE='';
 async function loadDir(){try{D=await api('directory');DE=''}catch(e){DE=errMsg(e)}renderDir()}
