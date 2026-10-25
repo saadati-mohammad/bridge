@@ -167,7 +167,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.67"
+VERSION = "7.68"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -4888,7 +4888,8 @@ class UIBackend:
             pg = _page(self.ab, ctx, base, self.recipe.get("entry"))
             loc = pg.locator(self.sel)
             n = loc.count()
-            return n, (loc.last.inner_text() if n else ""), pg.url, ui_generating(pg)
+            answer = loc.last.inner_text() if n else ""
+            return n, normalize_ui_tool_call_chrome(answer), pg.url, ui_generating(pg)
 
         send_started = time.monotonic()
         n0 = self.ab.run(start, True, 120)
@@ -16206,6 +16207,17 @@ class _CfgOver:
 # ---- tool-call parsing ------------------------------------------------------------------------
 CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|\Z)", re.S)
 FENCE_RE = re.compile(r"```tool_call[^\n]*\n(.*?)(?:\n```|\Z)", re.S)
+# Some web chat renderers expose a labelled code block through inner_text() as
+# its language label and toolbar buttons followed by raw code, without Markdown
+# fences. Restore only that distinctive UI representation so TextGate can hold
+# it and parse_tool_calls can validate it against the caller's tool schema.
+UI_TOOL_CALL_CHROME_RE = re.compile(
+    r"(?im)^[ \t]*tool_call[ \t]*\r?\n[ \t]*Copy[ \t]*\r?\n[ \t]*Download[ \t]*\r?\n"
+)
+
+
+def normalize_ui_tool_call_chrome(text: str) -> str:
+    return UI_TOOL_CALL_CHROME_RE.sub("```tool_call\n", text)
 
 
 def loose_json(s: str) -> Any:
@@ -20245,6 +20257,28 @@ def run_selftest(quick: bool = False) -> int:
                 _, calls, _ = parse_tool_calls(txt, tools, "s")
                 self.assertEqual([c["name"] for c in calls], want, txt)
             self.assertEqual(parse_tool_calls("<tool_call>x</tool_call>", {}, "s")[1], [])                  # no tools -> text untouched
+
+        def test_deepseek_tool_call_codeblock_toolbar_is_restored_for_parser(self) -> None:
+            raw = ('I don\'t have a clock built in, but I can check the system time for you.\n\n'
+                   'tool_call\nCopy\nDownload\n{"name": "Bash", "arguments": '
+                   '{"command": "date", "description": "Show current system date and time"}}')
+            restored = normalize_ui_tool_call_chrome(raw)
+            self.assertIn("```tool_call\n", restored)
+            self.assertNotIn("Copy", restored)
+            self.assertNotIn("Download", restored)
+            tools = {"Bash": {"description": "", "input_schema": {"required": ["command"]}}}
+            clean, calls, problems = parse_tool_calls(restored, tools, "deepseek")
+            self.assertEqual([call["name"] for call in calls], ["Bash"])
+            self.assertEqual(calls[0]["input"]["command"], "date")
+            self.assertEqual(problems, [])
+            self.assertIn("I don't have a clock built in", clean)
+
+        def test_deepseek_tool_call_toolbar_stream_prefix_is_gateable(self) -> None:
+            partial = normalize_ui_tool_call_chrome("tool_call\nCopy\nDownload\n{\"name\":")
+            self.assertTrue(partial.startswith("```tool_call\n"))
+            gate = TextGate(lambda _chunk: None, True)
+            gate.feed(partial)
+            self.assertEqual(gate.sent, 0)
 
         def test_echoed_tool_schema_placeholder_is_not_retried_as_an_unknown_tool(self) -> None:
             tools = {"Bash": {"description": "", "input_schema": {}}}
