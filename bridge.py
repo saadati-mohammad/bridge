@@ -8,20 +8,21 @@ Claude Code (Anthropic /v1/messages) and for Cursor / VS Code agents / anything
 OpenAI-compatible (/v1/chat/completions), with a web dashboard for accounts and keys.
 
 HOW IT WORKS (no per-site hard-coding)
-  1. ADD ACCOUNT  - a real browser opens; you log in once (the old way).
-  2. LEARN        - the bridge chats with the site through its own UI while recording the
-                    network traffic, then reverse-engineers a "recipe": endpoint, body template,
-                    auth source, which fields are per-chat / per-turn state, and how the answer
-                    is streamed. Recipes are verified by replaying them.
-  3. RUN          - tier DIRECT: plain HTTPS straight to the site's server (no browser, no RAM).
-                    tier PAGE : one in-page fetch() (tiny headless page) when direct is refused.
-                    tier UI   : drives the page headlessly only when nothing else verifies.
+  1. ADD ACCOUNT  - you sign into your chosen site in your own Chrome profile; login is saved immediately.
+  2. RUN          - a login-only web account can serve Claude Code through that same Chrome profile's UI right away.
+                    This keeps Cloudflare on the real owner browser; no Playwright profile is used for this path.
+  3. OPTIONAL LEARN - when the owner asks, the bridge records that site's real traffic and may build a faster
+                    request recipe (endpoint, body template, auth, per-chat/per-turn state and streaming). It never
+                    invents a protocol, and keeps the Chrome UI path as fallback.
+  4. RUN          - tier DIRECT: plain HTTPS straight to the site's server (no browser, no RAM).
+                    tier PAGE : one in-page fetch() when direct is refused.
+                    tier UI   : drives the owner's Chrome profile when no verified request recipe exists.
                     The tier is chosen by verification and downgraded automatically on failure.
-  4. REMEMBER     - every learned site gets docs/<host>.md and tools/<host>_client.py, so the
+  5. REMEMBER     - every learned site gets docs/<host>.md and tools/<host>_client.py, so the
                     next login (any account on that site) skips the browser entirely.
 
 PERSONAL CHROME (7.24)
-  Browser-dependent steps (login, learning, token refresh, PAGE and UI tiers) now run in YOUR OWN Chrome through a small Manifest-V3 extension that this file carries inside itself
+  Browser-dependent steps (login, optional learning, token refresh, PAGE and UI tiers) now run in YOUR OWN Chrome through a small Manifest-V3 extension that this file carries inside itself
   (extracted to <data>/personal_chrome/extension, verified by SHA-256). Chrome never installs extensions silently, so there is ONE human step: chrome://extensions > Developer mode >
   Load unpacked > pick that folder, then pair with the one-time code from `python bridge.py --pc-pair`. The bridge opens its own task tabs (it never navigates or closes your other tabs),
   talks to the extension over an authenticated loopback channel (pinned extension origin + token), and Chrome shows its own "is debugging this browser" bar while a tab is inspected.
@@ -92,6 +93,20 @@ TEXT-FIRST SUBMISSION, SIGNATURES, WINDOW BUDGET (7.8)
   markers); GET /api/vault/<ref>?lines=A-B returns exactly that slice (capped by vault_slice_max_lines); tool names/descriptions/schemas are neutralised like other
   third-party text; pluggable token estimator (register_tokenizer + config `tokenizer`, safe fallback) used for BOTH the prompt budget and route eligibility.
 
+RELIABILITY (7.71)
+  Nine changes, ordered by effect: (1) END MARKER - every tool-capable prompt asks the model to finish with one fixed line (default the line "END" in white brackets, `end_marker_text`); a reply is complete when that line is seen,
+  silence is only the last resort; (2) NETWORK TEXT - the UI tier reads the chat page's own raw stream (SSE / ndjson) through CDP and uses it only when it agrees with the page text (`net_text`);
+  (3) SCHEMA - every tool call is checked against the tool's full JSON schema (type, enum, extra keys, length, range, nesting; `schema_validation` strict|basic|off) and the exact error goes back to the model (`fix_retries`);
+  (4) PRE-CHECK - an Edit that cannot work (file never read, old_string not in the file as read, not unique, file missing) is refused using only this request's own history, before Claude Code runs it (`precheck`);
+  (5) FEWER TOOLS - above `tools_per_turn_max` only the tools that matter for the turn are shown in full, the rest by name; (6) NATIVE FORMAT - `tool_format` / `tool_format_by_host` (DeepSeek: DSML);
+  (7) GET /api/reliability + dashboard card + `--reliability`: per site parse success, cut-off rate, retries, how replies ended, timings; (8) `replay/` keeps credential-masked real replies, `--replay` runs every new version over them;
+  (9) `tool_probe_hours`: one tiny tool call per site per day, alerts on failure or a changed format. Self-test: python bridge.py --selftest (TestReliability771).
+  7.73: PERSONAL CHROME TAB - the tab you logged in with is remembered for good (`pc_home_tab`; it used to be forgotten when the login job ended, so every later request opened a NEW tab). It is used again after every
+  idle close; if it is gone, another tab of the SAME site that you handed to the bridge is used; only then a new tab is opened. Borrowed tabs are detached, never closed. A site verification ("verify you are human",
+  Turnstile ...) now brings the tab to the front once (a background tab looks 'hidden' to the site) and waits up to BRIDGE_UI_CHALLENGE_WAIT (240 s) for your click, then continues by itself.
+  7.72: (a) the pre-check is a guess from the request history, so a call it refused is no longer lost: after the model was told `fix_retries` times and still sends the same call, it is released and the
+  real tool decides; (b) replay files now also mask a Windows user name inside a JSON-escaped path (C:\\Users\\name); (c) TestReliability771 (18 tests, incl. full router round-trips) now really exists.
+
 ROUTING (7.4)
   A route is (account, model variant). Which route serves a request is decided by a policy (data in bridge_data/routing.json,
   validated on save): fixed, auto, rotation, failover, lowest_latency, best_fit, manual_approval. Resolution of the `model` a client
@@ -125,6 +140,7 @@ import argparse
 import base64
 import codecs
 import dataclasses
+import difflib
 import email.utils
 import gzip
 import hashlib
@@ -141,6 +157,7 @@ import queue
 import random
 import re
 import secrets
+import shutil
 import socket
 import ssl
 import statistics
@@ -148,6 +165,7 @@ import struct
 import subprocess
 import sys
 import textwrap
+from concurrent.futures import TimeoutError as FutureTimeout
 import threading
 import time
 import traceback
@@ -165,7 +183,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.53"
+VERSION = "7.75"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -808,6 +826,27 @@ class Config:
         "o9_relearn_wait_seconds": 600,     # 7.27: how long the repair waits for the Personal-Chrome re-learn job
         "o9_recheck_direct_minutes": 30,    # 7.26: how often an account that runs on page/ui is asked, without a browser, whether direct works now (0 = off)
         "tool_desc_limit": 500,
+        "ui_adaptive_wait": True,            # 7.70: the UI tier learns, per site, how long that site pauses in the middle of an answer and waits accordingly
+        "ui_quiet_base_s": 1.6,              # 7.70: quiet time (no new text) that ends an answer when the page shows no 'stop' control
+        "ui_quiet_generating_s": 1.0,        # 7.70: same, once the page HAS shown its 'stop' control (that control going away is the real signal)
+        "ui_quiet_open_call_s": 12.0,        # 7.70: quiet time while a tool call is still open (unclosed fence / tag / JSON) and no stop control was seen
+        "ui_quiet_open_call_generating_s": 8.0,
+        "ui_quiet_max_s": 45.0,              # 7.70: no learned or multiplied wait ever exceeds this
+        "end_marker": True,                  # 7.71: the model ends every tool-capable reply with one fixed line; a reply is complete when that line is seen
+        "end_marker_text": "\u27e6END\u27e7",  # 7.71: the line itself
+        "end_marker_grace_s": 6.0,           # 7.71: UI tier: extra silence waited (instead of finishing at once) while a followed marker rule has not produced its marker yet
+        "net_text": True,                    # 7.71: UI tier: read the page's raw stream through CDP and use it when it agrees with the page text
+        "schema_validation": "strict",       # 7.71: strict (every JSON-schema keyword) | basic (required + types) | off (required only)
+        "precheck": True,                    # 7.71: refuse an Edit that provably cannot work, using what this request's history already read / changed
+        "precheck_fs": False,                # 7.71: also look for the file on the local disk (only meaningful when the bridge runs on the machine that holds the project)
+        "fix_retries": 2,                    # 7.71: how many times a bad tool call is sent back to the model with the exact error
+        "tools_per_turn_max": 16,            # 7.71: more tools than this -> only the relevant ones are shown in full (0 = always all)
+        "tools_core": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "MultiEdit"],     # 7.71: always shown in full
+        "tool_format": "auto",               # 7.71: auto (fenced for browser chats, tag otherwise) | fenced | tag | dsml
+        "tool_format_by_host": {"deepseek": "dsml"},      # 7.71: substring of a site's host -> the markup its model was trained on
+        "replay_record": True,               # 7.71: keep credential-masked real replies for `--replay`
+        "replay_max": 400,
+        "tool_probe_hours": 24,              # 7.71: one tiny tool-call probe per ready site per this many hours (0 = off)
         "system_limit": 12000,
         "result_limit": 20000,
         "history_limit": 60000,
@@ -857,7 +896,7 @@ class Config:
         "max_body_mb": 32,
         "queue_wait_seconds": 300,
         "allow_private_api_hosts": False,    # opt-in for local model servers (Ollama, LM Studio ...)
-        "client_model_prefixes": ["claude-"],  # client model names that mean "use bridge-auto" (data, editable)
+        "client_model_prefixes": ["claude-", "sonnet", "opus", "haiku"],  # recognized Claude Code aliases route to the configured Bridge policy
         "catalog_ttl_seconds": 86400,        # model catalog is refreshed when older than this (0 = only on demand)
         "catalog_auto_refresh": True,        # discover on account add/login and when stale; never polls in the background
         "catalog_retry_seconds": 300,        # minimum gap between automatic (non-explicit) refresh attempts
@@ -920,6 +959,7 @@ class Config:
     def set(self, k: str, v: Any) -> None:
         self.data[k] = v
         self.save()
+        configure_reliability(self)
 
     def add_key(self, label: str, account: str = "") -> Dict[str, Any]:
         k = self._mk_key(label or "client", account)
@@ -2059,7 +2099,7 @@ def build_evidence(probes: List[Dict[str, Any]], storage: Dict[str, Any], secret
 # The user's own Chrome is the browser. A Manifest-V3 extension (embedded below, extracted at run time) executes commands that the bridge sends over an
 # authenticated loopback channel; a small Playwright-shaped compatibility layer (PCContext / PCPage / PCLocator / PCCdpSession) keeps every existing call site working.
 # ============================================================================
-PC_VERSION = "1.1.0"
+PC_VERSION = "1.3.1"
 
 PC_BACKGROUND_JS = r"""'use strict';
 // AI Web Bridge - Personal Chrome extension (service worker). Talks ONLY to http://127.0.0.1:<port>/pc/* with a bearer token obtained by one-time pairing.
@@ -2067,12 +2107,22 @@ const ALLOWED_DOMAINS = ['Page', 'Runtime', 'Network', 'Input', 'DOM', 'Debugger
 const BLOCKED_METHODS = new Set(['Network.getAllCookies', 'Network.clearBrowserCookies', 'Network.deleteCookies', 'Runtime.compileScript']);
 const SID = Date.now().toString(36) + Math.random().toString(36).slice(2);   // changes whenever the worker restarts: the bridge then re-validates its tabs
 const POLL_MS = 20000, FLUSH_MS = 120, MAX_BATCH = 400, RESULT_CACHE = 300;
-let cfg = null;                          // {port, token}
+let cfg = null;                          // {port, token, clientId}
+let identity = null;                     // stable per Chrome profile, isolated by chrome.storage.local
 let cmdCache = new Map();                // command id -> result (duplicate-command protection: a re-delivered command is never executed twice)
 let attached = new Map();                // tabId -> {owned, sinceMs}
 let evq = [], flushTimer = null, polling = false, lastError = '', lastOk = 0, inspecting = 0;
 
-async function loadCfg() { if (!cfg) { const s = await chrome.storage.local.get(['port', 'token']); cfg = (s.port && s.token) ? {port: s.port, token: s.token} : null; } return cfg; }
+async function getIdentity() {
+  if (!identity) {
+    const s = await chrome.storage.local.get(['clientId', 'profileName', 'token']);
+    const clientId = s.clientId || (s.token ? 'legacy' : (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2)));
+    identity = {clientId, profileName: s.profileName || ('Chrome ' + clientId.slice(0, 8))};
+    if (!s.clientId) await chrome.storage.local.set({clientId: identity.clientId});
+  }
+  return identity;
+}
+async function loadCfg() { if (!cfg) { const [s, i] = await Promise.all([chrome.storage.local.get(['port', 'token']), getIdentity()]); cfg = (s.port && s.token) ? {port: s.port, token: s.token, clientId: i.clientId} : null; } return cfg; }
 async function owned() { const s = await chrome.storage.session.get('owned'); return new Set(s.owned || []); }
 async function setOwned(set) { await chrome.storage.session.set({owned: [...set]}); }
 async function consented() { const s = await chrome.storage.session.get('consent'); return new Set(s.consent || []); }
@@ -2081,7 +2131,8 @@ function badge() { chrome.action.setBadgeText({text: attached.size ? String(atta
 
 async function api(path, body, signal) {
   const c = await loadCfg(); if (!c) throw new Error('not paired');
-  const r = await fetch('http://127.0.0.1:' + c.port + path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Bridge-PC-Token': c.token}, body: JSON.stringify(body || {}), signal});
+  const payload = Object.assign({}, body || {}, {client_id: c.clientId});
+  const r = await fetch('http://127.0.0.1:' + c.port + path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Bridge-PC-Token': c.token}, body: JSON.stringify(payload), signal});
   if (r.status === 401 || r.status === 403) { cfg = null; await chrome.storage.local.remove('token'); throw new Error('rejected by the bridge (pair again)'); }
   if (!r.ok) throw new Error('bridge http ' + r.status);
   return r.json();
@@ -2114,7 +2165,7 @@ async function opAllowed(tabId) { const o = await owned(), c = await consented()
 
 const OPS = {
   async ping() { return {pong: true, version: chrome.runtime.getManifest().version, attached: [...attached.keys()]}; },
-  async 'tabs.list'() { const o = await owned(), c = await consented(); const all = await chrome.tabs.query({}); return all.filter(t => o.has(t.id) || c.has(t.id)).map(t => Object.assign(slim(t), {owned: o.has(t.id)})); },
+  async 'tabs.list'() { const o = await owned(), c = await consented(); const all = await chrome.tabs.query({}); return all.filter(t => o.has(t.id) || c.has(t.id)).map(t => Object.assign(slim(t), {owned: o.has(t.id), consented: c.has(t.id)})); },
   async 'tab.get'(a) { if (!(await opAllowed(a.tab))) throw new Error('tab not allowed'); return slim(await chrome.tabs.get(a.tab)); },
   async 'tab.create'(a) {
     const url = (a.url && /^(https?:|about:blank$)/.test(a.url)) ? a.url : 'about:blank';
@@ -2167,17 +2218,50 @@ chrome.runtime.onMessage.addListener((msg, sender, send) => {
   (async () => {
     if (msg.type === 'pair') {
       try {
-        const r = await fetch('http://127.0.0.1:' + msg.port + '/pc/pair', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({code: msg.code})});
+        const ident = await getIdentity();
+        const r = await fetch('http://127.0.0.1:' + msg.port + '/pc/pair', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({code: msg.code, client_id: ident.clientId, client_name: String(msg.profileName || ident.profileName || '').slice(0, 80)})});
         const j = await r.json(); if (!r.ok) throw new Error(j.error || ('http ' + r.status));
-        await chrome.storage.local.set({port: msg.port, token: j.token}); cfg = null; pollLoop(); send({ok: true});
+        identity = Object.assign(ident, {profileName: String(msg.profileName || ident.profileName || '')});
+        await chrome.storage.local.set({port: msg.port, token: j.token, profileName: identity.profileName}); cfg = null; pollLoop(); send({ok: true, clientId: ident.clientId});
       } catch (e) { send({ok: false, error: String(e.message || e)}); }
     } else if (msg.type === 'status') {
-      const c = await loadCfg(), o = await owned(), allow = await consented(); send({paired: !!c, port: c && c.port, attached: [...attached.keys()], ownedTabs: [...o], allowedTabs: [...new Set([...o, ...allow])], lastError, lastOk, polling});
+      const c = await loadCfg(), i = await getIdentity(), o = await owned(), allow = await consented(), login = await chrome.storage.local.get(['loginAccountId', 'loginTabId']); send({paired: !!c, port: c && c.port, clientId: i.clientId, profileName: i.profileName, hasLogin: !!login.loginAccountId, loginAccountId: login.loginAccountId || '', loginTabId: login.loginTabId || null, attached: [...attached.keys()], ownedTabs: [...o], allowedTabs: [...new Set([...o, ...allow])], lastError, lastOk, polling});
+    } else if (msg.type === 'profile_name') {
+      const i = await getIdentity(); i.profileName = String(msg.name || '').replace(/[\x00-\x1f\x7f]/g, '').trim().slice(0, 80) || ('Chrome ' + i.clientId.slice(0, 8)); identity = i; await chrome.storage.local.set({profileName: i.profileName});
+      try { if (await loadCfg()) await api('/pc/profile-name', {name: i.profileName}); } catch (e) { lastError = String(e.message || e); }
+      send({ok: true, profileName: i.profileName});
+    } else if (msg.type === 'login_requests') {
+      try { const r = await api('/pc/login-requests', {}); send({ok: true, requests: r.requests || []}); } catch (e) { send({ok: false, error: String(e.message || e), requests: []}); }
+    } else if (msg.type === 'register_active_tab') {
+      try {
+        const [active] = await chrome.tabs.query({active: true, currentWindow: true});
+        if (!active || active.id !== msg.tabId || !/^https?:\/\//i.test(active.url || '')) throw new Error('Open the AI site tab you want to add, then try again.');
+        const r = await api('/pc/register-tab', {tab: active.id, url: active.url, title: active.title || ''});
+        const c = await consented(); c.add(active.id); await setConsent(c);
+        await chrome.storage.local.set({loginAccountId: r.account_id, loginTabId: active.id});
+        send({ok: true, accountId: r.account_id, label: r.label});
+      } catch (e) { send({ok: false, error: String(e.message || e)}); }
+    } else if (msg.type === 'claim_login') {
+      try {
+        const r = await api('/pc/login-claim', {account_id: String(msg.accountId || '')});
+        const tab = await chrome.tabs.create({url: r.url, active: true}); const o = await owned(); o.add(tab.id); await setOwned(o);
+        await chrome.storage.local.set({loginAccountId: r.account_id, loginTabId: tab.id}); send({ok: true, tab: tab.id});
+      } catch (e) { send({ok: false, error: String(e.message || e)}); }
+    } else if (msg.type === 'confirm_login') {
+      try {
+        const s = await chrome.storage.local.get(['loginAccountId', 'loginTabId']);
+        const [active] = await chrome.tabs.query({active: true, currentWindow: true});
+        if (!s.loginAccountId || !active || active.id !== s.loginTabId) throw new Error('Return to the site tab opened for this account, then confirm again.');
+        const tab = await chrome.tabs.get(s.loginTabId);
+        const r = await api('/pc/login-confirm', {account_id: s.loginAccountId, tab: tab.id, url: tab.url || tab.pendingUrl || ''});
+        await chrome.storage.local.remove(['loginAccountId', 'loginTabId']); send({ok: true, result: r});
+      } catch (e) { send({ok: false, error: String(e.message || e)}); }
     } else if (msg.type === 'allow_tab') {
       const c = await consented(); c.add(msg.tab); await setConsent(c); send({ok: true});
     } else if (msg.type === 'revoke_tab') {
       const c = await consented(); c.delete(msg.tab); await setConsent(c); if (attached.has(msg.tab)) await OPS['cdp.detach']({tab: msg.tab}); send({ok: true});
     } else if (msg.type === 'unpair') {
+      try { if (await loadCfg()) await api('/pc/unpair', {}); } catch (e) {}
       for (const t of [...attached.keys()]) await OPS['cdp.detach']({tab: t}); await chrome.storage.local.remove(['token', 'port']); cfg = null; send({ok: true});
     } else send({ok: false, error: 'unknown message'});
   })();
@@ -2196,15 +2280,16 @@ PC_POPUP_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><
 <section class="status-card"><div class="status-line"><i id="dot" class="dot"></i><div><strong id="state-title">Checking connection…</strong><p id="state-detail" class="muted"></p></div></div>
 <div class="metrics"><div><b id="tab-count">0</b><span data-i="tabs_shared">tabs shared</span></div><div><b id="port-value">—</b><span data-i="local_port">local port</span></div></div></section>
 <section id="pairbox" class="panel" hidden><h2 data-i="pair_title">Connect to your bridge</h2><p class="muted" data-i="pair_hint">Enter the one-time code shown in the Bridge dashboard.</p>
-<label class="field"><span data-i="port_label">Port</span><input id="port" inputmode="numeric" value="18765" maxlength="5"></label><label class="field"><span data-i="code_label">One-time code</span><input id="code" autocomplete="one-time-code" maxlength="8" placeholder="8 characters"></label><button id="pair" class="primary" data-i="connect">Connect securely</button><p id="pair-error" class="error" hidden></p></section>
+<label class="field"><span data-i="profile_label">Chrome profile name</span><input id="profile-name" maxlength="80" placeholder="Work, personal…"></label><label class="field"><span data-i="port_label">Port</span><input id="port" inputmode="numeric" value="18765" maxlength="5"></label><label class="field"><span data-i="code_label">One-time code</span><input id="code" autocomplete="one-time-code" maxlength="8" placeholder="8 characters"></label><button id="pair" class="primary" data-i="connect">Connect securely</button><p id="pair-error" class="error" hidden></p></section>
 <section id="tabbox" class="panel" hidden><div class="section-heading"><h2 data-i="this_tab">This tab</h2><span id="tab-badge" class="tag"></span></div><p id="tab-title" class="tab-title"></p><p id="tab-host" class="muted ltr"></p><p id="tab-note" class="muted note"></p>
 <button id="allow" class="primary" data-i="allow">Allow this tab</button><button id="revoke" class="secondary" data-i="revoke">Stop sharing</button></section>
+<section id="loginbox" class="panel" hidden><div class="section-heading"><h2 data-i="login_requests">Accounts waiting for login</h2><span id="profile-tag" class="tag"></span></div><label class="field"><span data-i="profile_label">Chrome profile name</span><input id="profile-name-active" maxlength="80"></label><button id="profile-save" class="secondary" data-i="save_profile">Save profile name</button><button id="register-tab" class="primary">Add this site from current tab</button><p id="register-hint" class="muted note">Open the AI site in this Chrome profile. This tab is added to Bridge without opening another browser window.</p><div id="login-list"></div><button id="login-confirm" class="primary" data-i="confirm_login" disabled>I'm signed in — confirm</button><p id="login-note" class="muted note"></p></section>
 <details class="privacy"><summary data-i="privacy_title">A small privacy promise</summary><p data-i="privacy_body">Only tabs opened by Bridge or tabs you allow here can be inspected. The link stays on this computer. Chrome shows its own notice while a tab is being inspected.</p></details>
 <footer><span class="local-mark"><i></i><span data-i="local_only">Private · this computer only</span></span><button id="unpair" class="link-button" data-i="disconnect" hidden>Disconnect</button></footer><script src="popup.js"></script></body></html>"""
 
 PC_POPUP_JS = r"""const $ = id => document.getElementById(id);
 const send = m => new Promise((resolve, reject) => chrome.runtime.sendMessage(m, r => { if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message)); else resolve(r || {}); }));
-const words = {en:{tagline:'Your browser, with permission.',tabs_shared:'tabs shared',local_port:'local port',pair_title:'Connect to your bridge',pair_hint:'Enter the one-time code shown in the Bridge dashboard.',port_label:'Port',code_label:'One-time code',connect:'Connect securely',this_tab:'This tab',allow:'Allow this tab',revoke:'Stop sharing',privacy_title:'A small privacy promise',privacy_body:'Only tabs opened by Bridge or tabs you allow here can be inspected. The link stays on this computer. Chrome shows its own notice while a tab is being inspected.',local_only:'Private · this computer only',disconnect:'Disconnect',checking:'Checking connection…',not_paired:'Not connected yet',connect_hint:'Use the one-time code from the Bridge dashboard.',connected:'Connected',waiting:'Bridge is reconnecting',waiting_hint:'Keep the Bridge app running on this computer.',tab_owned:'Bridge opened this tab',tab_allowed:'You allowed this tab',tab_not_shared:'Only you can see this tab',internal:'Chrome does not allow extensions to inspect this page.',tab_hint:'Bridge can use this tab only after you allow it.',allow_done:'This tab is shared with Bridge.',revoke_done:'Bridge no longer has access to this tab.',bad_pair:'Could not connect: ',pair_ok:'Connected securely.',pair_invalid:'Enter a valid port and 8-character code.',disconnect_confirm:'Disconnect this browser from Bridge?',disconnected:'Disconnected.',error:'Something went wrong. Try again.'},fa:{tagline:'مرورگر خودت، با اجازه‌ی خودت.',tabs_shared:'زبانه‌ی در دسترس',local_port:'درگاه محلی',pair_title:'اتصال به Bridge',pair_hint:'کد یک‌بارمصرف را از داشبورد Bridge وارد کن.',port_label:'درگاه',code_label:'کد یک‌بارمصرف',connect:'اتصال امن',this_tab:'این زبانه',allow:'اجازه‌ی دسترسی',revoke:'قطع دسترسی',privacy_title:'قول کوچک حریم خصوصی',privacy_body:'فقط زبانه‌هایی که Bridge باز کرده یا خودت اجازه داده‌ای قابل بررسی‌اند. ارتباط فقط روی همین کامپیوتر است. هنگام بررسی زبانه، Chrome اعلان خودش را نشان می‌دهد.',local_only:'خصوصی · فقط همین کامپیوتر',disconnect:'قطع اتصال',checking:'در حال بررسی اتصال…',not_paired:'هنوز متصل نشده',connect_hint:'کد یک‌بارمصرف را از داشبورد Bridge بردار.',connected:'متصل است',waiting:'Bridge در حال اتصال دوباره است',waiting_hint:'برنامه‌ی Bridge را روی همین کامپیوتر باز نگه دار.',tab_owned:'Bridge این زبانه را باز کرده',tab_allowed:'خودت اجازه داده‌ای',tab_not_shared:'فقط خودت به این زبانه دسترسی داری',internal:'افزونه‌ها اجازه‌ی بررسی این صفحه‌ی داخلی Chrome را ندارند.',tab_hint:'Bridge فقط پس از اجازه‌ی تو می‌تواند از این زبانه استفاده کند.',allow_done:'این زبانه با Bridge به‌اشتراک گذاشته شد.',revoke_done:'دسترسی Bridge به این زبانه قطع شد.',bad_pair:'اتصال برقرار نشد: ',pair_ok:'اتصال امن برقرار شد.',pair_invalid:'درگاه معتبر و کد ۸ حرفی را وارد کن.',disconnect_confirm:'اتصال این مرورگر با Bridge قطع شود؟',disconnected:'اتصال قطع شد.',error:'مشکلی پیش آمد. دوباره تلاش کن.'}};
+const words = {en:{tagline:'Your browser, with permission.',tabs_shared:'tabs shared',local_port:'local port',pair_title:'Connect to your bridge',pair_hint:'Enter the one-time code shown in the Bridge dashboard.',profile_label:'Chrome profile name',save_profile:'Save profile name',login_requests:'Accounts waiting for login',login_open:'Open login page',confirm_login:"I'm signed in — confirm",login_none:'No account is waiting for this profile.',login_done:'Login confirmed. Bridge is saving this account.',login_claimed:'Assigned to this Chrome profile',port_label:'Port',code_label:'One-time code',connect:'Connect securely',this_tab:'This tab',allow:'Allow this tab',revoke:'Stop sharing',privacy_title:'A small privacy promise',privacy_body:'Only tabs opened by Bridge or tabs you allow here can be inspected. The link stays on this computer. Chrome shows its own notice while a tab is being inspected.',local_only:'Private · this computer only',disconnect:'Disconnect',checking:'Checking connection…',not_paired:'Not connected yet',connect_hint:'Use the one-time code from the Bridge dashboard.',connected:'Connected',waiting:'Bridge is reconnecting',waiting_hint:'Keep the Bridge app running on this computer.',tab_owned:'Bridge opened this tab',tab_allowed:'You allowed this tab',tab_not_shared:'Only you can see this tab',internal:'Chrome does not allow extensions to inspect this page.',tab_hint:'Bridge can use this tab only after you allow it.',allow_done:'This tab is shared with Bridge.',revoke_done:'Bridge no longer has access to this tab.',bad_pair:'Could not connect: ',pair_ok:'Connected securely.',pair_invalid:'Enter a valid port and 8-character code.',disconnect_confirm:'Disconnect this browser from Bridge?',disconnected:'Disconnected.',error:'Something went wrong. Try again.'},fa:{tagline:'مرورگر خودت، با اجازه‌ی خودت.',tabs_shared:'زبانه‌ی در دسترس',local_port:'درگاه محلی',pair_title:'اتصال به Bridge',pair_hint:'کد یک‌بارمصرف را از داشبورد Bridge وارد کن.',profile_label:'نام این پروفایل Chrome',save_profile:'ذخیره‌ی نام پروفایل',login_requests:'حساب‌های منتظر ورود',login_open:'باز کردن صفحه‌ی ورود',confirm_login:'وارد شدم — تأیید',login_none:'حسابی برای این پروفایل منتظر ورود نیست.',login_done:'ورود تأیید شد؛ Bridge در حال ذخیره‌ی حساب است.',login_claimed:'به این پروفایل Chrome اختصاص دارد',port_label:'درگاه',code_label:'کد یک‌بارمصرف',connect:'اتصال امن',this_tab:'این زبانه',allow:'اجازه‌ی دسترسی',revoke:'قطع دسترسی',privacy_title:'قول کوچک حریم خصوصی',privacy_body:'فقط زبانه‌هایی که Bridge باز کرده یا خودت اجازه داده‌ای قابل بررسی‌اند. ارتباط فقط روی همین کامپیوتر است. هنگام بررسی زبانه، Chrome اعلان خودش را نشان می‌دهد.',local_only:'خصوصی · فقط همین کامپیوتر',disconnect:'قطع اتصال',checking:'در حال بررسی اتصال…',not_paired:'هنوز متصل نشده',connect_hint:'کد یک‌بارمصرف را از داشبورد Bridge بردار.',connected:'متصل است',waiting:'Bridge در حال اتصال دوباره است',waiting_hint:'برنامه‌ی Bridge را روی همین کامپیوتر باز نگه دار.',tab_owned:'Bridge این زبانه را باز کرده',tab_allowed:'خودت اجازه داده‌ای',tab_not_shared:'فقط خودت به این زبانه دسترسی داری',internal:'افزونه‌ها اجازه‌ی بررسی این صفحه‌ی داخلی Chrome را ندارند.',tab_hint:'Bridge فقط پس از اجازه‌ی تو می‌تواند از این زبانه استفاده کند.',allow_done:'این زبانه با Bridge به‌اشتراک گذاشته شد.',revoke_done:'دسترسی Bridge به این زبانه قطع شد.',bad_pair:'اتصال برقرار نشد: ',pair_ok:'اتصال امن برقرار شد.',pair_invalid:'درگاه معتبر و کد ۸ حرفی را وارد کن.',disconnect_confirm:'اتصال این مرورگر با Bridge قطع شود؟',disconnected:'اتصال قطع شد.',error:'مشکلی پیش آمد. دوباره تلاش کن.'}};
 const lang=(navigator.language||'en').toLowerCase().startsWith('fa')?'fa':'en', t=k=>(words[lang]||words.en)[k]||words.en[k]||k;
 document.documentElement.lang=lang;document.documentElement.dir=lang==='fa'?'rtl':'ltr';document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));
 let currentTab=null, busy=false;const isInternal=url=>/^(chrome|edge|about|devtools|chrome-extension):/.test(url||'')||/chromewebstore\.google\.com/.test(url||'');
@@ -2218,11 +2303,21 @@ async function refresh(){if(busy)return;try{const [s]=await Promise.all([send({t
   $('tab-badge').textContent=internal?'':owned?t('tab_owned'):allowed?t('tab_allowed'):t('tab_not_shared');$('tab-badge').className='tag '+(owned||allowed?'tag-on':'');
   $('tab-note').textContent=internal?t('internal'):(owned||allowed?'':t('tab_hint'));
   $('allow').hidden=internal||owned||allowed;$('revoke').hidden=internal||(!allowed&&!attached);$('allow').disabled=!id;$('revoke').disabled=!id;
+   $('loginbox').hidden=!paired;$('profile-tag').textContent=s.profileName||('Chrome '+String(s.clientId||'').slice(0,8));
+   $('register-tab').textContent=lang==='fa'?'افزودن حساب از زبانه‌ی فعلی':'Add this site from current tab';$('register-hint').textContent=lang==='fa'?'سایت هوش مصنوعی را در همین پروفایل باز کن؛ بدون بازکردن پنجره‌ی دیگر به Bridge اضافه می‌شود.':'Open the AI site in this Chrome profile. This tab is added to Bridge without opening another browser window.';
+   $('register-tab').disabled=!currentTab||internal||!/^https?:\/\//i.test(url);
+  const pn=$('profile-name-active');if(document.activeElement!==pn)pn.value=s.profileName||'';
+  $('login-confirm').disabled=!s.hasLogin||!currentTab||currentTab.id!==s.loginTabId;$('login-note').textContent=s.hasLogin?(currentTab&&currentTab.id===s.loginTabId?t('login_done'):(lang==='fa'?'برای تأیید، به همان زبانه‌ی حساب برگرد.':'Return to this account’s site tab to confirm.')):'';
+  try{const lr=await send({type:'login_requests'});renderLoginRequests(lr.requests||[])}catch(e){renderLoginRequests([])}
 }catch(e){$('state-title').textContent=t('not_paired');$('state-detail').textContent=t('error')} }
 $('pair').onclick=async()=>{const port=Number($('port').value),code=$('code').value.trim().toUpperCase(),err=$('pair-error');err.hidden=true;if(!Number.isInteger(port)||port<1||port>65535||!/^[A-HJ-NP-Z2-9]{8}$/.test(code)){err.textContent=t('pair_invalid');err.hidden=false;return}
-  $('pair').disabled=true;try{const r=await send({type:'pair',port,code});if(!r.ok)throw new Error(r.error||t('error'));$('code').value='';$('state-detail').textContent=t('pair_ok');await refresh()}catch(e){err.textContent=t('bad_pair')+e.message;err.hidden=false}finally{$('pair').disabled=false}};
+  $('pair').disabled=true;try{const r=await send({type:'pair',port,code,profileName:$('profile-name').value.trim()});if(!r.ok)throw new Error(r.error||t('error'));$('code').value='';$('state-detail').textContent=t('pair_ok');await refresh()}catch(e){err.textContent=t('bad_pair')+e.message;err.hidden=false}finally{$('pair').disabled=false}};
 $('code').addEventListener('input',()=>{$('code').value=$('code').value.toUpperCase().replace(/[^A-HJ-NP-Z2-9]/g,'').slice(0,8)});
 $('allow').onclick=async()=>{if(currentTab)await send({type:'allow_tab',tab:currentTab.id});await refresh()};$('revoke').onclick=async()=>{if(currentTab)await send({type:'revoke_tab',tab:currentTab.id});await refresh()};
+function renderLoginRequests(rows){const box=$('login-list');box.textContent='';if(!rows.length){const p=document.createElement('p');p.className='muted';p.textContent=t('login_none');box.appendChild(p);return}for(const row of rows){const card=document.createElement('div');card.className='request-row';const text=document.createElement('div'),name=document.createElement('strong'),host=document.createElement('p'),btn=document.createElement('button');name.textContent=row.label||row.host;host.className='muted ltr';host.textContent=row.host||'';btn.className='secondary';btn.textContent=row.claimed?t('login_claimed'):t('login_open');btn.disabled=!!row.claimed;if(!row.claimed)btn.onclick=async()=>{btn.disabled=true;try{const r=await send({type:'claim_login',accountId:row.id});if(!r.ok)throw new Error(r.error||t('error'));window.close()}catch(e){$('login-note').textContent=e.message;btn.disabled=false;await refresh()}};text.append(name,host);card.append(text,btn);box.appendChild(card)}}
+$('profile-save').onclick=async()=>{const r=await send({type:'profile_name',name:$('profile-name-active').value});if(r.ok){$('profile-tag').textContent=r.profileName||'Chrome';$('login-note').textContent=t('save_profile')}};
+ $('register-tab').onclick=async()=>{const b=$('register-tab');if(!currentTab)return;b.disabled=true;try{const r=await send({type:'register_active_tab',tabId:currentTab.id});if(!r.ok)throw new Error(r.error||t('error'));$('login-note').textContent=lang==='fa'?`حساب ${r.label||''} اضافه شد. اگر وارد نشده‌ای، در همین زبانه وارد شو؛ بعد تأیید ورود را بزن.`:`${r.label||'Account'} added. Sign in on this tab if needed, then confirm.`;await refresh()}catch(e){$('login-note').textContent=e.message;await refresh()}};
+$('login-confirm').onclick=async()=>{const b=$('login-confirm');b.disabled=true;try{const r=await send({type:'confirm_login'});if(!r.ok)throw new Error(r.error||t('error'));$('login-note').textContent=t('login_done');await refresh()}catch(e){$('login-note').textContent=e.message;await refresh()}};
 $('unpair').onclick=async()=>{if(!confirm(t('disconnect_confirm')))return;await send({type:'unpair'});$('state-detail').textContent=t('disconnected');await refresh()};
 refresh();setInterval(refresh,2500);"""
 
@@ -2381,10 +2476,10 @@ def pc_validate_command(op: str, args: Dict[str, Any]) -> None:
 
 
 class _PCCmd:
-    __slots__ = ("id", "op", "args", "state", "result", "error", "ev", "safe", "t_sent", "cancelled")
+    __slots__ = ("id", "op", "args", "client_id", "state", "result", "error", "ev", "safe", "t_sent", "cancelled")
 
-    def __init__(self, op: str, args: Dict[str, Any]):
-        self.id, self.op, self.args = uuid.uuid4().hex, op, args
+    def __init__(self, op: str, args: Dict[str, Any], client_id: str = "legacy"):
+        self.id, self.op, self.args, self.client_id = uuid.uuid4().hex, op, args, client_id
         self.state, self.result, self.error, self.ev, self.t_sent, self.cancelled = "queued", None, None, threading.Event(), 0.0, False
         self.safe = op in PC_SAFE_OPS or (op == "cdp.send" and str(args.get("method")) in PC_SAFE_CDP)
 
@@ -2402,18 +2497,26 @@ class PCHub:
         self.queue: deque = deque()
         self.srv: Optional[ThreadingHTTPServer] = None
         self.last_poll = 0.0
-        self._sid = ""                                                       # id of the extension worker that polled last (changes on every worker restart)
+        self._sid_by_client: Dict[str, str] = {}
+        self._last_poll_by_client: Dict[str, float] = {}
         self.epoch = 0
         self.grace = PC_CONNECT_GRACE
         self.listeners: List[Callable[[Dict[str, Any]], None]] = []
         self.pair_code, self.pair_until, self.pair_fails = "", 0.0, 0
+        self.login_requests_provider: Optional[Callable[[str], List[Dict[str, Any]]]] = None
+        self.login_claim_handler: Optional[Callable[[str, Dict[str, Any]], Tuple[int, Dict[str, Any]]]] = None
+        self.login_confirm_handler: Optional[Callable[[str, Dict[str, Any]], Tuple[int, Dict[str, Any]]]] = None
+        self.register_tab_handler: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None
         self.state = self._load()
         self.stats = {"events": 0, "commands": 0, "rejected": 0, "dupe_results": 0}
 
     # -- persistent pairing state (only a hash of the token is stored) -----------------------------------------------------------------------------
     def _load(self) -> Dict[str, Any]:
         try:
-            return json.loads((self.root / "pairing.json").read_text("utf-8"))
+            data = json.loads((self.root / "pairing.json").read_text("utf-8"))
+            if data.get("token_sha256") and not data.get("clients"):
+                data["clients"] = {"legacy": {"token_sha256": data["token_sha256"], "name": "Chrome profile", "paired_at": data.get("paired_at", 0)}}
+            return data
         except Exception:
             return {}
 
@@ -2428,23 +2531,119 @@ class PCHub:
         os.replace(tmp, p)
 
     def new_pairing(self) -> str:
-        """A one-time code, valid ten minutes. A successful pairing replaces the stored token and the pinned extension id."""
+        """Create a one-time code for adding one independent Chrome profile."""
         with self.lock:
             self.pair_code = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
             self.pair_until, self.pair_fails = time.time() + 600, 0
             return self.pair_code                                                    # the previous pairing stays valid until a new one succeeds
 
     def paired(self) -> bool:
-        return bool(self.state.get("token_sha256") and self.state.get("origin"))
+        return bool(self.state.get("origin") and (self.state.get("clients") or self.state.get("token_sha256")))
 
-    def connected(self) -> bool:
-        return self.paired() and (time.time() - self.last_poll) < self.grace
+    def client_for_token(self, origin: str, token: str) -> str:
+        if not origin or origin != self.state.get("origin") or not token:
+            return ""
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        for cid, rec in (self.state.get("clients") or {}).items():
+            if hmac.compare_digest(digest, str(rec.get("token_sha256") or "")):
+                return str(cid)
+        if hmac.compare_digest(digest, str(self.state.get("token_sha256") or "")):
+            return "legacy"
+        return ""
+
+    def connected(self, client_id: str = "") -> bool:
+        if not self.paired():
+            return False
+        if client_id:
+            return client_id in (self.state.get("clients") or {}) and time.time() - self._last_poll_by_client.get(client_id, 0) < self.grace
+        return any(time.time() - t < self.grace for t in self._last_poll_by_client.values())
+
+    def default_client_id(self) -> str:
+        clients = self.state.get("clients") or {}
+        if "legacy" in clients:
+            return "legacy"
+        return next(iter(clients), "legacy")
+
+    def profiles(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            return [{"id": cid, "name": str(rec.get("name") or "Chrome profile")[:80], "paired": True, "connected": self.connected(cid),
+                     "last_seen": round(self._last_poll_by_client.get(cid, 0), 3) or None}
+                    for cid, rec in (self.state.get("clients") or {}).items()]
+
+    def rename_profile(self, client_id: str, name: str) -> Dict[str, Any]:
+        clean = re.sub(r"[\x00-\x1f\x7f]", "", str(name or "")).strip()[:80] or "Chrome profile"
+        with self.lock:
+            clients = dict(self.state.get("clients") or {})
+            if client_id not in clients:
+                raise BridgeError("Chrome profile is not paired", "client", 404)
+            clients[client_id] = {**clients[client_id], "name": clean}
+            self.state["clients"] = clients
+            self._save()
+        return {"ok": True, "client_id": client_id, "name": clean}
+
+    def login_requests(self, client_id: str) -> List[Dict[str, Any]]:
+        try:
+            return list(self.login_requests_provider(client_id) or []) if self.login_requests_provider else []
+        except Exception as e:
+            log(f"personal Chrome login request list failed: {type(e).__name__}", "warn")
+            return []
+
+    def login_claim(self, client_id: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        if not self.login_claim_handler:
+            return 503, {"error": "login requests are not available"}
+        try:
+            return self.login_claim_handler(client_id, body)
+        except BridgeError as e:
+            return e.status, {"error": str(e)}
+        except Exception as e:
+            log(f"personal Chrome login claim failed: {type(e).__name__}", "warn")
+            return 500, {"error": "login request could not be opened"}
+
+    def login_confirm(self, client_id: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        if not self.login_confirm_handler:
+            return 503, {"error": "login confirmation is not available"}
+        try:
+            return self.login_confirm_handler(client_id, body)
+        except BridgeError as e:
+            return e.status, {"error": str(e)}
+        except Exception as e:
+            log(f"personal Chrome login confirmation failed: {type(e).__name__}", "warn")
+            return 500, {"error": "login could not be confirmed"}
+
+    def register_tab(self, client_id: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        if not self.register_tab_handler:
+            return 503, {"error": "account registration is not available"}
+        try:
+            return 200, self.register_tab_handler(client_id, body)
+        except BridgeError as e:
+            return e.status, {"error": str(e)}
+        except Exception as e:
+            log(f"personal Chrome tab registration failed: {type(e).__name__}", "warn")
+            return 500, {"error": "this tab could not be registered"}
+
+    def unpair(self, client_id: str) -> bool:
+        with self.cv:
+            clients = dict(self.state.get("clients") or {})
+            if client_id not in clients:
+                return False
+            clients.pop(client_id, None)
+            self.state["clients"] = clients
+            if not clients:
+                self.state = {}
+            self._save()
+            for c in self.cmds.values():
+                if c.client_id == client_id and c.state != "done":
+                    c.error = "this Chrome profile was disconnected"
+                    c.ev.set()
+            self.cv.notify_all()
+        self._fire({"k": "profile_unpaired", "client_id": client_id})
+        return True
 
     def status(self) -> Dict[str, Any]:
         with self.lock:
             return {"mode": pc_mode(), "listening": self.srv is not None, "port": self.port, "paired": self.paired(), "connected": self.connected(), "epoch": self.epoch,
                     "pending_commands": len(self.queue), "last_poll_age": round(time.time() - self.last_poll, 1) if self.last_poll else None, "stats": dict(self.stats),
-                    "pairing_code_active": bool(self.pair_code and time.time() < self.pair_until)}
+                    "pairing_code_active": bool(self.pair_code and time.time() < self.pair_until), "profiles": self.profiles()}
 
     # -- server ------------------------------------------------------------------------------------------------------------------------------------
     def start(self) -> bool:
@@ -2519,12 +2718,27 @@ class PCHub:
                         log_every("pc:auth:" + why_, 60, f"personal chrome channel: extension request rejected - {why_} (the extension must be paired again: python bridge.py --pc-pair)", "warn")
                         time.sleep(0.2)
                         return self._reply(401, {"error": "unauthorized"})
+                    client_id = hub.client_for_token(origin, tok)
+                    if not client_id:
+                        return self._reply(401, {"error": "unauthorized"})
                     if path == "/pc/poll":
-                        return self._reply(200, {"commands": hub._poll(min(float(body.get("wait_ms") or 20000), 25000) / 1000.0, str(body.get("sid") or "")[:64])})
+                        return self._reply(200, {"commands": hub._poll(min(float(body.get("wait_ms") or 20000), 25000) / 1000.0, str(body.get("sid") or "")[:64], client_id)})
                     if path == "/pc/result":
-                        return self._reply(200, hub._result(body))
+                        return self._reply(200, hub._result(body, client_id))
                     if path == "/pc/events":
-                        return self._reply(200, hub._events(body))
+                        return self._reply(200, hub._events(body, client_id))
+                    if path == "/pc/login-requests":
+                        return self._reply(200, {"requests": hub.login_requests(client_id)})
+                    if path == "/pc/register-tab":
+                        return self._reply(*hub.register_tab(client_id, body))
+                    if path == "/pc/login-claim":
+                        return self._reply(*hub.login_claim(client_id, body))
+                    if path == "/pc/login-confirm":
+                        return self._reply(*hub.login_confirm(client_id, body))
+                    if path == "/pc/profile-name":
+                        return self._reply(200, hub.rename_profile(client_id, str(body.get("name") or "")))
+                    if path == "/pc/unpair":
+                        return self._reply(200, {"ok": hub.unpair(client_id)})
                     return self._reply(404, {"error": "not found"})
                 except (BrokenPipeError, ConnectionResetError):
                     pass
@@ -2579,21 +2793,18 @@ class PCHub:
 
     # -- request handlers --------------------------------------------------------------------------------------------------------------------------
     def _auth(self, origin: str, token: str) -> bool:
-        st = self.state
-        if not (st.get("token_sha256") and st.get("origin")) or not origin or origin != st["origin"]:
-            return False
-        return hmac.compare_digest(hashlib.sha256(token.encode("utf-8")).hexdigest(), st["token_sha256"])
+        return bool(self.client_for_token(origin, token))
 
     def _auth_why(self, origin: str, token: str) -> str:
         """The reason a request was refused, for the log (never the token itself)."""
         st = self.state
-        if not (st.get("token_sha256") and st.get("origin")):
+        if not self.paired():
             return "not paired yet"
         if not origin:
             return "no Origin header (not sent by the extension)"
         if origin != st["origin"]:
             return "the extension id differs from the paired one (the extension was reinstalled or is another copy)"
-        return "wrong or missing token"
+        return "wrong or missing profile token"
 
     def _pair(self, origin: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         with self.lock:
@@ -2610,41 +2821,55 @@ class PCHub:
                     self.pair_code = ""
                 time.sleep(0.3)
                 return 403, {"error": "wrong code"}
+            client_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(body.get("client_id") or "legacy"))[:64] or "legacy"
+            name = re.sub(r"[\x00-\x1f\x7f]", "", str(body.get("client_name") or "Chrome profile")).strip()[:80] or "Chrome profile"
+            if self.state.get("origin") and self.state["origin"] != origin:
+                return 403, {"error": "extension id differs from the paired extension"}
+            clients = dict(self.state.get("clients") or {})
+            if client_id not in clients and len(clients) >= 100:
+                return 429, {"error": "profile limit reached (100)"}
             token = secrets.token_urlsafe(32)
-            self.state = {"token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(), "origin": origin, "paired_at": time.time(), "version": PC_VERSION}
+            clients[client_id] = {"token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(), "name": name,
+                                  "paired_at": (clients.get(client_id) or {}).get("paired_at") or time.time(), "last_repaired_at": time.time()}
+            self.state = {"clients": clients, "origin": origin, "paired_at": self.state.get("paired_at") or time.time(), "version": PC_VERSION}
             self.pair_code = ""
             self._save()
         log("personal Chrome extension paired", "ok")
         return 200, {"token": token}
 
-    def _poll(self, wait: float, sid: str = "") -> List[Dict[str, Any]]:
+    def _poll(self, wait: float, sid: str = "", client_id: str = "legacy") -> List[Dict[str, Any]]:
         end = time.time() + wait
         with self.cv:
-            new_worker = bool(sid) and bool(getattr(self, "_sid", "")) and sid != self._sid          # the worker restarted faster than the grace time: its tabs must still be re-validated
+            client_id = client_id or "legacy"
+            old_sid = self._sid_by_client.get(client_id, "")
+            new_worker = bool(sid) and bool(old_sid) and sid != old_sid
             if sid:
-                self._sid = sid
-            if time.time() - self.last_poll > self.grace or new_worker:
+                self._sid_by_client[client_id] = sid
+            if time.time() - self._last_poll_by_client.get(client_id, 0) > self.grace or new_worker:
                 self.epoch += 1                                              # a new connection: listeners re-validate tabs
-                self._fire({"k": "reconnected", "epoch": self.epoch})
-            self.last_poll = time.time()
+                self._fire({"k": "reconnected", "epoch": self.epoch, "client_id": client_id})
+            self._last_poll_by_client[client_id] = self.last_poll = time.time()
             while True:
                 out = []
-                while self.queue:
+                for _ in range(len(self.queue)):
                     c = self.queue.popleft()
+                    if c.client_id != client_id:
+                        self.queue.append(c)
+                        continue
                     if c.cancelled:
                         continue
                     c.state, c.t_sent = "sent", time.time()
                     out.append({"id": c.id, "op": c.op, "args": c.args})
                 if out or time.time() >= end or self.srv is None:
-                    self.last_poll = time.time()
+                    self._last_poll_by_client[client_id] = self.last_poll = time.time()
                     return out
                 self.cv.wait(timeout=min(1.0, max(0.05, end - time.time())))
-                self.last_poll = time.time()
+                self._last_poll_by_client[client_id] = self.last_poll = time.time()
 
-    def _result(self, body: Dict[str, Any]) -> Dict[str, Any]:
+    def _result(self, body: Dict[str, Any], client_id: str = "legacy") -> Dict[str, Any]:
         with self.cv:
             c = self.cmds.get(str(body.get("id") or ""))
-            if c is None:
+            if c is None or c.client_id != client_id:
                 return {"ok": False}
             if body.get("ack"):
                 if c.state == "sent":
@@ -2663,7 +2888,7 @@ class PCHub:
             c.ev.set()
             return {"ok": True}
 
-    def _events(self, body: Dict[str, Any]) -> Dict[str, Any]:
+    def _events(self, body: Dict[str, Any], client_id: str = "legacy") -> Dict[str, Any]:
         evs = body.get("events")
         if not isinstance(evs, list):
             return {"ok": False}
@@ -2673,7 +2898,7 @@ class PCHub:
                 if e.get("k") == "detached":
                     log_every(f"pc:detached:{e.get('tab')}", 10, f"personal chrome: the debugger was detached from tab {e.get('tab')} (reason: {str(e.get('reason'))[:80]}) - "
                               "'canceled_by_user' means the yellow 'debugging this browser' bar was closed", "warn")
-                self._fire(e)
+                self._fire({**e, "client_id": client_id})
         return {"ok": True}
 
     def _fire(self, ev: Dict[str, Any]) -> None:
@@ -2692,17 +2917,18 @@ class PCHub:
             self.listeners.remove(fn)
 
     # -- commands (called from bridge threads) -----------------------------------------------------------------------------------------------------
-    def call(self, op: str, args: Optional[Dict[str, Any]] = None, timeout: float = 30.0, cancel: Optional[threading.Event] = None, connect_wait: float = 0.0) -> Any:
+    def call(self, op: str, args: Optional[Dict[str, Any]] = None, timeout: float = 30.0, cancel: Optional[threading.Event] = None, connect_wait: float = 0.0, client_id: str = "") -> Any:
         args = args or {}
         pc_validate_command(op, args)
+        client_id = str(client_id or self.default_client_id())
         t_end = time.time() + connect_wait
-        while not self.connected():
+        while not self.connected(client_id):
             if time.time() >= t_end:
-                why_ = self.not_ready_reason()
-                log_every("pc:notready:" + why_[:50], 30, f"personal chrome: command '{op}' could not be sent - {why_}", "warn")
+                why_ = self.not_ready_reason(client_id)
+                log_every("pc:notready:" + client_id + ":" + why_[:50], 30, f"personal chrome: command '{op}' could not be sent - {why_}", "warn")
                 raise PCError(why_)
             time.sleep(0.25)
-        c = _PCCmd(op, args)
+        c = _PCCmd(op, args, client_id)
         with self.cv:
             self.cmds[c.id] = c
             self.queue.append(c)
@@ -2719,7 +2945,7 @@ class PCHub:
                     c.cancelled = True
                     raise PCError(f"{op} timed out after {timeout:g}s" + ("" if c.state == "queued" else "; the browser may or may not have executed it"),
                                   unknown_outcome=c.state != "queued" and not c.safe)
-                if not self.connected():                                      # extension went away while the command was in flight
+                if not self.connected(client_id):                             # this account's profile went away while the command was in flight
                     with self.cv:
                         if c.state in ("sent", "acked") and c.safe:
                             c.state = "queued"
@@ -2742,11 +2968,16 @@ class PCHub:
             with self.cv:
                 self.cmds.pop(c.id, None)
 
-    def not_ready_reason(self) -> str:
+    def not_ready_reason(self, client_id: str = "") -> str:
         if not self.srv:
             return "the personal-Chrome channel is not listening (port busy?); set BRIDGE_PC_PORT or close the program using it"
         if not self.paired():
             return "the Chrome extension is not paired yet: " + pc_instructions(self)
+        if client_id and client_id not in (self.state.get("clients") or {}):
+            return "the Chrome profile assigned to this account is not paired; pair that profile in the Bridge dashboard"
+        if client_id and not self.connected(client_id):
+            label = next((str(x.get("name") or cid) for cid, x in (self.state.get("clients") or {}).items() if cid == client_id), client_id)
+            return f"Chrome profile '{label}' is paired but not connected; open that Chrome profile and enable the Bridge extension"
         return "your Chrome is not connected to the bridge (is Chrome open with the 'AI Web Bridge - Personal Chrome' extension enabled?)"
 
 
@@ -3431,8 +3662,12 @@ class PCContext:
     """Plays the role of the Playwright BrowserContext for one account: the tabs it opens in the user's own Chrome (never other tabs), cookie access for the
     site, init scripts, bindings, CDP sessions. Closing it closes only the tabs it opened."""
 
-    def __init__(self, hub: PCHub, acct_id: str = "", background: bool = True):
-        self.hub, self.acct_id, self.background = hub, acct_id, background
+    def __init__(self, hub: PCHub, acct_id: str = "", background: bool = True, client_id: str = "", login_tab: Optional[int] = None, site_host: str = ""):
+        self.client_id = str(client_id or hub.default_client_id())
+        self.hub, self.acct_id, self.background = _PCProfileClient(hub, self.client_id), acct_id, background
+        self.login_tab = login_tab
+        self.site_host = str(site_host or "").lower().rstrip(".")
+        self.borrowed: Set[int] = {login_tab} if isinstance(login_tab, int) and not isinstance(login_tab, bool) else set()      # the owner's own tabs: used, detached at the end, NEVER closed
         self.cancel = threading.Event()
         self._pages: Dict[int, PCPage] = {}
         self._handlers: Dict[str, List[Callable[..., Any]]] = {}
@@ -3484,7 +3719,7 @@ class PCContext:
             return
         with self._lock:
             st = self._read_state()
-            st[self.acct_id] = [{"tab": p.tab_id, "host": (urllib.parse.urlsplit(p._url).hostname or "")} for p in self._pages.values() if not p._closed]
+            st[self.acct_id] = [{"tab": p.tab_id, "host": (urllib.parse.urlsplit(p._url).hostname or ""), "client_id": self.client_id} for p in self._pages.values() if not p._closed]
             tmp = self._state_path().with_suffix(".tmp")
             tmp.write_text(json.dumps(st), "utf-8")
             os.replace(tmp, self._state_path())
@@ -3493,17 +3728,29 @@ class PCContext:
         """After a bridge restart the tabs this account opened earlier are re-adopted - only if the browser still has them, they are still bridge-owned, and the site matches."""
         if not self.acct_id or not self.hub.connected():
             return
-        saved = {int(x["tab"]): x.get("host", "") for x in (self._read_state().get(self.acct_id) or []) if isinstance(x, dict) and isinstance(x.get("tab"), int)}
-        if not saved:
-            return
+        saved = {int(x["tab"]): x.get("host", "") for x in (self._read_state().get(self.acct_id) or []) if isinstance(x, dict) and isinstance(x.get("tab"), int)
+                 and str(x.get("client_id") or "legacy") == self.client_id}
+        if isinstance(self.login_tab, int):
+            saved.setdefault(self.login_tab, "")
         try:
             live = self.hub.call("tabs.list", {}, timeout=10) or []
         except PCError:
             return
+        live = sorted((t for t in live if isinstance(t, dict) and isinstance(t.get("id"), int)), key=lambda t: 0 if t["id"] == self.login_tab else 1)      # the owner's tab first: pages[0] is what gets used
         for t in live:
             host = (urllib.parse.urlsplit(t.get("url", "")).hostname or "")
-            if t.get("owned") and t["id"] in saved and (not saved[t["id"]] or host == saved[t["id"]]):
+            if (t.get("owned") or t.get("consented")) and t["id"] in saved and (not saved[t["id"]] or host == saved[t["id"]]):
                 self._pages[t["id"]] = PCPage(self, t["id"], t.get("url", ""), t.get("title", ""))
+        if not self._pages and self.site_host:
+            # 7.73: the remembered tab is gone (closed, Chrome restarted). Any tab of this very site that the owner handed to the bridge (consent) is the next best thing - still better than opening a new one.
+            for t in live:
+                host = (urllib.parse.urlsplit(t.get("url", "")).hostname or "").lower().rstrip(".")
+                if t.get("consented") and not t.get("owned") and host and (host == self.site_host or host.endswith("." + self.site_host) or self.site_host.endswith("." + host)):
+                    self._pages[t["id"]] = PCPage(self, t["id"], t.get("url", ""), t.get("title", ""))
+                    self.borrowed.add(t["id"])
+                    break
+        if self._pages:
+            self._write_state()
 
     @property
     def pages(self) -> List[PCPage]:
@@ -3526,10 +3773,12 @@ class PCContext:
             self.hub.call("cdp.detach", {"tab": pg.tab_id}, timeout=10)
         except PCError:
             pass
-        try:
-            self.hub.call("tab.close", {"tab": pg.tab_id}, timeout=10)
-        except PCError:
-            pass
+        # The owner-selected login tab is borrowed. Detach from Chrome but never close their tab.
+        if pg.tab_id != self.login_tab and pg.tab_id not in self.borrowed:
+            try:
+                self.hub.call("tab.close", {"tab": pg.tab_id}, timeout=10)
+            except PCError:
+                pass
         pg._mark_closed()
         self._write_state()
 
@@ -3577,6 +3826,7 @@ class PCContext:
         r = pg._cdp("Network.getCookies", {"urls": want}) or {}
         return [{"name": c["name"], "value": c["value"], "domain": c.get("domain", ""), "path": c.get("path", "/"), "expires": c.get("expires", -1), "httpOnly": c.get("httpOnly", False),
                  "secure": c.get("secure", False), "sameSite": c.get("sameSite", "Lax")} for c in r.get("cookies", [])]
+
 
     def add_cookies(self, cookies: List[Dict[str, Any]]) -> None:
         pg = next(iter(self.pages), None) or self.new_page()
@@ -3647,6 +3897,36 @@ class PCContext:
                 except Exception:
                     p._mark_closed()
         self._emit("close", self)
+
+
+class _PCProfileClient:
+    """A profile-bound view of the shared local hub. It never receives commands/events for another Chrome profile."""
+    def __init__(self, hub: PCHub, client_id: str):
+        self._hub, self.client_id = hub, client_id
+        self._listeners: Dict[Callable[[Dict[str, Any]], None], Callable[[Dict[str, Any]], None]] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._hub, name)
+
+    def call(self, op: str, args: Optional[Dict[str, Any]] = None, **kw: Any) -> Any:
+        return self._hub.call(op, args, client_id=self.client_id, **kw)
+
+    def connected(self) -> bool:
+        return self._hub.connected(self.client_id)
+
+    def add_listener(self, fn: Callable[[Dict[str, Any]], None]) -> None:
+        if fn in self._listeners:
+            return
+        def filtered(ev: Dict[str, Any]) -> None:
+            if ev.get("client_id") == self.client_id:
+                fn(ev)
+        self._listeners[fn] = filtered
+        self._hub.add_listener(filtered)
+
+    def remove_listener(self, fn: Callable[[Dict[str, Any]], None]) -> None:
+        wrapped = self._listeners.pop(fn, None)
+        if wrapped:
+            self._hub.remove_listener(wrapped)
 
 
 PC_CAPABILITIES = [
@@ -3773,22 +4053,52 @@ class AccountBrowser:
     """One persistent browser profile per account, owned by one thread (Playwright sync API is thread-bound).
     Closes itself after an idle period so it does not hold RAM."""
 
-    def __init__(self, acct_id: str, profile: Path, idle: float = 90):
+    def __init__(self, acct_id: str, profile: Path, idle: float = 90, pc_client_id: str = "", login_tab: Optional[int] = None):
         self.acct_id, self.profile, self.idle = acct_id, profile, idle
+        self.pc_client_id, self.login_tab = str(pc_client_id or ""), login_tab
+        self.site_host = ""
         self.q: "queue.Queue" = queue.Queue()
         self.thread: Optional[threading.Thread] = None
         self.lock = threading.Lock()
         self.mode: Optional[bool] = None     # headless flag of the live context
         self.page_cache: Dict[str, Any] = {}
+        self.cur_job: Tuple[str, float] = ("", 0.0)   # 7.74: (name, started) of the job the worker thread is running right now
 
     def run(self, fn: Callable[[Any], Any], headless: bool = True, idle: Optional[float] = None) -> Any:
         fut: Future = Future()
         with self.lock:
             if not self.thread or not self.thread.is_alive():
-                self.thread = threading.Thread(target=self._loop, daemon=True, name=f"browser-{self.acct_id}")
+                self.thread = threading.Thread(target=self._loop, args=(self.q,), daemon=True, name=f"browser-{self.acct_id}")
                 self.thread.start()
-        self.q.put((fn, headless, idle, fut))
-        return fut.result()
+            q_, th_ = self.q, self.thread
+        q_.put((fn, headless, idle, fut))
+        t0, last_say = time.monotonic(), 0.0
+        name = getattr(fn, "__qualname__", "job").split(".")[-1]
+        while True:                                                  # 7.74: never wait silently and forever behind a job that is stuck
+            try:
+                return fut.result(timeout=5)
+            except FutureTimeout:
+                pass
+            waited = time.monotonic() - t0
+            if waited - last_say >= 30:
+                last_say = waited
+                cn, cs = self.cur_job
+                stack = ""
+                try:
+                    fr = sys._current_frames().get(th_.ident)
+                    if fr is not None:
+                        stack = " <- ".join(f"{os.path.basename(f.filename)}:{f.lineno}:{f.name}" for f in reversed(traceback.extract_stack(fr)[-6:]))
+                except Exception:
+                    pass
+                log(f"browser job '{name}' has waited {int(waited)}s; the browser thread is running '{cn or 'nothing'}' for {int(time.monotonic() - cs) if cs else 0}s at: {stack or '?'}", "warn")
+            if waited >= max(180.0, float(idle or 0) + 60.0) and not fut.done():
+                with self.lock:                                       # abandon the stuck worker: a fresh thread + queue take over, the old one ends whenever its job returns
+                    if self.q is q_:
+                        self.q = queue.Queue()
+                        self.thread = None
+                        self.cur_job = ("", 0.0)
+                fut.cancel()
+                raise BridgeError(f"the browser connection was stuck for {int(waited)}s (job '{name}'); it was reset, please retry", "upstream", 503)
 
     def close(self) -> None:
         fut: Future = Future()
@@ -3802,9 +4112,10 @@ class AccountBrowser:
     def _open(self, pw: Any, headless: bool) -> Any:
         if pc_mode() == "personal_chrome":                      # the user's own Chrome: a context that owns only the tabs it opens (headless=True -> background tabs)
             hub = pc_hub(self.profile.parent.parent)
-            if not hub.connected():
-                hub = pc_ensure_ready(self.profile.parent.parent)
-            return PCContext(hub, self.acct_id, background=bool(headless))
+            if hub.srv is None:
+                hub.start()
+            cid = self.pc_client_id or hub.default_client_id()
+            return PCContext(hub, self.acct_id, background=bool(headless), client_id=cid, login_tab=self.login_tab, site_host=self.site_host)      # 7.73: the tab is kept, not consumed
         self.profile.mkdir(parents=True, exist_ok=True)
         last: Optional[Exception] = None
         for ch in ("chrome", "msedge", None):
@@ -3832,7 +4143,8 @@ class AccountBrowser:
                 last = e
         raise BridgeError(f"cannot launch a browser: {last}", "browser", 500)
 
-    def _loop(self) -> None:
+    def _loop(self, q: Optional["queue.Queue"] = None) -> None:
+        q = q or self.q
         pw = None
         if pc_mode() == "playwright":                           # explicit opt-in only; the default path never imports Playwright
             from playwright.sync_api import sync_playwright
@@ -3842,7 +4154,7 @@ class AccountBrowser:
         try:
             while True:
                 try:
-                    fn, headless, job_idle, fut = self.q.get(timeout=idle if ctx else 3600)
+                    fn, headless, job_idle, fut = q.get(timeout=idle if ctx else 3600)
                 except queue.Empty:
                     break
                 if fn is None:
@@ -3856,9 +4168,19 @@ class AccountBrowser:
                         ctx = self._open(pw, headless)
                         self.mode = headless
                     idle = job_idle or self.idle
-                    fut.set_result(fn(ctx))
+                    if fut.cancelled():
+                        continue
+                    self.cur_job = (getattr(fn, "__qualname__", "job").split(".")[-1], time.monotonic())
+                    try:
+                        res_ = fn(ctx)
+                    finally:
+                        if q is self.q:
+                            self.cur_job = ("", 0.0)
+                    if not fut.cancelled():
+                        fut.set_result(res_)
                 except Exception as e:
-                    fut.set_exception(e)
+                    if not fut.cancelled():
+                        fut.set_exception(e)
                     try:
                         if ctx is not None:
                             ctx.pages
@@ -4072,9 +4394,25 @@ class Capture:
 # person would (most checks finish by themselves in a few seconds), keeps a minimum gap between sends, and after a check that did not finish it backs off
 # (growing waits) and hands the window to the owner instead of retrying in a loop.
 UI_READY_TIMEOUT = float(os.environ.get("BRIDGE_UI_READY_TIMEOUT", "90"))        # seconds to wait for the page to become usable
-UI_MIN_GAP = float(os.environ.get("BRIDGE_UI_MIN_GAP", "4"))                     # minimum seconds between two sends to the same site
+UI_MIN_GAP = float(os.environ.get("BRIDGE_UI_MIN_GAP", "1.5"))
+UI_NO_ANSWER_CHECK_S = float(os.environ.get("BRIDGE_UI_NO_ANSWER_CHECK", "12"))      # 7.74: no answer text yet after this long -> look at the page (was the message really sent? error banner?)
+UI_NO_ANSWER_LIMIT_S = float(os.environ.get("BRIDGE_UI_NO_ANSWER_LIMIT", "150"))     # 7.74: no answer AND no sign of life on the page for this long -> fail fast (retryable) instead of waiting 10 minutes
+UI_STALL_S = float(os.environ.get("BRIDGE_UI_STALL", "240"))                         # 7.74: answer text exists but has not changed for this long, even though the page still claims to be generating -> take it as finished
+_UI_ERR_RE = re.compile(r"server (is )?busy|too many (requests|messages)|rate.?limit|too long|exceed|length limit|start a new (chat|conversation)|something went wrong|network error|try again|"
+                        r"服务器繁忙|过长|超出|上限|请稍后|重新开始|新对话", re.I)
+_UI_DIAG_JS = r"""() => {
+  const out = {err: '', alerts: []};
+  const sels = '[role=alert],[role=status],[class*=toast i],[class*=Toast],[class*=error i],[class*=notice i],[class*=tip i],[class*=warning i]';
+  for (const e of Array.from(document.querySelectorAll(sels)).slice(0, 12)) {
+    const t = (e.innerText || '').trim();
+    if (t && t.length < 300) out.alerts.push(t);
+  }
+  return out;
+}"""
+                     # minimum seconds between two sends to the same site
 UI_BACKOFF_BASE = float(os.environ.get("BRIDGE_UI_BACKOFF", "60"))               # first back-off after an unfinished check (doubles, capped)
 UI_BACKOFF_MAX = 900.0
+UI_CHALLENGE_WAIT = float(os.environ.get("BRIDGE_UI_CHALLENGE_WAIT", "240"))      # 7.73: how long a visible verification may take the owner before the request gives up
 UI_STABLE_LOOKS = 2                                                              # the page must look ready this many polls in a row
 UI_CHALLENGE_TEXT_RE = re.compile(r"cloudflare[_\s-]?challenge|cf[_-]?chl|challenge[_\s-]?(?:required|failed|expired)", re.I)
 _UI_GATE_LOCK = threading.Lock()
@@ -4090,7 +4428,11 @@ UI_STATE_JS = """(sels) => {
     const ro = box.readOnly === true || box.hasAttribute('readonly') || box.getAttribute('contenteditable') === 'false';
     out.enabled = !dis; out.editable = !ro;
     let c = box; for (let i = 0; i < 4 && c.parentElement && c.parentElement !== document.body; i++) c = c.parentElement;
-    out.scope_text = (c.innerText || '').slice(0, 1500);
+    const scan = c.cloneNode(true);
+    for (const e of scan.querySelectorAll("textarea, [contenteditable='true'], [role='textbox'], input[type='text']")) {
+      if ('value' in e) e.value = ''; e.textContent = '';
+    }
+    out.scope_text = (scan.innerText || '').slice(0, 1500);
   }
   out.widget = [...document.querySelectorAll("iframe[src*='challenges.cloudflare.com'], .cf-turnstile iframe, [id^='cf-chl'], #challenge-running, #challenge-stage")].some(vis);
   return out;
@@ -4203,6 +4545,16 @@ def ui_wait_ready(page: Any, timeout: float = UI_READY_TIMEOUT, say: Optional[Ca
                 return
         else:
             ok, last = 0, why
+            if st["challenge"] and not seen_challenge:
+                # 7.73: a verification needs a visible tab (a background tab is 'hidden' to the site, which alone can make a check fail) and the owner's click. Show the tab ONCE,
+                # give the owner time, and carry on by itself the moment the check is passed - nothing is typed meanwhile.
+                timeout = max(timeout, UI_CHALLENGE_WAIT)
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
+                if say:
+                    say("the site shows a verification: the tab was brought to the front - complete it once and the request continues by itself")
             seen_challenge = seen_challenge or bool(st["challenge"])
             el = time.time() - t0
             if say and (not told or el - last_say >= 15):
@@ -4224,7 +4576,7 @@ def ui_type_and_send(page: Any, text: str, say: Optional[Callable[[str], None]] 
     host = _ui_host(page)
     ui_gate_check(host)
     try:
-        ui_wait_ready(page, say=say)
+        ui_wait_ready(page, say=say, poll_ms=150)
     except BridgeError as e:
         if e.kind == "challenge":
             wait = ui_gate_failed(host)
@@ -4243,11 +4595,51 @@ def ui_type_and_send(page: Any, text: str, say: Optional[Callable[[str], None]] 
         box.click(timeout=5000)                                                  # an editor that refuses fill() but is enabled: typing the text is still honest input
         page.keyboard.insert_text(text)
     page.wait_for_timeout(250)
-    if not ui_input_ready(page):                                                 # a check can appear right after the text lands: do not press Enter into it
+    state = ui_page_state(page)                                                 # the composer text is excluded from challenge scanning
+    if state.get("challenge"):
         wait = ui_gate_failed(host)
         raise BridgeError(f"a bot check appeared while the message was being typed; it was not sent; backing off {int(wait)}s", "challenge", 503, retry_after=wait)
+    for _ in range(4):                                                         # allow the site's controlled composer to settle after fill()
+        if not state.get("blocked_by"):
+            break
+        page.wait_for_timeout(250)
+        state = ui_page_state(page)
+        if state.get("challenge"):
+            wait = ui_gate_failed(host)
+            raise BridgeError(f"a bot check appeared while the message was being typed; it was not sent; backing off {int(wait)}s", "challenge", 503, retry_after=wait)
+    if state.get("blocked_by"):
+        raise BridgeError(f"the chat composer became unavailable before sending ({state['blocked_by']}); nothing was sent", "ui", 503)
     page.keyboard.press("Enter")
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(200)
+
+    def _composer_len() -> int:
+        try:
+            b_ = find_input(page)
+            if b_ is None:
+                return 0
+            try:
+                return len((b_.input_value(timeout=1500) or "").strip())
+            except Exception:
+                return len((b_.inner_text(timeout=1500) or "").strip())
+        except Exception:
+            return 0
+    if len(text) > 200:                                                         # 7.75: a very long message is often not sent by the first Enter: check, then press the send button
+        for attempt_ in range(3):
+            for _ in range(10):
+                if _composer_len() < 20:
+                    break
+                page.wait_for_timeout(300)
+            else:
+                if say:
+                    say("the message is still in the box after Enter - pressing send")
+                if not ui_click_send(page):
+                    b2_ = find_input(page)
+                    if b2_ is not None:
+                        b2_.click(timeout=3000)
+                        page.keyboard.press("Enter")
+                page.wait_for_timeout(300)
+                continue
+            break
     try:
         post = ui_page_state(page)
     except Exception as e:
@@ -4491,6 +4883,155 @@ class PageBackend(DirectBackend):
         return self.client.upload_text(conv, text, cancel)
 
 
+def ui_diff_lines(body: str, before: Set[str], prompt: str) -> List[str]:
+    """Return newly rendered page text without echoing the request or common chat controls."""
+    norm = lambda value: " ".join(str(value or "").split()).casefold()
+    prompt_flat = norm(prompt)
+    body = str(body or "")
+    # Some web clients render the complete request and answer as one reflowed text block
+    # (especially when the request contains a system/tool schema). Compare a whitespace-
+    # folded view, but retain source offsets so only the echoed request is removed.
+    if prompt_flat:
+        folded: List[str] = []
+        starts: List[int] = []
+        ends: List[int] = []
+        i = 0
+        while i < len(body):
+            if body[i].isspace():
+                j = i + 1
+                while j < len(body) and body[j].isspace():
+                    j += 1
+                if folded and folded[-1] != " ":
+                    folded.append(" "); starts.append(i); ends.append(j)
+                elif folded:
+                    ends[-1] = j
+                i = j
+                continue
+            ch = body[i]
+            cf = ch.casefold()
+            folded.extend(cf)
+            starts.extend([i] * len(cf))
+            ends.extend([i + 1] * len(cf))
+            i += 1
+        flat = "".join(folded)
+        at = flat.find(prompt_flat)
+        if at >= 0:
+            raw_start, raw_end = starts[at], ends[at + len(prompt_flat) - 1]
+            # Drop the adjacent user label too, while keeping any assistant answer
+            # rendered immediately after the prompt on the same line.
+            prefix = body[:raw_start]
+            label = re.search(r"(?:you said|you|user)\s*:\s*$", prefix, re.I)
+            if label:
+                raw_start = label.start()
+            body = body[:raw_start] + body[raw_end:]
+    prompt_lines = {norm(line) for line in str(prompt or "").splitlines() if len(norm(line)) >= 10}
+    old = {norm(line) for line in before}
+    controls = {"share", "copy", "edit", "retry", "regenerate", "new chat", "new conversation",
+                "ai-generated, for reference only", "you said:", "claude responded:"}
+    out: List[str] = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        key = norm(line)
+        if not key or key in old or key in controls:
+            continue
+        content = key
+        display = line
+        for prefix in ("you said:", "you:", "user:", "claude responded:"):
+            if content.startswith(prefix):
+                content = content[len(prefix):].strip()
+                display = line[len(prefix):].strip()
+                break
+        if not content or content == prompt_flat or content in prompt_lines:
+            continue
+        if prompt_flat and len(content) >= 24 and (content in prompt_flat or prompt_flat in content):
+            continue
+        out.append(display)
+    return out
+
+
+UI_ANSWER_JS = r"""(a) => {
+  const sel = a[0], from = a[1];
+  let els;
+  try { els = Array.from(document.querySelectorAll(sel)); } catch (e) { return null; }
+  els = els.filter(e => !els.some(o => o !== e && o.contains(e)));
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed;left:-99999px;top:0;width:1000px;white-space:normal;pointer-events:none;';
+  document.body.appendChild(box);
+  const out = [];
+  try {
+    for (let i = from; i < els.length; i++) {
+      const c = els[i].cloneNode(true);
+      c.querySelectorAll('button,[role=button],svg,style,script').forEach(x => x.remove());
+      // A page that renders raw <invoke name=".."><parameter ..> as HTML makes them unknown elements and innerText silently drops the tags (only the values
+      // survive). Turn every such element back into its source text, innermost first, so the parser sees the real call.
+      Array.from(c.querySelectorAll('*')).filter(x => x instanceof HTMLUnknownElement && !x.closest('pre')).reverse().forEach(x => {
+        const tag = x.tagName.toLowerCase();
+        let at = '';
+        for (const a of Array.from(x.attributes)) at += ' ' + a.name + '="' + a.value + '"';
+        const w = document.createElement('span');
+        w.style.whiteSpace = 'pre-wrap';
+        w.appendChild(document.createTextNode('<' + tag + at + '>'));
+        while (x.firstChild) w.appendChild(x.firstChild);
+        w.appendChild(document.createTextNode('</' + tag + '>'));
+        x.replaceWith(w);
+      });
+      c.querySelectorAll('pre').forEach(pre => {
+        const code = pre.querySelector('code') || pre;
+        let lang = '';
+        const mm = /(?:language|lang)-([\w+-]+)/.exec((code.className || '') + ' ' + (pre.className || ''));
+        if (mm) lang = mm[1];
+        if (!lang) {
+          const h = pre.previousElementSibling || (pre.parentElement && pre.parentElement.previousElementSibling);
+          const t = h && ((h.textContent || '').trim().split(/\s+/)[0] || '');
+          if (t && /^[A-Za-z_+-]{2,20}$/.test(t) && (h.textContent || '').trim().length < 60) { lang = t; h.remove(); }
+        }
+        const d = document.createElement('div');
+        d.style.whiteSpace = 'pre-wrap';
+        d.textContent = '\n```' + lang + '\n' + code.textContent.replace(/\n+$/, '') + '\n```\n';
+        pre.replaceWith(d);
+      });
+      box.appendChild(c);
+      out.push(c.innerText);
+      box.removeChild(c);
+    }
+  } finally { box.remove(); }
+  return [els.length, out.join('\n\n')];
+}"""
+
+
+def ui_read_answers(pg: Any, sel: str, n0: int) -> Optional[Tuple[int, str]]:
+    """(number of top-level answer elements, text of every answer element after the first n0) with code blocks as real fences and no toolbar buttons.
+    None = the page or the selector does not allow it (non-CSS selector, no evaluate): the caller falls back to the plain locator read."""
+    try:
+        r = pg.evaluate(UI_ANSWER_JS, [sel, max(0, int(n0))])
+    except Exception:
+        return None
+    if isinstance(r, (list, tuple)) and len(r) == 2 and isinstance(r[1], str):
+        return int(r[0] or 0), r[1]
+    return None
+
+
+_OPEN_TOOL_RE = re.compile(r"<\s*(?:tool_call|tool_use|function_call)s?\b|<\s*(?:[｜|]\s*DSML\s*[｜|]\s*)?(?:invoke|function_calls)\b|<function=", re.I)
+
+
+def ui_tool_call_open(txt: str) -> bool:
+    """True while the visible answer contains the start of a tool call that is not finished (odd number of fences, an unclosed tag, unbalanced JSON): the
+    site may be mid-thought, so the bridge must keep waiting instead of treating a short pause as the end of the answer."""
+    if not txt:
+        return False
+    if len(re.findall(r"(?m)^[ \t]*```", txt)) % 2 == 1:
+        return True
+    t = txt.rstrip()
+    for m in _OPEN_TOOL_RE.finditer(t):
+        tail = t[m.start():]
+        if not re.search(r"</\s*(?:[｜|]\s*DSML\s*[｜|]\s*)?(?:tool_call|tool_use|function_call|invoke|function_calls|function)s?\s*>", tail, re.I):
+            return True
+    last = t.rfind("```tool_call")
+    if last >= 0 and not re.search(r"\n```\s*$", t[last:]) and t[last:].count("{") != t[last:].count("}"):
+        return True
+    return False
+
+
 UI_GENERATING_SELECTOR = ('button[aria-label*="stop" i], button[data-testid*="stop" i], button[title*="stop" i], [aria-label*="stop generating" i], '
                           '[aria-label*="stop streaming" i], [aria-label*="stop response" i], [data-testid*="stop-button" i]')
 
@@ -4501,6 +5042,112 @@ def ui_generating(pg: Any) -> bool:
         return pg.locator(UI_GENERATING_SELECTOR).count() > 0
     except Exception:
         return False
+
+
+class UIWait:
+    """7.70: how long the UI tier waits in silence before it calls an answer finished. Fixed numbers are wrong for some site or other (a thinking model pauses
+    for many seconds in the middle of a sentence), so the bridge MEASURES it: for every answer it records the longest pause between two text changes, keeps
+    the last 40 per site, and waits longer than that site's own 90th-percentile pause. Every time a tool call turns out to have been cut off, that site's wait
+    is multiplied (x1.5, at most three times, forgotten after a week). All numbers are plain settings (ui_quiet_*), `ui_adaptive_wait=false` turns learning off,
+    and nothing ever exceeds `ui_quiet_max_s`. Never raises: a broken record falls back to the configured numbers."""
+    KEYS: Dict[str, Any] = {"ui_adaptive_wait": True, "ui_quiet_base_s": 1.6, "ui_quiet_generating_s": 1.0, "ui_quiet_open_call_s": 12.0,
+                            "ui_quiet_open_call_generating_s": 8.0, "ui_quiet_max_s": 45.0}
+    MIN_SAMPLES = 5
+    KEEP = 40
+    FILE = "ui_wait.json"
+
+    def __init__(self, cfg: Any = None, store: Any = None) -> None:
+        self.lock = threading.Lock()
+        self.cfg: Any = cfg
+        self.store: Any = store
+        self.hosts: Dict[str, Dict[str, Any]] = {}
+        self.saved_at = 0.0
+        if store is not None:
+            self.bind(cfg, store)
+
+    def bind(self, cfg: Any, store: Any) -> None:
+        self.cfg, self.store = cfg, store
+        try:
+            data = store.read(self.FILE, {}) if store is not None else {}
+            if isinstance(data, dict):
+                for h, v in data.items():
+                    if isinstance(v, dict) and isinstance(v.get("gaps"), list):
+                        self.hosts[str(h)] = {"gaps": [float(x) for x in v["gaps"][-self.KEEP:] if isinstance(x, (int, float))], "cuts": int(v.get("cuts") or 0), "cut_at": float(v.get("cut_at") or 0)}
+        except Exception:
+            self.hosts = {}
+
+    def _c(self, key: str) -> Any:
+        try:
+            v = self.cfg[key] if self.cfg is not None else None
+        except Exception:
+            v = None
+        return self.KEYS[key] if v is None else v
+
+    def _h(self, host: str) -> Dict[str, Any]:
+        return self.hosts.setdefault(str(host or "?"), {"gaps": [], "cuts": 0, "cut_at": 0.0})
+
+    def _save(self, force: bool = False) -> None:
+        if self.store is None or (not force and time.time() - self.saved_at < 30):
+            return
+        self.saved_at = time.time()
+        try:
+            self.store.write(self.FILE, self.hosts)
+        except Exception:
+            pass
+
+    def observe(self, host: str, max_gap: float) -> None:
+        """One finished answer: the longest silence that happened INSIDE it (the final quiet window is not part of it)."""
+        if not (isinstance(max_gap, (int, float)) and 0 <= max_gap < 600):
+            return
+        with self.lock:
+            g = self._h(host)["gaps"]
+            g.append(round(float(max_gap), 2))
+            del g[:-self.KEEP]
+            self._save()
+
+    def note_cut(self, host: str) -> None:
+        """A tool call from this site arrived cut off: it was ended too early. Wait longer next time."""
+        with self.lock:
+            h = self._h(host)
+            h["cuts"], h["cut_at"] = min(6, int(h.get("cuts") or 0) + 1), time.time()
+            self._save(True)
+
+    def learned_gap(self, host: str) -> Optional[float]:
+        with self.lock:
+            g = sorted(self._h(host)["gaps"])
+        return g[int(0.9 * (len(g) - 1))] if len(g) >= self.MIN_SAMPLES else None
+
+    def _mult(self, host: str) -> float:
+        with self.lock:
+            h = self._h(host)
+            if h.get("cuts") and time.time() - float(h.get("cut_at") or 0) > 7 * 86400:
+                h["cuts"] = 0
+            return 1.5 ** min(3, int(h.get("cuts") or 0))
+
+    def quiet_s(self, host: str, generating_seen: bool, open_call: bool) -> float:
+        try:
+            base = float(self._c("ui_quiet_open_call_generating_s" if (open_call and generating_seen) else "ui_quiet_open_call_s" if open_call
+                                 else "ui_quiet_generating_s" if generating_seen else "ui_quiet_base_s"))
+            q = base
+            if self._c("ui_adaptive_wait"):
+                g = self.learned_gap(host)
+                if g is not None:
+                    if open_call:
+                        q = max(base, 2.0 * g)
+                    elif not generating_seen:                       # with a stop control the page itself says when it is over; learning matters where it cannot
+                        q = max(base, 1.3 * g + 0.5)
+                q *= self._mult(host)
+            return round(min(float(self._c("ui_quiet_max_s")), max(0.3, q)), 2)
+        except Exception:
+            return 1.6
+
+    def view(self) -> Dict[str, Any]:
+        with self.lock:
+            return {h: {"samples": len(v["gaps"]), "p90_gap_s": (sorted(v["gaps"])[int(0.9 * (len(v["gaps"]) - 1))] if len(v["gaps"]) >= self.MIN_SAMPLES else None),
+                        "cuts": v.get("cuts", 0)} for h, v in self.hosts.items()}
+
+
+UI_WAIT = UIWait()
 
 
 class UIBackend:
@@ -4537,12 +5184,13 @@ class UIBackend:
         base = self.recipe["base"]
 
         before: set = set()
+        state: Dict[str, Any] = {"n0": 0, "js": None}
 
         def page_text(ctx: Any) -> Tuple[int, str, str, bool]:
             pg = _page(self.ab, ctx, base, self.recipe.get("entry"))
-            lines = [l.strip() for l in pg.inner_text("body").splitlines() if l.strip()]
-            snip = prompt.strip()[:40]
-            new = [l for l in lines if l not in before and not (snip and snip in l)]
+            if state.get("tap") is not None:
+                state["tap"].service()
+            new = ui_diff_lines(pg.inner_text("body"), before, prompt)
             return len(new), "\n".join(new), pg.url, ui_generating(pg)
 
         def start(ctx: Any) -> int:
@@ -4550,8 +5198,13 @@ class UIBackend:
             target = conv["url"] or self.recipe.get("entry") or base + "/"
             host_ = _ui_host(pg)
             ui_gate_check(host_ or (urllib.parse.urlsplit(base).hostname or ""))      # in a back-off: touch nothing
-            fresh_ok = (conv["url"] is None and not ui_select and self.sel and (pg.url or "").startswith(base) and not url_on_login_path(pg.url) and ui_new_chat(pg, self.sel))
-            if not fresh_ok and (conv["url"] is None or pg.url != target):
+            answer_probe = self.sel or '[data-message-author-role="assistant"]'
+            on_site = (pg.url or "").startswith(base) and not url_on_login_path(pg.url)
+            fresh_ok = (conv["url"] is None and not ui_select and (self.sel or self.diff) and on_site and ui_new_chat(pg, answer_probe))
+            # The extension borrows the owner's authenticated tab. Preserve a usable same-site tab
+            # when the site's New chat control is missing; reloading it can trigger a browser check.
+            preserve_borrowed_tab = conv["url"] is None and on_site
+            if not fresh_ok and not preserve_borrowed_tab and (conv["url"] is None or pg.url != target):
                 pg.goto(target, wait_until="domcontentloaded", timeout=45000)
                 pg.wait_for_timeout(900)
             if ui_select and (conv["url"] is None or conv.get("model") != model):
@@ -4561,40 +5214,171 @@ class UIBackend:
                 before.update(l.strip() for l in pg.inner_text("body").splitlines() if l.strip())
                 n0 = 0
             else:
-                n0 = pg.locator(self.sel).count()
-            ui_type_and_send(pg, prompt)
-            pg.wait_for_timeout(1200)
+                probe = ui_read_answers(pg, self.sel, 10 ** 6)                  # 7.69: count top-level answer elements the same way read() will
+                state["js"] = probe is not None
+                n0 = probe[0] if probe is not None else pg.locator(self.sel).count()
+            state["n0"] = n0
+            state["prev_last"] = ""
+            if state.get("js") and n0 > 0:                                      # 7.75: long chats unmount old messages from the page, so counting answers is not reliable: remember the last one
+                try:
+                    pl_ = ui_read_answers(pg, self.sel, max(0, n0 - 1))
+                    state["prev_last"] = pl_[1] if pl_ else ""
+                except Exception:
+                    state["prev_last"] = ""
+            if RELCFG.get("net_text"):                                          # 7.71: listen to the page's own streamed response before the question is sent
+                tap_ = NetTap()
+                if tap_.attach(ctx, pg):
+                    state["tap"] = tap_
+            ui_type_and_send(pg, prompt, say=lambda m_: log(f"UI send: {m_}", "warn"))      # 7.74: the wait for a usable page is no longer silent
+            log(f"UI send: message typed and sent ({len(prompt)} chars)", "info")
+            pg.wait_for_timeout(100)
             return n0
 
         def read(ctx: Any) -> Tuple[int, str, str, bool]:
             pg = _page(self.ab, ctx, base, self.recipe.get("entry"))
+            if state.get("tap") is not None:
+                state["tap"].service()
+            if state.get("js"):
+                n0_ = int(state.get("n0") or 0)
+                got = ui_read_answers(pg, self.sel, n0_)
+                if got is not None:
+                    if got[0] > n0_ or not state.get("prev_last") and got[1]:
+                        return got[0], normalize_ui_tool_call_chrome(got[1]), pg.url, ui_generating(pg)
+                    gen_ = ui_generating(pg)                                   # 7.75: the answer count did not grow (the page drops old messages): compare the last answer itself
+                    last_ = ui_read_answers(pg, self.sel, max(0, got[0] - 1))
+                    lt_ = last_[1] if last_ else ""
+                    if lt_ and (lt_ != state.get("prev_last") or gen_):
+                        return n0_ + 1, normalize_ui_tool_call_chrome(lt_), pg.url, gen_
+                    return got[0], "", pg.url, gen_
             loc = pg.locator(self.sel)
             n = loc.count()
-            return n, (loc.last.inner_text() if n else ""), pg.url, ui_generating(pg)
+            answer = loc.last.inner_text() if n else ""
+            return n, normalize_ui_tool_call_chrome(answer), pg.url, ui_generating(pg)
 
+        send_started = time.monotonic()
         n0 = self.ab.run(start, True, 120)
-        last, stable, sent, t0 = "", 0, "", time.time()
+        last, stable, sent, t0 = "", 0, "", time.monotonic()
+        first_text_at: Optional[float] = None
+        last_text_at = t0
+        max_gap, host_name = 0.0, (urllib.parse.urlsplit(base).hostname or "unknown")
         seen_generating = False                       # once the page has shown its 'stop' control, the control going away is the real end-of-answer signal
-        while time.time() - t0 < 600:
-            if cancel is not None and cancel.is_set():
-                return
-            time.sleep(0.4)
-            n, txt, url, generating = self.ab.run(page_text if self.diff else read, True, 120)
-            seen_generating = seen_generating or generating
-            if n > n0 and txt:
-                if txt.startswith(sent):
-                    d = txt[len(sent):]
-                    if d:
-                        yield d
-                        sent = txt
-                stable = stable + 1 if (txt == last and not generating) else 0
-                last = txt
-                # A site that pauses mid-answer (thinking, a tool-call block, a slow chunk) must not be taken for finished: with a visible 'stop' control the answer ends when it is gone
-                # (2 s of calm); without any such control the text must stay unchanged for 8 s.
-                if stable >= (5 if seen_generating else 20):
-                    conv["url"], conv["turn"] = url, conv["turn"] + 1
+        mk = end_marker() if (end_marker() and end_marker() in prompt) else ""     # 7.71: the reply is expected to end with the marker only when THIS prompt asked for it
+        tap = state.get("tap")
+        conv["end_via"], conv["net_text"], conv["net_streams"] = "", None, 0
+        last_diag, resent, last_progress, body_sig, polls = t0, False, t0, "", 0
+
+        def diag(ctx: Any) -> Dict[str, Any]:                          # 7.74: what does the page look like while no answer shows up?
+            pg = _page(self.ab, ctx, base, self.recipe.get("entry"))
+            d: Dict[str, Any] = {"composer": 0, "alerts": [], "gen": ui_generating(pg), "url": pg.url, "sig": ""}
+            try:
+                box = find_input(pg)
+                if box is not None:
+                    try:
+                        c = box.input_value(timeout=1500)
+                    except Exception:
+                        c = box.inner_text(timeout=1500)
+                    d["composer"] = len((c or "").strip())
+            except Exception:
+                pass
+            try:
+                r = pg.evaluate(_UI_DIAG_JS)
+                if isinstance(r, dict):
+                    d["alerts"] = [str(x) for x in (r.get("alerts") or [])][:6]
+            except Exception:
+                pass
+            try:
+                body = pg.inner_text("body")
+                d["sig"] = f"{len(body)}:{hash(body[-300:])}"
+                d["tail"] = body[-200:].replace("\n", " | ")
+            except Exception:
+                pass
+            return d
+
+        def resend(ctx: Any) -> None:                                  # 7.74: the text is still sitting in the box: press the site's own send button (or Enter once more)
+            pg = _page(self.ab, ctx, base, self.recipe.get("entry"))
+            if not ui_click_send(pg):
+                box = find_input(pg)
+                if box is not None:
+                    box.click(timeout=3000)
+                    pg.keyboard.press("Enter")
+
+        try:
+            while time.monotonic() - t0 < 600:
+                if cancel is not None and cancel.is_set():
                     return
-        raise BridgeError("UI tier timed out waiting for the answer", "ui", 504)
+                time.sleep(0.2)
+                polls += 1
+                n, txt, url, generating = self.ab.run(page_text if self.diff else read, True, 120)
+                seen_generating = seen_generating or generating
+                _now = time.monotonic()
+                if first_text_at is None and (_now - t0) >= UI_NO_ANSWER_CHECK_S and (_now - last_diag) >= UI_NO_ANSWER_CHECK_S:
+                    last_diag = _now
+                    try:
+                        d = self.ab.run(diag, True, 40)
+                    except BridgeError:
+                        raise
+                    except Exception as e_:
+                        d = {"composer": 0, "alerts": [], "gen": False, "sig": "", "err_diag": str(e_)[:120]}
+                    if d.get("gen") or (d.get("sig") and d["sig"] != body_sig):
+                        last_progress = _now                            # the page is alive (thinking text / stop button / streaming elsewhere)
+                    body_sig = d.get("sig") or body_sig
+                    bad = [a for a in d.get("alerts", []) if _UI_ERR_RE.search(a)]
+                    log(f"UI waiting for answer: {int(_now - t0)}s n={n} n0={n0} generating={d.get('gen')} composer_chars={d.get('composer')} "
+                        f"alerts={d.get('alerts')} page_tail={d.get('tail', '')!r}", "warn")
+                    if bad and not d.get("gen"):
+                        raise BridgeError(f"the chat site shows an error instead of an answer: {bad[0][:200]}", "upstream", 502)
+                    if d.get("composer", 0) > 20 and not d.get("gen") and not resent:
+                        resent = True
+                        log("UI: the message is still in the input box (it was not sent) - pressing send again", "warn")
+                        try:
+                            self.ab.run(resend, True, 40)
+                        except BridgeError:
+                            raise
+                        except Exception as e_:
+                            log(f"UI: re-send failed: {type(e_).__name__}: {e_}", "warn")
+                        last_progress = time.monotonic()
+                if first_text_at is None and (time.monotonic() - last_progress) >= UI_NO_ANSWER_LIMIT_S:
+                    raise BridgeError(f"no answer appeared on the chat page for {int(time.monotonic() - t0)}s and the page showed no activity; "
+                                      f"the next request starts a fresh chat", "upstream", 504)
+                if n > n0 and txt:
+                    stamp = time.monotonic()
+                    if first_text_at is None:
+                        first_text_at = stamp
+                    if txt.startswith(sent):
+                        d = txt[len(sent):]
+                        if d:
+                            yield d
+                            sent = txt
+                    if txt != last:
+                        if last:
+                            max_gap = max(max_gap, stamp - last_text_at)         # 7.70: a pause INSIDE the answer: what this site does mid-thought
+                        last_text_at = stamp
+                    last = txt
+                    # 7.71: the end of the answer is decided by (1) the model's own end marker, (2) a finished network stream that agrees with the page, and only then (3) silence.
+                    # 7.69/7.70: a tool call that is still open gets a much longer quiet window, measured per site (UIWait) and configurable (ui_quiet_*).
+                    nt = tap.final_text(txt) if (tap is not None and tap.ok) else None
+                    quiet = UI_WAIT.quiet_s(host_name, seen_generating, ui_tool_call_open(txt))
+                    via = ui_decide_end(txt, mk, stamp - last_text_at, generating, seen_generating, quiet, RELIABILITY.marker_trusted(host_name), float(RELCFG["grace_s"]), nt is not None)
+                    if not via and (stamp - last_text_at) >= UI_STALL_S:
+                        via = "stall"                                   # 7.74: text frozen for minutes while a 'stop' control is stuck on the page
+                    if via:
+                        UI_WAIT.observe(host_name, max_gap)
+                        finished = time.monotonic()
+                        conv["end_via"], conv["net_text"] = via, nt
+                        conv["net_streams"] = tap.seen() if tap is not None else 0
+                        log(f"UI timing host={urllib.parse.urlsplit(url).hostname or 'unknown'} send_ms={int((t0-send_started)*1000)} "
+                            f"first_text_ms={int((first_text_at-send_started)*1000) if first_text_at else -1} "
+                            f"settle_ms={int((finished-last_text_at)*1000)} total_ms={int((finished-send_started)*1000)} "
+                            f"stop_seen={str(seen_generating).lower()} end={via}", "info")
+                        conv["url"], conv["turn"] = url, conv["turn"] + 1
+                        return
+            raise BridgeError("UI tier timed out waiting for the answer", "ui", 504)
+        finally:
+            if tap is not None:
+                try:
+                    self.ab.run(lambda _c: tap.detach(), True, 20)
+                except Exception:
+                    pass
 
 
 def verify_recipe(backend: Any, name: str = "") -> Dict[str, Any]:
@@ -5860,6 +6644,8 @@ def lc_derive(a: Dict[str, Any], has_recipe: bool) -> Tuple[str, str]:
     if a.get("disabled"):
         return "disabled", "migrated: the owner had disabled this account"
     st = a.get("state")
+    if st == "needs_learning":
+        return "degraded_fallback", "login saved; personal-Chrome UI serving is available while optional learning can add a faster protocol"
     if st in ("login_required", "expired") or st == "learning":
         return "needs_login", f"migrated from state '{st}'"
     if st == "ready" and (has_recipe or a.get("tier")):
@@ -13048,9 +13834,14 @@ class Accounts:
 
     def browser(self, aid: str) -> AccountBrowser:
         with self.lock:
+            acct = self.get(aid) or {}
+            tab = next((t for t in (acct.get("pc_login_tab"), acct.get("pc_home_tab")) if isinstance(t, int) and not isinstance(t, bool)), None)
             if aid not in self.browsers:
-                self.browsers[aid] = AccountBrowser(aid, self.store.path("profiles", aid), self.cfg["headless_idle_seconds"])
-            return self.browsers[aid]
+                self.browsers[aid] = AccountBrowser(aid, self.store.path("profiles", aid), self.cfg["headless_idle_seconds"],
+                                                   str(acct.get("pc_client_id") or ""), tab)
+            ab = self.browsers[aid]
+            ab.login_tab, ab.site_host = tab, str(acct.get("host") or "")      # 7.73: refreshed on every use (a re-login or a new tab id must not be missed)
+            return ab
 
     def public(self) -> List[Dict[str, Any]]:
         out = []
@@ -13132,15 +13923,16 @@ class Accounts:
                 return str(e)
             raise
 
-    def add(self, url: str, label: str) -> Tuple[Dict[str, Any], Job]:
+    def add(self, url: str, label: str, learn: bool = True, defer_login: bool = False, pc_client_id: str = "") -> Tuple[Dict[str, Any], Optional[Job]]:
         site = normalize_site_input(url)                         # O2: raises a plain-language BridgeError for junk / non-http(s)
         note = self.site_guard(site["open_url"])
         host = site["host"]
         same = [x.get("label") for x in self.items if x.get("type") != "api" and (x.get("identity_host") or x.get("host")) == site["identity_host"]]
         acct = {"id": uuid.uuid4().hex[:8], "label": label or host, "host": host, "url": site["open_url"], "input": site["input"],
-                "identity_host": site["identity_host"], "state": "learning",
-                "tier": "", "created": now(), "requests": 0, "last_error": "", "cooldown_until": 0,
-                "ok": 0, "fail": 0, "streak_fail": 0, "ema_ms": 0, "health": None}
+                "identity_host": site["identity_host"], "state": "login_pending" if defer_login else "learning",
+                "tier": "", "serving_mode": "browser", "created": now(), "requests": 0, "last_error": "", "cooldown_until": 0,
+                "ok": 0, "fail": 0, "streak_fail": 0, "ema_ms": 0, "health": None,
+                "pc_client_id": str(pc_client_id or ""), "login_client_id": str(pc_client_id or ""), "login_learn": bool(learn) if defer_login else False}
         if same:
             acct["note"] = "you already have an account for this site (" + ", ".join(str(x) for x in same[:3]) + "); this one is separate"
         elif note:
@@ -13149,9 +13941,129 @@ class Accounts:
         with self.lock:
             self.items.append(acct)
             self.save()
+        if defer_login:
+            acct["login_requested_at"] = now()
+            acct["login_claimed_at"] = 0
+            self.save()
+            self.lc(acct["id"], "needs_login", "choose this account in the Chrome extension, log in, then confirm")
+            return acct, None
         self.lc(acct["id"], "logging_in", "a visible browser opens so the owner can log in")
-        self.begin_learn(acct["id"], "learn")
-        return acct, self.start_job(acct, "login")
+        if learn:
+            self.begin_learn(acct["id"], "learn")
+        return acct, self.start_job(acct, "login" if learn else "login-only")
+
+    def browser_login_requests(self, client_id: str) -> List[Dict[str, Any]]:
+        with self.lock:
+            rows = []
+            for a in self.items:
+                if a.get("type") == "api" or a.get("state") not in ("login_pending", "login_claimed"):
+                    continue
+                target = str(a.get("login_client_id") or "")
+                if target and target != client_id:
+                    continue
+                rows.append({"id": a["id"], "label": str(a.get("label") or a.get("host") or "Account")[:80], "host": a.get("host", ""),
+                             "url": a.get("url", ""), "claimed": a.get("state") == "login_claimed", "created": a.get("login_requested_at", a.get("created", 0))})
+            return rows[:100]
+
+    def register_browser_tab(self, client_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Register the owner's explicitly selected active Chrome tab as a browser account, without starting learning."""
+        tab = body.get("tab")
+        url = str(body.get("url") or "")[:2048]
+        title = re.sub(r"[\x00-\x1f\x7f]", "", str(body.get("title") or "")).strip()[:120]
+        parsed = urllib.parse.urlsplit(url)
+        if not isinstance(tab, int) or isinstance(tab, bool) or tab < 0:
+            raise BridgeError("the active Chrome tab id is invalid", "client", 400)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise BridgeError("open a normal AI site tab before adding its account", "client", 400)
+        if any(a.get("type") != "api" and a.get("pc_client_id") == client_id and a.get("host") == parsed.hostname.lower() for a in self.items):
+            raise BridgeError("an account for this site is already assigned to this Chrome profile; use Re-login or assign another profile", "client", 409)
+        label = title or parsed.hostname
+        account, _job = self.add(url, label, learn=False, defer_login=True, pc_client_id=client_id)
+        with self.lock:
+            account["state"] = "login_claimed"
+            account["login_client_id"] = client_id
+            account["login_claimed_at"] = now()
+            account["pc_login_tab"] = tab
+            self.save()
+        self.lc(account["id"], "needs_login", "this tab was assigned to the account; confirm after signing in")
+        return {"ok": True, "account_id": account["id"], "label": account["label"], "host": account["host"], "tab": tab}
+
+    def claim_browser_login(self, client_id: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        aid = str(body.get("account_id") or "")[:80]
+        with self.lock:
+            a = self.get(aid)
+            if not a or a.get("type") == "api" or a.get("state") not in ("login_pending", "login_claimed"):
+                return 404, {"error": "login request is no longer available"}
+            target = str(a.get("login_client_id") or "")
+            if target and target != client_id:
+                return 409, {"error": "this account is assigned to a different Chrome profile"}
+            a["login_client_id"], a["state"], a["login_claimed_at"] = client_id, "login_claimed", now()
+            a["pc_client_id"] = client_id
+            self.save()
+            return 200, {"account_id": aid, "label": str(a.get("label") or a["host"])[:80], "url": a["url"], "host": a["host"]}
+
+    def confirm_browser_login(self, client_id: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        aid, tab = str(body.get("account_id") or "")[:80], body.get("tab")
+        url = str(body.get("url") or "")[:2048]
+        if not isinstance(tab, int) or isinstance(tab, bool) or tab < 0:
+            return 400, {"error": "a valid tab id is required"}
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return 400, {"error": "the confirmed tab must be a web page"}
+        with self.lock:
+            a = self.get(aid)
+            if not a or a.get("type") == "api" or a.get("state") != "login_claimed":
+                return 404, {"error": "login request is no longer available"}
+            if str(a.get("login_client_id") or "") != client_id:
+                return 409, {"error": "this account belongs to a different Chrome profile"}
+            want = str(a.get("identity_host") or a.get("host") or "").lower().rstrip(".")
+            got = parsed.hostname.lower().rstrip(".")
+            if got != want:
+                return 400, {"error": f"open {want} in this profile before confirming; current tab is {got}"}
+            a["pc_client_id"], a["pc_login_tab"] = client_id, tab
+            a["state"], a["last_error"] = "logging_in", ""
+            learn = bool(a.pop("login_learn", False))
+            a.pop("login_claimed_at", None)
+            self.save()
+        self.lc(aid, "logging_in", "owner confirmed login from the assigned Chrome profile")
+        job = self.start_job(a, "login" if learn else "login-only", owner_confirmed=True)
+        return 200, {"ok": True, "account_id": aid, "job": job.id}
+
+    def test_connection(self, aid: str) -> Dict[str, Any]:
+        """Check a saved web session without sending a model prompt; preserve needs_learning when the site recipe is absent."""
+        a = self.get(aid)
+        if not a:
+            raise BridgeError("unknown account", "client", 404)
+        if a.get("type") == "api":
+            raise BridgeError("use the provider test for an API account", "client", 400)
+        if any(not j.done and j.account == aid for j in self.jobs.values()):
+            raise BridgeError("this account is still signing in or learning; wait for the current task to finish", "client", 409)
+        row = self.validate_one(a)
+        row["login_saved"] = bool(a.get("state") == "needs_learning" or row.get("status") == "valid")
+        if row["status"] in ("needs_login", "expired", "looks IP/device-bound"):
+            a["state"] = "login_required"
+            self.lc(aid, "needs_login", "manual connection test: " + str(row["reason"]))
+        elif row["status"] == "valid" and a.get("state") == "login_required":
+            a["state"] = "needs_learning" if not self.recipe(a.get("host", "")) else "ready"
+            self.lc(aid, "degraded_fallback", "session works; site protocol readiness is shown separately")
+        self.save()
+        return row
+
+    def request_browser_login(self, aid: str, relearn: bool = False) -> Dict[str, Any]:
+        with self.lock:
+            a = self.get(aid)
+            if not a or a.get("type") == "api":
+                raise BridgeError("unknown browser account", "client", 404)
+            if any(not j.done and j.account == aid for j in self.jobs.values()):
+                raise BridgeError("this account already has a running job", "client", 409)
+            a["state"], a["login_learn"] = "login_pending", bool(relearn)
+            a["login_client_id"] = str(a.get("pc_client_id") or "")
+            a["login_requested_at"], a["login_claimed_at"] = now(), 0
+            a.pop("pc_login_tab", None)
+            a.pop("pc_home_tab", None)
+            self.save()
+        self.lc(aid, "needs_login", "choose this account in its Chrome extension, log in, then confirm")
+        return {"ok": True, "pending": True, "account_id": aid, "pc_client_id": a.get("login_client_id", "")}
 
     def add_api(self, kind: str, base: str, key: str, model: str, label: str) -> Dict[str, Any]:
         if kind not in ("openai", "anthropic") or not base.startswith("http") or not key:
@@ -13326,10 +14238,11 @@ class Accounts:
                 self.lc(a["id"], "needs_login", "the learned recipe was forgotten")
         self.save()
 
-    def start_job(self, acct: Dict[str, Any], kind: str, headless: Optional[bool] = None, login_timeout: int = 600) -> Job:
+    def start_job(self, acct: Dict[str, Any], kind: str, headless: Optional[bool] = None, login_timeout: int = 600, owner_confirmed: bool = False) -> Job:
         job = Job(kind, acct["label"])
         job.account = acct["id"]
-        if kind in ("login", "relearn"):
+        job.user_done = bool(owner_confirmed)
+        if kind in ("login", "login-only", "relearn"):
             acct["login_run"] = uuid.uuid4().hex[:8]                 # O3: one login run = one acceptance (see finish_login)
         job.headless, job.login_timeout = headless, login_timeout
         self.jobs[job.id] = job
@@ -13369,12 +14282,26 @@ class Accounts:
             if job.ok:
                 job.set_stage("finish", "done")
             self.save()
+            if isinstance(acct.get("pc_login_tab"), int) and not isinstance(acct.get("pc_login_tab"), bool):
+                acct["pc_home_tab"] = acct["pc_login_tab"]                 # 7.73: the tab the owner logged in with is the account's tab from now on (it used to be forgotten here, so every request opened a new one)
+            acct.pop("pc_login_tab", None)
+            self.save()
             try:
                 if self.get(acct["id"]) is not None:
                     self.browser(acct["id"]).close()
             except Exception:
                 pass
-            if job.ok and job.kind != "human":                    # only after the job released the browser profile
+            if job.ok and job.kind == "login-only":
+                recipe = self.recipe(acct.get("host", "")) or {}
+                if recipe:
+                    acct.update(state="ready", tier=str(recipe.get("tier") or "page"), serving_mode="browser", last_error="", cooldown_until=0)
+                    reason = "login saved; browser-backed web use is the default and the existing site recipe is reused without a learning probe"
+                else:
+                    acct.update(state="needs_learning", tier="ui", last_error="Login saved. Claude Code can use the assigned personal Chrome profile now; optional learning can add a faster site protocol.")
+                    reason = "login saved; ready for personal-Chrome UI serving; optional learning can add a faster protocol"
+                for st_, why_ in (("capturing", "login detected; session saved"), ("degraded_fallback", reason)):
+                    self.lc(acct["id"], st_, why_)
+            elif job.ok and job.kind != "human":                    # only after the job released the browser profile
                 for st_, why_ in (("capturing", "login detected; traffic captured"), ("learning", "recipe built from the captured traffic"),
                                   ("degraded_fallback", f"recipe learned (tier {acct.get('tier') or 'page'}); never validated (O8 not run), so not stable")):
                     self.lc(acct["id"], st_, why_)
@@ -13407,7 +14334,7 @@ class Accounts:
     def _learn(self, ctx: Any, acct: Dict[str, Any], job: Job) -> None:
         holder: Dict[str, Any] = {}
         rec: Optional[CdpRecorder] = None
-        if self.cfg["analysis_enabled"]:
+        if job.kind != "login-only" and self.cfg["analysis_enabled"]:
             try:
                 rec = CdpRecorder(ctx, max_body=int(self.cfg["capture_max_body_kb"]) * 1024)
                 rec.start()
@@ -13808,7 +14735,10 @@ class Accounts:
         url = acct["url"]
         job.set_stage("open", f"opening {url}")
         job.say(f"opening {url} - log in if asked (up to {job.login_timeout // 60 or 1} min)")
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        current_host = urllib.parse.urlsplit(getattr(page, "url", "") or "").hostname or ""
+        target_host = urllib.parse.urlsplit(url).hostname or ""
+        if job.kind != "login-only" or current_host.lower() != target_host.lower():
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
         job.set_stage("login", "waiting for you to log in")
         job.need_owner("login", "log in inside the browser window")
         t_login, last_beat = time.time(), time.time()
@@ -13868,6 +14798,17 @@ class Accounts:
                     if v:
                         sess["auth"][n] = v
             return st
+
+        if job.kind == "login-only":
+            # Save the owner's session without sending any learning prompts. A known site recipe
+            # can be reused; a new site remains visibly unavailable until learning is requested.
+            refresh_sess()
+            self.save_session(acct["id"], sess)
+            if self.recipe(host):
+                job.say("login saved; the existing site recipe is available without a new probe")
+            else:
+                job.say("login saved; Claude Code can use this personal Chrome tab now. Choose Start learning later if you want the optimized protocol")
+            return
 
         if recipe:
             refresh_sess()
@@ -14127,7 +15068,7 @@ class Accounts:
         if mode == "browser":
             recipe = self.recipe(acct["host"])
             if not recipe:
-                raise BridgeError("browser mode needs a learned recipe", "setup", 503)
+                return self._unlearned_ui_backend(acct)
             ui = recipe.get("ui") or {}
             if recipe.get("tier") == "ui" or recipe.get("unresolved"):
                 if not (ui.get("answer") or ui.get("diff")):
@@ -14295,6 +15236,8 @@ class Accounts:
             return be
         recipe = self.recipe(acct["host"])
         if not recipe:
+            if acct.get("state") == "needs_learning":
+                return self._unlearned_ui_backend(acct)
             raise BridgeError("site not learned yet - add/re-learn the account", "setup", 503)
         br = self.blocked_reason(acct)
         if br:
@@ -14307,8 +15250,28 @@ class Accounts:
             return PageBackend(recipe, sess, self.browser(acct["id"]))
         return UIBackend(recipe, self.browser(acct["id"]))
 
+    def _unlearned_ui_backend(self, acct: Dict[str, Any]) -> UIBackend:
+        """Serve a login-only account through its assigned personal Chrome profile until optional learning."""
+        parsed = urllib.parse.urlsplit(str(acct.get("url") or ""))
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise BridgeError("the saved web account has no valid site URL", "setup", 503)
+        base = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+        host = str(acct.get("host") or parsed.hostname or "").lower()
+        ui = {"diff": True}
+        if host == "chatgpt.com" or host.endswith(".chatgpt.com"):
+            ui = {"answer": '[data-message-author-role="assistant"]'}
+        elif host == "deepseek.com" or host.endswith(".deepseek.com"):
+            ui = {"answer": '.ds-assistant-message-main-content.ds-markdown, [data-message-author-role="assistant"], [data-role="assistant"]'}
+        elif host == "claude.ai" or host.endswith(".claude.ai"):
+            ui = {"answer": '.font-claude-response, [data-testid="ai-message"], [data-testid="message-assistant"], .assistant-message'}
+        backend = UIBackend({"base": base, "entry": base + "/", "continuity": False, "tier": "ui", "ui": ui},
+                            self.browser(acct["id"]))
+        backend.unlearned_ui = True
+        return backend
+
     def usable(self, a: Dict[str, Any]) -> bool:
-        return a.get("state") == "ready" and not a.get("disabled") and a.get("cooldown_until", 0) <= now() and not self.blocked_reason(a)
+        web_login_only = a.get("type") != "api" and a.get("state") == "needs_learning"
+        return (a.get("state") == "ready" or web_login_only) and not a.get("disabled") and a.get("cooldown_until", 0) <= now() and not self.blocked_reason(a)
 
     AUTO_ALIASES = ("", "bridge-auto", "bridge-fast", "bridge-balanced", "bridge-quality")
 
@@ -14353,7 +15316,7 @@ class Accounts:
                     raise BridgeError("the requested account no longer exists", "model_not_found", 404)
                 if a["id"] in exclude:
                     raise BridgeError(f"account '{a['label']}' failed and a fixed route is never replaced by another account", "unavailable", 503)
-                if a.get("state") != "ready":
+                if a.get("state") != "ready" and not (a.get("state") == "needs_learning" and a.get("type") != "api"):
                     raise BridgeError(f"account '{a['label']}' is not ready (state: {a.get('state')})", "setup", 503)
                 br = self.blocked_reason(a)
                 if br:
@@ -15054,26 +16017,69 @@ def minify_schema(s: Any, depth: int = 0, full: bool = False) -> Any:
     return s
 
 
-def tools_text(tools: Dict[str, Dict[str, Any]], choice: Dict[str, Any], desc_limit: int, fenced: bool, full: bool = False) -> str:
+def tools_text(tools: Dict[str, Dict[str, Any]], choice: Dict[str, Any], desc_limit: int, fenced: bool, full: bool = False,
+               hidden: Optional[Dict[str, Dict[str, Any]]] = None, fmt: str = "", only_list: bool = False) -> str:
     if not tools:
         return ""
-    fmt = ('```tool_call\n{"name": "<tool name>", "arguments": { ... }}\n```' if fenced
-           else '<tool_call>{"name": "<tool name>", "arguments": { ... }}</tool_call>')
-    lines = ["You are the assistant inside an agentic coding tool and you can call tools. To call a tool, output exactly:",
-             fmt,
-             "Rules: arguments must be valid JSON that follows the tool's input schema. You may output several tool calls in "
-             "one reply, then STOP - the results arrive in the next message as [TOOL_RESULT ...]. Never invent tool results "
-             "and never describe a call without making it. If no tool is needed, just answer in plain text.", "", "Available tools:"]
+    fmt = fmt or ("fenced" if fenced else "tag")
+    lines: List[str] = []
+    if not only_list:
+        if fmt == "dsml":                                               # 7.71 (6): the markup this site's model was trained on
+            D = _DSML
+            example = (f'<{D}DSML{D}function_calls>\n<{D}DSML{D}invoke name="TOOL_NAME">\n<{D}DSML{D}parameter name="ARG_NAME" string="true">TEXT VALUE</{D}DSML{D}parameter>\n'
+                       f'<{D}DSML{D}parameter name="ARG_NAME" string="false">NUMBER, true / false, OR JSON</{D}DSML{D}parameter>\n</{D}DSML{D}invoke>\n</{D}DSML{D}function_calls>')
+            lines = ["You are the assistant inside an agentic coding tool and you can call tools. To call a tool, output exactly:", example,
+                     "Rules: (1) ONE <invoke> per call; several <invoke> elements may sit inside one function_calls block. (2) Write a text argument exactly as it is (no quotes, no escaping) with string=\"true\"; "
+                     "write numbers, booleans, arrays and objects as JSON with string=\"false\". (3) Then STOP immediately - write nothing after the closing function_calls tag; the results arrive in the "
+                     "next message as [TOOL_RESULT ...]. (4) Never invent tool results and never describe a call without making it. (5) If no tool is needed, just answer in plain text."]
+        else:
+            ex = ('```tool_call\n{"name": "<tool name>", "arguments": { ... }}\n```' if fmt == "fenced"
+                  else '<tool_call>{"name": "<tool name>", "arguments": { ... }}</tool_call>')
+            lines = ["You are the assistant inside an agentic coding tool and you can call tools. To call a tool, output exactly:",
+                     ex,
+                     "Rules: (1) ONE call per " + ("fenced block" if fmt == "fenced" else "tag") + ", the body is a single JSON object with the keys \"name\" and \"arguments\"; "
+                     "arguments must be valid JSON that follows the tool's input schema (escape newlines and quotes inside strings). "
+                     "(2) Use ONLY this format: never XML, never <function_calls>, <invoke>, DSML or any other tool syntax, never a bare JSON object without the "
+                     + ("fenced block shown above" if fmt == "fenced" else "tag shown above") + ". "
+                     "(3) You may output several calls in one reply, then STOP immediately - write nothing after the last call; the results arrive in the next message as [TOOL_RESULT ...]. "
+                     "(4) Never invent tool results and never describe a call without making it. (5) If no tool is needed, just answer in plain text."]
+        mr = end_marker_rule()                                          # 7.71 (1): the model says itself when it is done
+        if mr:
+            lines[-1] = lines[-1] + " " + mr
+        lines += ["", "Available tools:"]
     for name, t in tools.items():
         # E8 (7.9): tool names, descriptions and schemas come from the client's MCP servers = third-party text; they must not be able to close
         # the <tools> block or open a fake <system>/<tool_call>. neutralise() only touches the bridge's own control tags.
         lines.append(f"- {neutralise(str(name))}: {neutralise(trim_middle(' '.join(str(t.get('description', '')).split()), 0 if full else desc_limit))}")
         lines.append(f"  schema: {neutralise(jdump(minify_schema(t.get('input_schema') or {}, 0, full)))}")
+    if hidden and not only_list:                                        # 7.71 (5): the rest by name and one line
+        lines += ["", "More tools exist; their schemas are not shown to keep this list short:"]
+        for name, t in hidden.items():
+            first = ' '.join(str(t.get('description', '')).split())
+            lines.append(f"- {neutralise(str(name))}: {neutralise(trim_middle(first.split('. ')[0], 100))}")
+        lines.append("You may still call one of them with your best arguments: if they are wrong, the bridge answers with that tool's exact schema.")
+    if only_list:
+        return "\n".join(lines)
     if choice.get("type") == "any":
         lines += ["", "You MUST call at least one tool in this reply."]
     elif choice.get("type") == "tool" and choice.get("name"):
         lines += ["", f"You MUST call the tool '{choice['name']}' in this reply."]
     return "\n".join(lines)
+
+
+def fix_message(req: Any, problems: List[str], need: bool) -> str:
+    """What the model is told when a tool call was unusable: the exact problems, the exact schema of every tool named in them, and the end-marker rule again."""
+    msg = ("Your previous reply contained an invalid tool call: " + "; ".join(problems or ["no tool call was made but one is required"]) +
+           ". Reply again with ONLY the corrected tool call(s) in the exact format.")
+    seen: List[str] = []
+    for p in problems:
+        for n in re.findall(r"tool '([^']+)'", p):
+            if n in req.tools and n not in seen:
+                seen.append(n)
+    for n in seen[:3]:
+        msg += f"\nThe exact input schema of '{neutralise(n)}': " + neutralise(jdump(minify_schema(req.tools[n].get("input_schema") or {}, 0, True)))
+    m = end_marker()
+    return msg + (f"\nEnd the reply with the line {m}." if m else "")
 
 
 _CTRL_RE = re.compile(r"<(/?)(tool_call|system|tools|conversation|handoff)\b", re.I)
@@ -15391,6 +16397,1123 @@ class ContextCtx:
         self.idx = -1
 
 
+# ============================================================================
+# 7.71 RELIABILITY LAYER (nine changes, ordered by effect)
+#   1 END MARKER      the model ends every tool-capable reply with one fixed line; a reply is complete only when that line is seen (UI tier: no more guessing from silence)
+#   2 NETWORK TEXT    the raw stream of the chat page (SSE / ndjson) read through CDP; used only when it AGREES with what the page shows, the page text stays the fallback
+#   3 SCHEMA          full JSON-schema check of every tool call (type, enum, extra keys, length, range, nested); the exact error goes back to the model
+#   4 PRE-CHECK       session memory (reads / edits seen in THIS request's history) rejects an Edit that cannot work before Claude Code runs it
+#   5 FEWER TOOLS     only the tools that matter for this turn are shown in full; the rest by name + one line (a wrong call to one of them gets its exact schema back)
+#   6 NATIVE FORMAT   a host can be given the markup its model was trained on (DeepSeek: DSML); the others keep the fenced / tag format
+#   7 DASHBOARD       per-host parse success, cut-off rate, retries, end-signal mix, latency (GET /api/reliability, dashboard card, --reliability)
+#   8 REPLAY          real model replies (credential-masked) are kept and every new version is run over all of them (--replay)
+#   9 DAILY PROBE     one tiny tool call per site per day; a changed format or a failing site raises an alert
+# Everything is data-driven (config keys below), additive, and falls back to the old behaviour when switched off.
+# ============================================================================
+RELCFG: Dict[str, Any] = {"marker": True, "marker_text": "\u27e6END\u27e7", "grace_s": 6.0, "schema": "strict", "net_text": True, "precheck": True, "precheck_fs": False}
+
+
+def configure_reliability(cfg: Any) -> None:
+    """Copy the plain settings into the module-level switches that code without a Config object (UI backend, parser) reads. Never raises."""
+    try:
+        RELCFG["marker"] = bool(cfg["end_marker"])
+        RELCFG["marker_text"] = (str(cfg["end_marker_text"] or "").strip() or "\u27e6END\u27e7")[:24]
+        RELCFG["grace_s"] = max(0.0, min(30.0, float(cfg["end_marker_grace_s"])))
+        RELCFG["schema"] = str(cfg["schema_validation"]) if str(cfg["schema_validation"]) in ("strict", "basic", "off") else "strict"
+        RELCFG["net_text"] = bool(cfg["net_text"])
+        RELCFG["precheck"] = bool(cfg["precheck"])
+        RELCFG["precheck_fs"] = bool(cfg["precheck_fs"])
+    except Exception:
+        pass
+
+
+def end_marker() -> str:
+    return str(RELCFG["marker_text"]) if RELCFG.get("marker") else ""
+
+
+def end_marker_rule() -> str:
+    m = end_marker()
+    return (f"(6) END MARKER: the very last line of EVERY reply must be exactly {m} and nothing may follow it. The bridge treats a reply as finished only when it sees that line, "
+            f"so never leave it out, never write it earlier and never put it inside a code block.") if m else ""
+
+
+# ---- 1. end marker -----------------------------------------------------------------------------------------------------------------------
+class MarkerFilter:
+    """Streaming filter: removes the end marker from the text the client sees, holds back a partly written marker until it is clear what it is, and remembers whether the marker was seen."""
+
+    def __init__(self, marker: str) -> None:
+        self.m, self.buf, self.seen = marker or "", "", False
+
+    def feed(self, d: str) -> str:
+        if not self.m or not d or self.seen:
+            return d
+        self.buf += d
+        i = self.buf.find(self.m)
+        if i >= 0:
+            self.seen = True
+            out = self.buf[:i] + self.buf[i + len(self.m):]
+            self.buf = ""
+            return out
+        keep = 0
+        for k in range(min(len(self.m) - 1, len(self.buf)), 0, -1):
+            if self.buf.endswith(self.m[:k]):
+                keep = k
+                break
+        out, self.buf = self.buf[:len(self.buf) - keep], self.buf[len(self.buf) - keep:]
+        return out
+
+    def finish(self) -> str:
+        out, self.buf = self.buf, ""
+        return out
+
+
+def strip_marker(text: str, marker: str) -> Tuple[str, bool]:
+    """(text without the marker line, marker was present). Whitespace right before a closing marker is removed."""
+    if not marker or marker not in text:
+        return text, False
+    i = text.rfind(marker)
+    before, after = text[:i], text[i + len(marker):]
+    return (before.rstrip() + after if not after.strip() else before + after), True
+
+
+def ui_decide_end(txt: str, mk: str, since_text: float, generating: bool, seen_generating: bool, quiet: float, marker_trusted: bool, grace: float, net_ok: bool) -> str:
+    """One pure decision per poll of the UI tier: '' keep waiting | 'marker' | 'network' | 'stop' | 'quiet'.
+    The marker (the model's own explicit end) and a finished network stream that agrees with the page beat any silence timer; the silence timer is the last resort and
+    waits `grace` longer on sites whose model has been following the marker rule."""
+    if mk and txt.rstrip().endswith(mk) and since_text >= 0.35:
+        return "marker"
+    if net_ok and since_text >= 0.2 and not ui_tool_call_open(txt):      # 7.75: a stream that "finished" in the middle of a tool call is a cut, not an end
+        return "network"
+    q = max(quiet, grace) if (mk and marker_trusted) else quiet
+    if not generating and since_text >= q:
+        return "stop" if seen_generating else "quiet"
+    return ""
+
+
+# ---- 2. network text (raw SSE / ndjson of the chat page) ---------------------------------------------------------------------------------
+_NET_SKIP = frozenset({"reasoning", "reasoning_content", "thinking", "thought", "thoughts", "analysis", "search", "search_results", "citations", "references", "metadata", "usage",
+                       "id", "model", "role", "type", "event", "status", "finish_reason", "stop_reason", "index", "created", "title", "conversation_id", "message_id", "parent_id",
+                       "error", "end_turn", "is_completion", "sources", "annotations", "tool_calls_meta"})
+_NET_TEXT = frozenset({"text", "content", "delta", "completion", "token", "response", "answer", "v", "value", "output", "choices", "message", "messages", "parts", "part", "data",
+                       "fragments", "candidates", "content_block", "output_text", "result"})
+_NET_PATH_SKIP = re.compile(r"think|reason|search|status|title|token_usage|citation|quasi|ban_|suggest", re.I)
+
+
+def _net_collect(o: Any, out: List[str], depth: int = 0) -> None:
+    if depth > 8:
+        return
+    if isinstance(o, str):
+        out.append(o)
+    elif isinstance(o, list):
+        for x in o:
+            _net_collect(x, out, depth + 1)
+    elif isinstance(o, dict):
+        p = o.get("p")
+        if isinstance(p, str) and _NET_PATH_SKIP.search(p):
+            return
+        if str(o.get("type", "")).lower() in ("think", "thinking", "reasoning", "search", "tool_result"):
+            return
+        for k, v in o.items():
+            kl = str(k).lower()
+            if kl in _NET_SKIP or kl == "p" or kl == "o":
+                continue
+            if kl in _NET_TEXT:
+                _net_collect(v, out, depth + 1)
+
+
+def sse_payloads(raw: str) -> List[str]:
+    """The `data:` payloads of an SSE body (multi-line data joined), or the lines of an ndjson body."""
+    if "data:" in raw:
+        res: List[str] = []
+        for block in re.split(r"\r?\n\r?\n", raw):
+            ds = [ln[5:].lstrip(" ") for ln in block.splitlines() if ln.startswith("data:")]
+            if ds:
+                res.append("\n".join(ds))
+        return res
+    return [ln for ln in raw.splitlines() if ln.strip()]
+
+
+def extract_stream_text(payloads: List[str]) -> str:
+    """Best-effort answer text of one stream: the string leaves under text-like keys, skipping reasoning / metadata. Cumulative streams (every event repeats the whole text so far) take the last
+    piece. The result is only ever USED when it agrees with the page text (net_agrees), so a wrong guess costs nothing."""
+    pieces: List[str] = []
+    for p in payloads:
+        s = p.strip()
+        if not s or s == "[DONE]":
+            continue
+        try:
+            o = json.loads(s)
+        except Exception:
+            continue
+        got: List[str] = []
+        _net_collect(o, got)
+        txt = "".join(got)
+        if txt:
+            pieces.append(txt)
+    if len(pieces) >= 3 and sum(1 for i in range(1, len(pieces)) if pieces[i].startswith(pieces[i - 1])) >= 0.9 * (len(pieces) - 1):
+        return pieces[-1]
+    return "".join(pieces)
+
+
+def _alnum(s: str) -> str:
+    return re.sub(r"[\W_]+", "", s.lower())
+
+
+def net_agrees(dom: str, net: str) -> bool:
+    """The network text may replace the page text only if it is the SAME answer: same start, same ending of what the page shows, and not shorter. Punctuation / markdown is ignored."""
+    a, b = _alnum(dom), _alnum(net)
+    if len(a) < 12 or len(b) < len(a) * 0.95:
+        return False
+    return b.startswith(a[:min(len(a), 120)]) and a[-40:] in b
+
+
+class NetTap:
+    """Collects the streamed responses of ONE chat page through CDP Network events (Personal Chrome or the old browser; the same session API). Event handlers only record; the commands that
+    need an answer (stream content, response body) are issued by service(), which the UI loop calls from the browser thread. Any failure just leaves `ok` False: the page text is used."""
+    STREAM_TYPES = ("event-stream", "ndjson", "x-ndjson", "stream+json", "jsonl")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.streams: Dict[str, Dict[str, Any]] = {}
+        self.sess: Any = None
+        self.ok = False
+        self.cache: Dict[str, Tuple[int, str]] = {}
+
+    def attach(self, ctx: Any, pg: Any) -> bool:
+        try:
+            s = ctx.new_cdp_session(pg)
+            try:
+                s.send("Network.enable", {})
+            except Exception:
+                pass
+            s.on("Network.responseReceived", self._resp)
+            s.on("Network.eventSourceMessageReceived", self._es)
+            s.on("Network.dataReceived", self._data)
+            s.on("Network.loadingFinished", self._fin)
+            s.on("Network.loadingFailed", self._fail)
+            self.sess, self.ok = s, True
+        except Exception:
+            self.sess, self.ok = None, False
+        return self.ok
+
+    def detach(self) -> None:
+        s, self.sess, self.ok = self.sess, None, False
+        try:
+            if s is not None:
+                s.detach()
+        except Exception:
+            pass
+
+    def _new(self, rid: str, url: str = "", ctype: str = "") -> Dict[str, Any]:
+        st = self.streams.get(rid)
+        if st is None:
+            st = {"rid": rid, "url": url, "ctype": ctype, "payloads": [], "raw": bytearray(), "finished": False, "failed": False, "asked": False, "fetched": False, "t": time.monotonic()}
+            self.streams[rid] = st
+        return st
+
+    def _resp(self, p: Dict[str, Any]) -> None:
+        r = p.get("response") or {}
+        ct = str(r.get("mimeType") or "")
+        for k, v in (r.get("headers") or {}).items():
+            if str(k).lower() == "content-type":
+                ct = str(v)
+        if any(t in ct.lower() for t in self.STREAM_TYPES):
+            with self.lock:
+                self._new(str(p.get("requestId", "")), str(r.get("url") or ""), ct)
+
+    def _es(self, p: Dict[str, Any]) -> None:
+        with self.lock:
+            self._new(str(p.get("requestId", ""))).get("payloads", []).append(str(p.get("data") or ""))
+
+    def _data(self, p: Dict[str, Any]) -> None:
+        d = p.get("data")
+        if not d:
+            return
+        with self.lock:
+            st = self.streams.get(str(p.get("requestId", "")))
+            if st is not None:
+                try:
+                    st["raw"].extend(base64.b64decode(d))
+                except Exception:
+                    pass
+
+    def _fin(self, p: Dict[str, Any]) -> None:
+        with self.lock:
+            st = self.streams.get(str(p.get("requestId", "")))
+            if st is not None:
+                st["finished"] = True
+
+    def _fail(self, p: Dict[str, Any]) -> None:
+        with self.lock:
+            st = self.streams.get(str(p.get("requestId", "")))
+            if st is not None:
+                st["failed"] = True
+
+    def service(self) -> None:
+        """Browser-thread work: ask Chrome to stream the content of a stream we have seen, and fetch the finished body when no event carried it. Best effort."""
+        s = self.sess
+        if s is None:
+            return
+        with self.lock:
+            todo = [(st["rid"], not st["asked"], st["finished"] and not st["fetched"] and not st["payloads"] and not st["raw"]) for st in self.streams.values()]
+        for rid, ask, fetch in todo:
+            try:
+                if ask:
+                    with self.lock:
+                        self.streams[rid]["asked"] = True
+                    r = s.send("Network.streamResourceContent", {"requestId": rid}) or {}
+                    if r.get("bufferedData"):
+                        with self.lock:
+                            self.streams[rid]["raw"].extend(base64.b64decode(r["bufferedData"]))
+                if fetch:
+                    with self.lock:
+                        self.streams[rid]["fetched"] = True
+                    r = s.send("Network.getResponseBody", {"requestId": rid}) or {}
+                    body = r.get("body") or ""
+                    with self.lock:
+                        self.streams[rid]["raw"].extend(base64.b64decode(body) if r.get("base64Encoded") else body.encode("utf-8", "replace"))
+            except Exception:
+                continue
+
+    def _text_of(self, st: Dict[str, Any]) -> str:
+        n = len(st["payloads"]) + len(st["raw"])
+        c = self.cache.get(st["rid"])
+        if c and c[0] == n:
+            return c[1]
+        pl = list(st["payloads"]) or sse_payloads(bytes(st["raw"]).decode("utf-8", "replace"))
+        txt = extract_stream_text(pl)
+        self.cache[st["rid"]] = (n, txt)
+        return txt
+
+    def final_text(self, dom_text: str) -> Optional[str]:
+        """The text of a FINISHED stream that agrees with the page text, newest stream first; None when there is none."""
+        with self.lock:
+            cands = sorted((st for st in self.streams.values() if st["finished"] and not st["failed"]), key=lambda s_: -s_["t"])
+            for st in cands:
+                txt = self._text_of(st)
+                if txt and net_agrees(dom_text, txt):
+                    return txt
+        return None
+
+    def seen(self) -> int:
+        with self.lock:
+            return len(self.streams)
+
+
+# ---- 3. schema validation ------------------------------------------------------------------------------------------------------------------
+def _jtype(v: Any) -> str:
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, int):
+        return "integer"
+    if isinstance(v, float):
+        return "number"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, list):
+        return "array"
+    if isinstance(v, dict):
+        return "object"
+    return type(v).__name__
+
+
+def _type_ok(v: Any, t: str) -> bool:
+    jt = _jtype(v)
+    if t == jt or (t == "number" and jt == "integer"):
+        return True
+    return t == "integer" and jt == "number" and float(v).is_integer()
+
+
+def _pv(v: Any) -> str:
+    try:
+        s = json.dumps(v, ensure_ascii=False)
+    except Exception:
+        s = repr(v)
+    return s if len(s) <= 40 else s[:37] + "..."
+
+
+def _where(path: str) -> str:
+    return "the arguments" if not path else f"argument '{path}'"
+
+
+def _ref(root: Dict[str, Any], ref: Any) -> Dict[str, Any]:
+    if not (isinstance(ref, str) and ref.startswith("#/")):
+        return {}
+    cur: Any = root
+    for part in ref[2:].split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return {}
+    return cur if isinstance(cur, dict) else {}
+
+
+def _enum_has(enum: List[Any], v: Any) -> bool:
+    return any(_jtype(e) == _jtype(v) and e == v or (isinstance(e, (int, float)) and isinstance(v, (int, float)) and not isinstance(e, bool) and not isinstance(v, bool) and e == v) for e in enum)
+
+
+def _validate(v: Any, sch: Any, path: str, errs: List[str], root: Dict[str, Any], strict: bool, depth: int) -> None:
+    if depth > 12 or len(errs) >= 8 or not isinstance(sch, dict):
+        return
+    if "$ref" in sch:
+        sch = {**_ref(root, sch["$ref"]), **{k: x for k, x in sch.items() if k != "$ref"}}
+    for sub in (sch.get("allOf") or []) if isinstance(sch.get("allOf"), list) else []:
+        _validate(v, sub, path, errs, root, strict, depth + 1)
+    for key in ("anyOf", "oneOf"):
+        subs = sch.get(key)
+        if isinstance(subs, list) and subs:
+            best: Optional[List[str]] = None
+            for sub in subs:
+                e2: List[str] = []
+                _validate(v, sub, path, e2, root, strict, depth + 1)
+                if not e2:
+                    best = []
+                    break
+                if best is None or len(e2) < len(best):
+                    best = e2
+            if best:
+                errs.append(f"{_where(path)} matches none of the allowed shapes (closest: {best[0]})")
+                return
+    if sch.get("nullable") and v is None:
+        return
+    t = sch.get("type")
+    types = [x for x in (t if isinstance(t, list) else [t]) if isinstance(x, str)]
+    if types and not any(_type_ok(v, x) for x in types):
+        errs.append(f"{_where(path)} must be {' or '.join(types)}, got {_jtype(v)} ({_pv(v)})")
+        return
+    if strict:
+        if isinstance(sch.get("enum"), list) and not _enum_has(sch["enum"], v):
+            errs.append(f"{_where(path)} must be one of {json.dumps(sch['enum'][:10], ensure_ascii=False)}, got {_pv(v)}")
+            return
+        if "const" in sch and not (_jtype(sch["const"]) == _jtype(v) and sch["const"] == v):
+            errs.append(f"{_where(path)} must be exactly {_pv(sch['const'])}, got {_pv(v)}")
+            return
+    if isinstance(v, str) and strict:
+        if isinstance(sch.get("minLength"), int) and len(v) < sch["minLength"]:
+            errs.append(f"{_where(path)} is too short ({len(v)} characters, minimum {sch['minLength']})")
+        if isinstance(sch.get("maxLength"), int) and len(v) > sch["maxLength"]:
+            errs.append(f"{_where(path)} is too long ({len(v)} characters, maximum {sch['maxLength']})")
+        if isinstance(sch.get("pattern"), str):
+            try:
+                if not re.search(sch["pattern"], v):
+                    errs.append(f"{_where(path)} does not match the pattern {sch['pattern'][:60]!r}")
+            except re.error:
+                pass
+    elif isinstance(v, (int, float)) and not isinstance(v, bool) and strict:
+        if isinstance(sch.get("minimum"), (int, float)) and v < sch["minimum"]:
+            errs.append(f"{_where(path)} must be >= {sch['minimum']}, got {_pv(v)}")
+        if isinstance(sch.get("maximum"), (int, float)) and v > sch["maximum"]:
+            errs.append(f"{_where(path)} must be <= {sch['maximum']}, got {_pv(v)}")
+        if isinstance(sch.get("exclusiveMinimum"), (int, float)) and not isinstance(sch.get("exclusiveMinimum"), bool) and v <= sch["exclusiveMinimum"]:
+            errs.append(f"{_where(path)} must be > {sch['exclusiveMinimum']}, got {_pv(v)}")
+        if isinstance(sch.get("exclusiveMaximum"), (int, float)) and not isinstance(sch.get("exclusiveMaximum"), bool) and v >= sch["exclusiveMaximum"]:
+            errs.append(f"{_where(path)} must be < {sch['exclusiveMaximum']}, got {_pv(v)}")
+        mo = sch.get("multipleOf")
+        if isinstance(mo, (int, float)) and not isinstance(mo, bool) and mo > 0 and abs(round(v / mo) * mo - v) > 1e-9:
+            errs.append(f"{_where(path)} must be a multiple of {mo}, got {_pv(v)}")
+    elif isinstance(v, list):
+        if strict:
+            if isinstance(sch.get("minItems"), int) and len(v) < sch["minItems"]:
+                errs.append(f"{_where(path)} needs at least {sch['minItems']} item(s), got {len(v)}")
+            if isinstance(sch.get("maxItems"), int) and len(v) > sch["maxItems"]:
+                errs.append(f"{_where(path)} allows at most {sch['maxItems']} item(s), got {len(v)}")
+            if sch.get("uniqueItems") and len({jdump(x) for x in v}) != len(v):
+                errs.append(f"{_where(path)} must not contain duplicates")
+        it = sch.get("items")
+        for i, x in enumerate(v[:200]):
+            sub = it[i] if isinstance(it, list) and i < len(it) else (it if isinstance(it, dict) else None)
+            if sub is not None:
+                _validate(x, sub, f"{path}[{i}]", errs, root, strict, depth + 1)
+    elif isinstance(v, dict):
+        props = sch.get("properties") if isinstance(sch.get("properties"), dict) else {}
+        req = [k for k in (sch.get("required") or []) if isinstance(k, str)] if isinstance(sch.get("required"), list) else []
+        miss = [k for k in req if k not in v]
+        if miss:
+            errs.append(f"missing required argument(s): {', '.join(miss)}" if not path else f"{_where(path)} is missing required key(s): {', '.join(miss)}")
+        for k, x in v.items():
+            if k in props:
+                _validate(x, props[k], f"{path}.{k}" if path else str(k), errs, root, strict, depth + 1)
+        if strict:
+            ap = sch.get("additionalProperties")
+            extra = [k for k in v if k not in props]
+            if ap is False and extra:
+                errs.append(f"unexpected argument(s) {', '.join(repr(k) for k in extra[:6])} ({'allowed: ' + ', '.join(props) if props else 'this object takes no keys'})")
+            elif isinstance(ap, dict):
+                for k in extra:
+                    _validate(v[k], ap, f"{path}.{k}" if path else str(k), errs, root, strict, depth + 1)
+            if isinstance(sch.get("minProperties"), int) and len(v) < sch["minProperties"]:
+                errs.append(f"{_where(path)} needs at least {sch['minProperties']} key(s)")
+
+
+def validate_args(schema: Any, args: Any, mode: Optional[str] = None) -> List[str]:
+    """Every way a tool call's arguments can disagree with the tool's JSON schema, as short precise sentences (at most 8). mode: strict (all keywords) | basic (required + types) | off (required only)."""
+    mode = mode or str(RELCFG.get("schema") or "strict")
+    errs: List[str] = []
+    if not isinstance(schema, dict) or not schema:
+        return errs
+    if mode == "off":
+        miss = [k for k in (schema.get("required") or []) if isinstance(args, dict) and k not in args]
+        return [f"missing required argument(s): {', '.join(miss)}"] if miss else []
+    _validate(args, schema, "", errs, schema, mode == "strict", 0)
+    return errs[:8]
+
+
+def tool_problem(name: str, errs: List[str]) -> str:
+    msg = "; ".join(errs)
+    return f"tool '{name}' is {msg}" if msg.startswith("missing required") else f"tool '{name}': {msg}"
+
+
+# ---- 4. pre-check with the memory of this session --------------------------------------------------------------------------------------------
+_READ_NAMES = frozenset({"read", "read_file", "readfile", "view", "view_file", "open_file"})
+_WRITE_NAMES = frozenset({"write", "write_file", "writefile", "create_file"})
+_BASH_NAMES = frozenset({"bash", "shell", "run_command", "execute_command", "terminal", "powershell", "cmd", "run_terminal_cmd"})
+_PATH_KEYS = ("file_path", "path", "filename", "notebook_path")
+_RO_CMD = re.compile(r"^\s*(?:ls|cat|head|tail|grep|rg|find|pwd|echo|wc|which|type|stat|file|du|df|env|printenv|tree|git\s+(?:status|diff|log|show|branch|ls-files|rev-parse)|sort|uniq|cut|diff|true|date|whoami)\b")
+_NUMBERED = re.compile(r"^\s*(\d+)(?:\u2192|\t)(.*)$")
+
+
+def _tool_kind(name: str, args: Dict[str, Any]) -> str:
+    n = str(name).lower()
+    if isinstance(args.get("edits"), list) and any(k in args for k in _PATH_KEYS):
+        return "multiedit"
+    if any(k in args for k in _PATH_KEYS) and (("old_string" in args and "new_string" in args) or ("old_str" in args and "new_str" in args)):
+        return "edit"
+    if n in _WRITE_NAMES and "content" in args:
+        return "write"
+    if n in _READ_NAMES and any(k in args for k in _PATH_KEYS):
+        return "read"
+    if n in _BASH_NAMES or (n.endswith("bash") and "command" in args):
+        return "bash"
+    return "other"
+
+
+def _path_of(args: Dict[str, Any]) -> str:
+    for k in _PATH_KEYS:
+        if isinstance(args.get(k), str) and args[k].strip():
+            p = args[k].strip().replace("\\", "/") if re.match(r"^[A-Za-z]:[\\/]", args[k].strip()) else args[k].strip()
+            p = os.path.normpath(p) if not re.match(r"^[A-Za-z]:/", p) else re.sub(r"/+", "/", p)
+            return p.lower() if re.match(r"^[A-Za-z]:/", p) else p
+    return ""
+
+
+def _mutating_cmd(cmd: str) -> bool:
+    if re.search(r"(?<![0-9&])>|\btee\b|\bsed\s+-[a-z]*i|\bgit\s+(?:checkout|reset|stash|apply|pull|merge|rebase|restore|clean|commit)\b", cmd):
+        return True
+    segs = re.split(r"&&|\|\||;|\|", cmd)
+    return not all(_RO_CMD.match(s) for s in segs if s.strip())
+
+
+def _edit_pairs(args: Dict[str, Any], kind: str) -> List[Tuple[str, str, bool]]:
+    if kind == "multiedit":
+        return [(str(e.get("old_string", "")), str(e.get("new_string", "")), bool(e.get("replace_all"))) for e in args.get("edits") or [] if isinstance(e, dict)]
+    return [(str(args.get("old_string", args.get("old_str", ""))), str(args.get("new_string", args.get("new_str", ""))), bool(args.get("replace_all")))]
+
+
+def _apply_edits(content: str, pairs: List[Tuple[str, str, bool]]) -> Optional[str]:
+    for old, new, ra in pairs:
+        if not old:
+            return None
+        c = content.count(old)
+        if c == 0 or (c > 1 and not ra):
+            return None
+        content = content.replace(old, new) if ra else content.replace(old, new, 1)
+    return content
+
+
+def build_session_facts(messages: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """What THIS request's own history proves about files: read (content, whether it was the whole file), missing, written / edited since, possibly changed by a shell command. No server memory: the client sends the history."""
+    files: Dict[str, Dict[str, Any]] = {}
+    uses: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+    for m in messages:
+        for b in m.get("content") or []:
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "tool_use":
+                uses[str(b.get("id", ""))] = (str(b.get("name", "")), b.get("input") if isinstance(b.get("input"), dict) else {})
+            elif b.get("type") == "tool_result":
+                name, inp = uses.get(str(b.get("tool_use_id", "")), ("", {}))
+                if not name:
+                    continue
+                kind, path, err, txt = _tool_kind(name, inp), _path_of(inp), bool(b.get("is_error")), _result_text(b)
+                if kind == "read" and path:
+                    lines, started = [], False
+                    for ln in txt.splitlines():
+                        mm = _NUMBERED.match(ln)
+                        if mm:
+                            started = True
+                            lines.append((int(mm.group(1)), mm.group(2)))
+                        elif started:
+                            break
+                    if err or (not lines and re.search(r"(?i)does not exist|no such file|not found|ENOENT", txt[:400])):
+                        files[path] = {"read": False, "missing": True, "content": None, "full": False, "stale": False}
+                    elif lines:
+                        partial = any(k in inp for k in ("offset", "limit", "start_line", "end_line")) or lines[0][0] != 1 or len(lines) >= 2000 or any(len(x[1]) >= 2000 for x in lines)
+                        files[path] = {"read": True, "missing": False, "content": "\n".join(x[1] for x in lines), "full": not partial, "stale": False}
+                    else:
+                        files[path] = {"read": True, "missing": False, "content": None, "full": False, "stale": False}
+                elif kind == "write" and path and not err:
+                    files[path] = {"read": True, "missing": False, "content": str(inp.get("content", "")), "full": True, "stale": False}
+                elif kind in ("edit", "multiedit") and path and not err:
+                    f = files.setdefault(path, {"read": True, "missing": False, "content": None, "full": False, "stale": False})
+                    f["read"], f["missing"] = True, False
+                    new = _apply_edits(f["content"], _edit_pairs(inp, kind)) if isinstance(f.get("content"), str) and f.get("full") else None
+                    if new is None:
+                        f["stale"] = True
+                    else:
+                        f["content"] = new
+                elif kind == "bash" and _mutating_cmd(str(inp.get("command", ""))):
+                    for f in files.values():
+                        f["stale"] = True
+    return files
+
+
+def _closest_hint(content: str, old: str) -> str:
+    first = next((ln.strip() for ln in old.splitlines() if ln.strip()), "")
+    if not first:
+        return ""
+    lines = content.splitlines()
+    cand = difflib.get_close_matches(first, [ln.strip() for ln in lines], n=1, cutoff=0.6)
+    if not cand:
+        return ""
+    ln = next((i for i, x in enumerate(lines, 1) if x.strip() == cand[0]), 0)
+    return f" The closest line in the file is line {ln}: {cand[0][:120]!r}."
+
+
+def _check_edit_call(name: str, args: Dict[str, Any], kind: str, facts: Dict[str, Dict[str, Any]], batch: Dict[str, str], has_read_tool: bool, fs_check: bool) -> str:
+    path = _path_of(args)
+    pairs = _edit_pairs(args, kind)
+    for i, (old, new, _ra) in enumerate(pairs):
+        if old and old == new:
+            return f"tool '{name}': old_string and new_string are identical" + (f" (edit {i + 1})" if kind == "multiedit" else "") + ", so nothing would change."
+        if re.search(r"(?m)^\s*\d+\u2192", old):
+            return f"tool '{name}': old_string contains line-number prefixes (like '12\u2192') that are not part of the file. Copy only the text after the arrow."
+    if not path or (len(pairs) == 1 and not pairs[0][0]):
+        return ""
+    touched = batch.get(path) or batch.get("*")
+    if touched:
+        return ""                                                         # read / written / changed earlier in this very reply: its state is unknown until the results arrive
+    f = facts.get(path)
+    if f is not None and f.get("missing"):
+        return f"tool '{name}': {path} does not exist (an earlier Read in this session said so). Check the path (Glob / ls) or create it with Write."
+    if f is None:
+        if fs_check and os.path.isabs(path) and not os.path.exists(path) and os.path.isdir(os.path.dirname(path)):
+            return f"tool '{name}': {path} does not exist on this machine. Check the path or create the file with Write."
+        if has_read_tool:
+            return f"tool '{name}': {path} has not been read in this session. Read it first, then edit it."
+        return ""
+    if f.get("stale") or not f.get("full") or not isinstance(f.get("content"), str):
+        return ""                                                         # not sure what the file looks like now: let Claude Code be the judge
+    content = f["content"]
+    for i, (old, _new, ra) in enumerate(pairs):
+        c = content.count(old)
+        where = f" (edit {i + 1} of {len(pairs)})" if kind == "multiedit" else ""
+        if c == 0:
+            return (f"tool '{name}': old_string{where} was not found in {path} as it was last read in this session.{_closest_hint(content, old)} "
+                    f"Read the file again if it may have changed, then copy old_string exactly (same spaces, tabs and line breaks).")
+        if c > 1 and not ra:
+            return f"tool '{name}': old_string{where} appears {c} times in {path}. Add surrounding lines so it is unique, or set replace_all to true."
+        content = content.replace(old, pairs[i][1]) if ra else content.replace(old, pairs[i][1], 1)
+    return ""
+
+
+def _note_batch(name: str, args: Dict[str, Any], batch: Dict[str, str]) -> None:
+    kind, path = _tool_kind(name, args), _path_of(args)
+    if kind == "read" and path:
+        batch.setdefault(path, "read")
+    elif kind in ("write", "edit", "multiedit") and path:
+        batch[path] = "changed"
+    elif kind == "bash" and _mutating_cmd(str(args.get("command", ""))):
+        batch["*"] = "changed"
+
+
+def precheck_calls(req: Any, calls: List[Dict[str, Any]], cfg: Any, earlier: Optional[List[Dict[str, Any]]] = None) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """(calls that may run, problems). Stops at the FIRST call that cannot work: the order of calls matters, so everything after it is asked for again together with the corrected one."""
+    if not calls or not RELCFG.get("precheck"):
+        return calls, []
+    try:
+        facts = build_session_facts(req.messages)
+        has_read = any(_tool_kind(n, {"file_path": "x"}) == "read" for n in req.tools)
+        batch: Dict[str, str] = {}
+        for c in earlier or []:
+            _note_batch(c["name"], c["input"], batch)
+        ok: List[Dict[str, Any]] = []
+        for i, c in enumerate(calls):
+            kind = _tool_kind(c["name"], c["input"])
+            if kind in ("edit", "multiedit"):
+                why = _check_edit_call(c["name"], c["input"], kind, facts, batch, has_read, bool(RELCFG.get("precheck_fs")))
+                if why:
+                    later = len(calls) - i - 1
+                    return ok, [why + (f" ({later} later call(s) in the same reply were not run because the order matters; send them again after this one.)" if later else "")]
+            ok.append(c)
+            _note_batch(c["name"], c["input"], batch)
+        return ok, []
+    except Exception as e:                                                # a bug here must never stop serving
+        log(f"precheck skipped: {type(e).__name__}: {e}", "debug")
+        return calls, []
+
+
+# ---- 5. fewer tools per turn -------------------------------------------------------------------------------------------------------------------
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]{2,}")
+
+
+def _words(s: str) -> Set[str]:
+    return {w.lower() for w in _WORD_RE.findall(re.sub(r"([a-z])([A-Z])", r"\1 \2", str(s).replace("_", " ").replace("-", " ")))}
+
+
+def _msg_text(m: Dict[str, Any], cap: int = 1500) -> str:
+    out = []
+    for b in m.get("content") or []:
+        if isinstance(b, dict):
+            if b.get("type") == "text":
+                out.append(str(b.get("text", "")))
+            elif b.get("type") == "tool_result":
+                out.append(_result_text(b)[:cap])
+    return " ".join(out)[:cap * 2]
+
+
+def select_tools(req: Any, cfg: Any, shown_before: Optional[Iterable[str]] = None) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    """(tools shown in full, tools shown by name only). With at most `tools_per_turn_max` tools nothing changes. Otherwise: the named tool_choice, the core tools, tools used in the recent history,
+    then the ones whose name / description share words with what the conversation is about now; tools the remote chat has already seen in full stay preferred."""
+    tools = req.tools
+    try:
+        maxn = int(cfg["tools_per_turn_max"] or 0)
+    except Exception:
+        maxn = 0
+    if not maxn or len(tools) <= maxn:
+        return tools, {}
+    core = {str(x).lower() for x in (cfg["tools_core"] or [])}
+    forced = {req.tool_choice.get("name")} if req.tool_choice.get("type") == "tool" and req.tool_choice.get("name") in tools else set()
+    recent = req.messages[-24:]
+    used: Dict[str, int] = {}
+    for i, m in enumerate(recent):
+        for b in m.get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") in tools:
+                used[b["name"]] = i
+    ctx_words: Set[str] = set()
+    for m in recent[-3:]:
+        ctx_words |= _words(_msg_text(m))
+    last_user = next((m for m in reversed(req.messages) if m.get("role") == "user" and any(b.get("type") == "text" for b in m.get("content") or [] if isinstance(b, dict))), None)
+    if last_user is not None:
+        ctx_words |= _words(_msg_text(last_user))
+    before = set(shown_before or [])
+    order = list(tools)
+    score: Dict[str, float] = {}
+    for n, t in tools.items():
+        s = 1000.0 if n in forced else 0.0
+        s += 100.0 if n.lower() in core else 0.0
+        s += (50.0 + used[n]) if n in used else 0.0
+        s += 3.0 * len(_words(n) & ctx_words) + 0.5 * len(_words(str(t.get("description", ""))[:300]) & ctx_words)
+        s += 5.0 if n in before else 0.0
+        score[n] = s
+    keep = set(sorted(order, key=lambda n: (-score[n], order.index(n)))[:maxn])
+    return {n: tools[n] for n in order if n in keep}, {n: tools[n] for n in order if n not in keep}
+
+
+# ---- 6. native tool format per site -------------------------------------------------------------------------------------------------------------
+_DSML = "\uff5c"
+
+
+def choose_tool_format(cfg: Any, host: str, backend: Any) -> str:
+    """fenced | tag | dsml. `tool_format_by_host` (substring of the host -> format) wins, then `tool_format` (auto = what the backend needs)."""
+    try:
+        for k, v in (cfg["tool_format_by_host"] or {}).items():
+            if str(k).lower() in str(host).lower() and v in ("fenced", "tag", "dsml"):
+                return str(v)
+        f = str(cfg["tool_format"] or "auto")
+        if f in ("fenced", "tag", "dsml"):
+            return f
+    except Exception:
+        pass
+    return "fenced" if getattr(backend, "fenced_tools", False) else "tag"
+
+
+def render_call_dsml(name: Any, args: Any) -> str:
+    D = _DSML
+    out = [f"<{D}DSML{D}function_calls>", f'<{D}DSML{D}invoke name="{name}">']
+    for k, v in (args or {}).items():
+        if isinstance(v, str):
+            out.append(f'<{D}DSML{D}parameter name="{k}" string="true">{v}</{D}DSML{D}parameter>')
+        else:
+            out.append(f'<{D}DSML{D}parameter name="{k}" string="false">{json.dumps(v, ensure_ascii=False)}</{D}DSML{D}parameter>')
+    out += [f"</{D}DSML{D}invoke>", f"</{D}DSML{D}function_calls>"]
+    return "\n".join(out)
+
+
+def detect_tool_format(text: str) -> str:
+    if re.search(r"DSML", text):
+        return "dsml"
+    if re.search(r"<\s*invoke\b|<\s*function_calls", text, re.I):
+        return "xml"
+    if re.search(r"<\s*function=", text, re.I):
+        return "qwen"
+    if re.search(r"<\s*tool_call\b", text, re.I):
+        return "tag"
+    if "```tool_call" in text:
+        return "fenced"
+    if re.search(r"```(?:json)?\s*\{", text):
+        return "json-fence"
+    return "none" if "{" not in text else "bare-json"
+
+
+# ---- 7. reliability dashboard ---------------------------------------------------------------------------------------------------------------------
+class Reliability:
+    """Per host: how often a tool call parsed the first time, how often it was cut off, how many retries it needed, how replies ended, how long they took. Counters + the last 200 timings, saved to reliability.json."""
+    FILE = "reliability.json"
+    KEEP = 200
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.hosts: Dict[str, Dict[str, Any]] = {}
+        self.alerts: "deque[Dict[str, Any]]" = deque(maxlen=60)
+        self.store: Any = None
+        self.saved_at = 0.0
+        self.dirty = 0
+
+    def bind(self, store: Any) -> None:
+        self.store = store
+        try:
+            d = store.read(self.FILE, {}) if store is not None else {}
+            if isinstance(d, dict):
+                self.hosts = {str(h): v for h, v in (d.get("hosts") or {}).items() if isinstance(v, dict)}
+                for a in d.get("alerts") or []:
+                    if isinstance(a, dict):
+                        self.alerts.append(a)
+        except Exception:
+            self.hosts = {}
+
+    def _h(self, host: str) -> Dict[str, Any]:
+        return self.hosts.setdefault(str(host or "?"), {"requests": 0, "attempts": 0, "first_ok": 0, "final_ok": 0, "cut_off": 0, "retries": 0, "schema_rejects": 0, "precheck_rejects": 0,
+                                                       "marker_expected": 0, "marker_seen": 0, "net_used": 0, "net_streams": 0, "ended": {}, "secs": [], "last_at": 0.0, "last_error": "", "formats": {}})
+
+    def record(self, host: str, **f: Any) -> None:
+        try:
+            with self.lock:
+                h = self._h(host)
+                h["requests"] += 1
+                h["last_at"] = round(now(), 1)
+                if f.get("attempted"):
+                    h["attempts"] += 1
+                    h["first_ok"] += 1 if f.get("first_ok") else 0
+                    h["final_ok"] += 1 if f.get("final_ok") else 0
+                h["cut_off"] += 1 if f.get("cut_off") else 0
+                h["retries"] += int(f.get("retries") or 0)
+                h["schema_rejects"] += int(f.get("schema_rejects") or 0)
+                h["precheck_rejects"] += int(f.get("precheck_rejects") or 0)
+                if f.get("marker_expected"):
+                    h["marker_expected"] += 1
+                    h["marker_seen"] += 1 if f.get("marker_seen") else 0
+                if f.get("net_used"):
+                    h["net_used"] += 1
+                h["net_streams"] += int(f.get("net_streams") or 0)
+                via = str(f.get("end_via") or "")
+                if via:
+                    h["ended"][via] = h["ended"].get(via, 0) + 1
+                if isinstance(f.get("seconds"), (int, float)) and f["seconds"] >= 0:
+                    h["secs"].append(round(float(f["seconds"]), 2))
+                    del h["secs"][:-self.KEEP]
+                if f.get("format"):
+                    h["formats"][str(f["format"])] = h["formats"].get(str(f["format"]), 0) + 1
+                if f.get("error"):
+                    h["last_error"] = str(f["error"])[:200]
+                self.dirty += 1
+            self._save()
+        except Exception:
+            pass
+
+    def marker_trusted(self, host: str) -> bool:
+        """False once the site's model has been seen to ignore the marker rule (>= 8 samples, followed in under half): then the silence timer is not stretched for a marker that will not come."""
+        with self.lock:
+            h = self.hosts.get(str(host or "?")) or {}
+            e, s = int(h.get("marker_expected") or 0), int(h.get("marker_seen") or 0)
+        return e < 8 or s / max(1, e) >= 0.5
+
+    def alert(self, kind: str, host: str, msg: str) -> None:
+        with self.lock:
+            self.alerts.append({"t": round(now(), 1), "kind": kind, "host": host, "message": msg[:300]})
+            self.dirty += 5
+        log(f"reliability alert [{kind}] {host}: {msg}", "warn")
+        self._save(True)
+
+    def _save(self, force: bool = False) -> None:
+        if self.store is None or (not force and (self.dirty < 20 or time.time() - self.saved_at < 30)):
+            return
+        self.saved_at, self.dirty = time.time(), 0
+        try:
+            with self.lock:
+                snap = {"hosts": json.loads(json.dumps(self.hosts)), "alerts": list(self.alerts)}
+            self.store.write(self.FILE, snap)
+        except Exception:
+            pass
+
+    def flush(self) -> None:
+        self._save(True)
+
+    @staticmethod
+    def _pct(a: int, b: int) -> Optional[float]:
+        return round(100.0 * a / b, 1) if b else None
+
+    def view(self) -> Dict[str, Any]:
+        with self.lock:
+            rows = []
+            for host, h in sorted(self.hosts.items()):
+                s = sorted(h["secs"])
+                q = lambda p: (s[int(p * (len(s) - 1))] if s else None)       # noqa: E731
+                rows.append({"host": host, "requests": h["requests"], "tool_attempts": h["attempts"], "parse_ok_pct": self._pct(h["first_ok"], h["attempts"]),
+                             "final_ok_pct": self._pct(h["final_ok"], h["attempts"]), "cut_off_pct": self._pct(h["cut_off"], h["attempts"]), "retries": h["retries"],
+                             "retries_per_attempt": round(h["retries"] / h["attempts"], 2) if h["attempts"] else None, "schema_rejects": h["schema_rejects"],
+                             "precheck_rejects": h["precheck_rejects"], "marker_pct": self._pct(h["marker_seen"], h["marker_expected"]), "net_text_used": h["net_used"],
+                             "ended_by": dict(h["ended"]), "p50_s": q(0.5), "p90_s": q(0.9), "formats": dict(h["formats"]), "last_error": h["last_error"], "last_at": h["last_at"]})
+            return {"hosts": rows, "alerts": list(self.alerts)[::-1][:30]}
+
+
+RELIABILITY = Reliability()
+
+
+# ---- 8. replay of real replies --------------------------------------------------------------------------------------------------------------------
+_RE_HOME = re.compile(r"(?i)((?:/home/|/Users/|[A-Z]:\\{1,4}Users\\{1,4}|[A-Z]:/Users/))([^/\\\s\"'<>:*?|]+)")      # 7.72: a Windows path inside a JSON string has its backslashes doubled (C:\\Users\\name)
+_RE_EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+
+
+def replay_redact(text: str) -> str:
+    t = redact_stored(text)[0]
+    t = _RE_HOME.sub(lambda m: m.group(1) + "user", t)
+    return _RE_EMAIL.sub("user@example.com", t)
+
+
+def _replay_expect(tools: Dict[str, Dict[str, Any]], text: str) -> Dict[str, Any]:
+    clean, calls, problems = parse_tool_calls(text, tools, "replay")
+    return {"calls": [[c["name"], sha(jdump(c["input"]))[:12]] for c in calls], "n_problems": len(problems), "clean_sha": sha(clean)[:12]}
+
+
+class ReplayStore:
+    """Real replies of the sites' models (credentials, e-mail addresses and home folders masked) together with what the parser made of them. `run()` parses all of them with the CURRENT code:
+    same = unchanged, improved = a reply that used to fail now parses, regression = something that worked changed."""
+    MAX_TEXT = 30000
+
+    def __init__(self, folder: Optional[Path] = None, max_cases: int = 400) -> None:
+        self.dir, self.max_cases, self.lock = folder, max_cases, threading.Lock()
+
+    def bind(self, folder: Path, max_cases: int = 400) -> None:
+        self.dir, self.max_cases = folder, int(max_cases)
+
+    def record(self, host: str, tools: Dict[str, Dict[str, Any]], text: str) -> Optional[str]:
+        if self.dir is None or not tools or not text.strip() or len(text) > self.MAX_TEXT:
+            return None
+        try:
+            red = replay_redact(text)
+            cid = sha(host + "|" + red)[:16]
+            p = self.dir / (cid + ".json")
+            if p.exists():
+                return None
+            low = red.lower()
+            used = {n: minify_schema(t.get("input_schema") or {}, 0, True) for n, t in tools.items() if n.lower() in low}
+            sub = {n: {"name": n, "description": "", "input_schema": s} for n, s in (used or {n: {} for n in list(tools)[:8]}).items()}
+            case = {"v": 1, "id": cid, "host": host, "recorded": round(now()), "version": VERSION, "tools": sub, "text": red, "expect": _replay_expect(sub, red)}
+            with self.lock:
+                self.dir.mkdir(parents=True, exist_ok=True)
+                tmp = p.with_name(p.name + ".tmp")
+                tmp.write_text(json.dumps(case, ensure_ascii=False), "utf-8")
+                os.replace(tmp, p)
+                files = sorted(self.dir.glob("*.json"), key=lambda f: f.stat().st_mtime)
+                for old in files[:max(0, len(files) - self.max_cases)]:
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
+            return cid
+        except Exception as e:
+            log(f"replay record skipped: {type(e).__name__}: {e}", "debug")
+            return None
+
+    def cases(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        if self.dir is None or not self.dir.exists():
+            return out
+        for f in sorted(self.dir.glob("*.json")):
+            try:
+                c = json.loads(f.read_text("utf-8"))
+                if isinstance(c, dict) and isinstance(c.get("tools"), dict) and isinstance(c.get("text"), str):
+                    out.append(c)
+            except Exception:
+                continue
+        return out
+
+    def run(self, accept: bool = False) -> Dict[str, Any]:
+        rep: Dict[str, Any] = {"total": 0, "same": 0, "improved": [], "regressions": [], "version": VERSION}
+        for c in self.cases():
+            rep["total"] += 1
+            now_ = _replay_expect(c["tools"], c["text"])
+            was = c.get("expect") or {}
+            if now_ == was:
+                rep["same"] += 1
+                continue
+            improved = int(was.get("n_problems") or 0) > 0 and not now_["n_problems"] and bool(now_["calls"]) and not was.get("calls")
+            (rep["improved"] if improved else rep["regressions"]).append({"id": c.get("id"), "host": c.get("host"), "was": was, "now": now_})
+            if accept and self.dir is not None:
+                c["expect"], c["version"] = now_, VERSION
+                try:
+                    (self.dir / (str(c["id"]) + ".json")).write_text(json.dumps(c, ensure_ascii=False), "utf-8")
+                except OSError:
+                    pass
+        return rep
+
+    def summary(self) -> Dict[str, Any]:
+        cs = self.cases()
+        hosts: Dict[str, int] = {}
+        for c in cs:
+            hosts[str(c.get("host"))] = hosts.get(str(c.get("host")), 0) + 1
+        return {"cases": len(cs), "hosts": hosts}
+
+
+REPLAY = ReplayStore()
+
+
+def reliability_cli(args: Any) -> int:
+    st = Store(HOME)
+    cfg = Config(st)
+    if getattr(args, "reliability", False):
+        RELIABILITY.bind(st)
+        v = RELIABILITY.view()
+        print(f"AI Web Bridge {VERSION} - reliability per site (data folder {st.home})")
+        if not v["hosts"]:
+            print("  no data yet: it fills while requests with tools are served")
+        for r in v["hosts"]:
+            print(f"  {r['host']}: requests={r['requests']} tool_attempts={r['tool_attempts']} parsed_first_time={r['parse_ok_pct']}% final_ok={r['final_ok_pct']}% cut_off={r['cut_off_pct']}% "
+                  f"retries={r['retries']} marker_followed={r['marker_pct']}% net_text_used={r['net_text_used']} ended_by={r['ended_by']} p50={r['p50_s']}s p90={r['p90_s']}s")
+        for a in v["alerts"][:10]:
+            print(f"  ALERT {time.strftime('%Y-%m-%d %H:%M', time.localtime(a['t']))} [{a['kind']}] {a['host']}: {a['message']}")
+    if getattr(args, "replay", False):
+        REPLAY.bind(st.path("replay"), int(cfg["replay_max"]))
+        rep = REPLAY.run(accept=bool(getattr(args, "replay_accept", False)))
+        print(f"replay: {rep['total']} recorded replies, {rep['same']} unchanged, {len(rep['improved'])} improved, {len(rep['regressions'])} REGRESSIONS (version {VERSION})")
+        for r in rep["improved"][:20]:
+            print(f"  improved   {r['id']} {r['host']}: {r['was'].get('n_problems')} problem(s) -> {len(r['now']['calls'])} call(s)")
+        for r in rep["regressions"][:20]:
+            print(f"  REGRESSION {r['id']} {r['host']}: was {r['was']} now {r['now']}")
+        return 1 if rep["regressions"] else 0
+    return 0
+
+
+# ---- 9. daily probe -------------------------------------------------------------------------------------------------------------------------------
+class HealthProbe:
+    """Once a day (tool_probe_hours) every ready browser / direct account gets ONE tiny tool-call request through the normal pipeline. A failing site, a changed answer format or a reply
+    without the end marker becomes an alert (dashboard + log). It never runs while the account is busy or cooling down."""
+    FILE = "health_probe.json"
+    TOOL = {"bridge_ping": {"name": "bridge_ping", "description": "Health check. Call it once with the given code.",
+                            "input_schema": {"type": "object", "properties": {"value": {"type": "string", "description": "the check code"}}, "required": ["value"], "additionalProperties": False}}}
+
+    def __init__(self, app: Any) -> None:
+        self.app, self.lock = app, threading.Lock()
+        self.state: Dict[str, Dict[str, Any]] = {}
+        try:
+            d = app.store.read(self.FILE, {})
+            self.state = {str(k): v for k, v in d.items() if isinstance(v, dict)} if isinstance(d, dict) else {}
+        except Exception:
+            self.state = {}
+        self.started = now()
+
+    def _save(self) -> None:
+        try:
+            self.app.store.write(self.FILE, self.state)
+        except Exception:
+            pass
+
+    def eligible(self, a: Dict[str, Any]) -> str:
+        if a.get("type") == "api":
+            return "api accounts are not probed"
+        if a.get("state") != "ready":
+            return "account is not ready"
+        if self.app.acc.inflight.get(a["id"], 0):
+            return "account is busy"
+        if float(a.get("cooldown_until") or 0) > now():
+            return "account is cooling down"
+        return ""
+
+    def run_one(self, a: Dict[str, Any]) -> Dict[str, Any]:
+        why = self.eligible(a)
+        if why:
+            return {"ran": False, "reason": why}
+        tok = secrets.token_hex(4)
+        req = NormReq("", [{"role": "user", "content": [{"type": "text", "text": f'This is an automatic health check. Call the tool bridge_ping exactly once with value "{tok}". Do nothing else.'}]}],
+                      dict(self.TOOL), {"type": "tool", "name": "bridge_ping"}, False, 512, "bridge-health", "anthropic")
+        t0, host = time.monotonic(), a.get("host", "?")
+        res: Dict[str, Any] = {"ran": True, "t": round(now()), "host": host, "ok": False, "reason": "", "format": "", "seconds": 0.0}
+        self.app.acc.bump_inflight(a["id"], 1)
+        try:
+            out = self.app.router._run(a, req, lambda _s: None, threading.Event())
+            raw = str(getattr(out, "raw", "") or "")
+            res["format"] = detect_tool_format(raw)
+            call = next((c for c in out.calls if c["name"] == "bridge_ping"), None)
+            if call is None:
+                res["reason"] = "no valid tool call came back" + (f" (reply started: {raw[:80]!r})" if raw else "")
+            elif call["input"].get("value") != tok:
+                res["reason"] = "the tool call had a wrong value"
+            else:
+                res["ok"] = True
+        except BridgeError as e:
+            res["reason"] = f"{e.kind}: {str(e)[:150]}"
+        except Exception as e:
+            res["reason"] = f"{type(e).__name__}: {str(e)[:150]}"
+        finally:
+            self.app.acc.bump_inflight(a["id"], -1)
+        res["seconds"] = round(time.monotonic() - t0, 2)
+        with self.lock:
+            prev = self.state.get(a["id"]) or {}
+            self.state[a["id"]] = {**res, "label": a.get("label", ""), "prev_ok": prev.get("ok"), "prev_format": prev.get("format")}
+            self._save()
+        if not res["ok"]:
+            RELIABILITY.alert("probe_failed", host, f"daily tool-call probe failed on '{a.get('label', a['id'])}': {res['reason']}")
+        elif prev.get("format") and res["format"] and prev["format"] != res["format"]:
+            RELIABILITY.alert("format_changed", host, f"the model's tool-call format changed from {prev['format']} to {res['format']} on '{a.get('label', a['id'])}'")
+        elif prev.get("ok") is False:
+            log(f"daily probe recovered on {host}", "ok")
+        return res
+
+    def due(self, a: Dict[str, Any], hours: float) -> bool:
+        last = float((self.state.get(a["id"]) or {}).get("t") or 0)
+        return (now() - (last or self.started - hours * 3600 + 600)) >= hours * 3600          # a never-probed account is probed ten minutes after start
+
+    def run_due(self) -> int:
+        hrs = float(self.app.cfg["tool_probe_hours"] or 0)
+        n = 0
+        if hrs <= 0:
+            return 0
+        for a in list(self.app.acc.items):
+            if not self.eligible(a) and self.due(a, hrs):
+                self.run_one(a)
+                n += 1
+        return n
+
+    def start(self) -> None:
+        def loop() -> None:
+            while True:
+                time.sleep(300)
+                try:
+                    self.run_due()
+                except Exception as e:
+                    log(f"daily probe loop: {type(e).__name__}: {e}", "debug")
+        threading.Thread(target=loop, daemon=True, name="tool-probe").start()
+
+    def view(self) -> Dict[str, Any]:
+        with self.lock:
+            return {"hours": float(self.app.cfg["tool_probe_hours"] or 0), "accounts": {k: dict(v) for k, v in self.state.items()}}
+
+
+def reliability_report(app: Any) -> Dict[str, Any]:
+    out = RELIABILITY.view()
+    out["settings"] = {k: app.cfg[k] for k in ("end_marker", "end_marker_text", "net_text", "schema_validation", "precheck", "tools_per_turn_max", "tool_format", "tool_format_by_host",
+                                               "replay_record", "tool_probe_hours", "fix_retries")}
+    out["probe"] = app.probe.view() if getattr(app, "probe", None) is not None else {}
+    out["replay"] = REPLAY.summary()
+    return out
+
+
+_TL = threading.local()
+
+
 def render_message(m: Dict[str, Any], rlimit: int, names: Dict[str, str], ctx: Optional[ContextCtx] = None) -> str:
     role = m["role"].upper()
     parts = []
@@ -15401,7 +17524,10 @@ def render_message(m: Dict[str, Any], rlimit: int, names: Dict[str, str], ctx: O
             parts.append(neutralise(tx) if m["role"] == "user" else tx)                       # E8: pasted pages/files in user text are data too
         elif t == "tool_use":
             names[b.get("id", "")] = b.get("name", "")
-            parts.append("<tool_call>" + json.dumps({"name": b.get("name"), "arguments": b.get("input") or {}}, ensure_ascii=False) + "</tool_call>")   # arguments are never cut
+            _js = json.dumps({"name": b.get("name"), "arguments": b.get("input") or {}}, ensure_ascii=False)
+            _fm = getattr(_TL, "fmt", "") or ("fenced" if getattr(_TL, "fenced", False) else "tag")
+            parts.append(render_call_dsml(b.get("name"), b.get("input") or {}) if _fm == "dsml" else
+                         (("```tool_call\n" + _js + "\n```") if _fm == "fenced" else ("<tool_call>" + _js + "</tool_call>")))   # arguments are never cut
         elif t == "tool_result":
             err = " ERROR" if b.get("is_error") else ""
             nm = names.get(b.get("tool_use_id", ""), "")
@@ -15560,8 +17686,12 @@ def history_cut(req: NormReq, cfg: Config) -> int:
 
 
 def build_prompt(req: NormReq, cfg: Config, fenced: bool, delta_from: Optional[int] = None, summary: str = "", handoff: str = "",
-                 vault: Optional[ResultVault] = None, trace: Optional[Dict[str, Any]] = None, budget: int = 0) -> str:
+                 vault: Optional[ResultVault] = None, trace: Optional[Dict[str, Any]] = None, budget: int = 0, fmt: str = "",
+                 shown_tools: Optional[Iterable[str]] = None) -> str:
     names: Dict[str, str] = {}
+    fmt = fmt or ("fenced" if fenced else "tag")
+    _TL.fenced = bool(fenced)
+    _TL.fmt = fmt
     for m in req.messages:                                      # learn tool ids -> names
         for b in m["content"]:
             if b.get("type") == "tool_use":
@@ -15575,15 +17705,28 @@ def build_prompt(req: NormReq, cfg: Config, fenced: bool, delta_from: Optional[i
         for i in range(delta_from, len(req.messages)):
             ctx.idx = i
             parts.append(render_message(req.messages[i], rl, names, ctx))
-        tail = "\n\n(Continue as the assistant. To call tools use the same tool_call format.)" if req.tools else ""
-        out = "\n\n".join(parts) + tail
+        _mk = end_marker()
+        tail = (("\n\n(Continue as the assistant. To call a tool use ONLY the " + {"fenced": "```tool_call fenced JSON block", "dsml": "DSML function_calls format"}.get(fmt, "tag format") +
+                 " exactly as defined at the start of this chat" + ("" if fmt == "dsml" else " - never XML/DSML/<invoke>") + "." +
+                 (f" End the reply with the line {_mk}." if _mk else "") + ")") if req.tools else "")
+        upd, shown_now = "", None
+        if req.tools and shown_tools is not None:                                  # 7.71 (5): tools that became relevant since the remote chat last saw the list
+            before_ = set(shown_tools)
+            sel_, _hid = select_tools(req, cfg, before_)
+            new_ = {n: t for n, t in sel_.items() if n not in before_}
+            shown_now = sorted(before_ | set(sel_))
+            if new_:
+                upd = "<tools_update>\nThese tools are available from now on, in the same call format:\n" + tools_text(new_, {}, cfg["tool_desc_limit"], fenced, fmt=fmt, only_list=True) + "\n</tools_update>\n\n"
+        out = upd + "\n\n".join(parts) + tail
         if trace is not None:
-            trace.update({"mode": "delta", "chars": len(out), "est_tokens": estimate_tokens(out), "estimate": True, "reductions": ctx.reductions})
+            trace.update({"mode": "delta", "chars": len(out), "est_tokens": estimate_tokens(out), "estimate": True, "reductions": ctx.reductions, "tools_shown": shown_now})
         return out
+    _TL.fenced = bool(fenced)                                   # 7.69: history tool calls are rendered in the SAME format the model is told to use
     sysx = req.system.strip()                                   # E3: the system prompt is never cut
-    full_tools = tools_text(req.tools, req.tool_choice, 0, fenced, full=True)
+    shown_, hidden_ = select_tools(req, cfg, None)                           # 7.71 (5): the tools that matter for this turn in full, the rest by name
+    full_tools = tools_text(shown_, req.tool_choice, 0, fenced, full=True, hidden=hidden_, fmt=fmt)
     compact = len(sysx) + len(full_tools) + len(handoff) > int(cfg["fixed_soft_chars"])
-    tt = tools_text(req.tools, req.tool_choice, cfg["tool_desc_limit"], fenced) if compact else full_tools
+    tt = tools_text(shown_, req.tool_choice, cfg["tool_desc_limit"], fenced, hidden=hidden_, fmt=fmt) if compact else full_tools
     head = []
     if sysx:
         head.append("<system>\n" + sysx + "\n</system>")
@@ -15600,6 +17743,7 @@ def build_prompt(req: NormReq, cfg: Config, fenced: bool, delta_from: Optional[i
     conv = "<conversation>\n" + note + "\n\n".join(plan.rendered) + "\n</conversation>"
     out = "\n\n".join(head + [conv, "Reply now as the assistant to the last message."])
     if trace is not None:
+        trace["tools_shown"] = list(shown_) if req.tools else None
         red = list(plan.reductions) + ([{"kind": "tool_descriptions_compacted", "chars_before": len(full_tools), "chars_after": len(tt)}] if compact else [])
         trace.update({"mode": "full", "chars": len(out), "est_tokens": estimate_tokens(out), "estimate": True, "reductions": red,
                       "system_chars": len(sysx), "system_over_soft_limit": len(sysx) > int(cfg["system_limit"]), "omitted_messages": plan.omitted})
@@ -15696,8 +17840,25 @@ class _CfgOver:
 
 
 # ---- tool-call parsing ------------------------------------------------------------------------
-CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|\Z)", re.S)
+# 7.69: the parser understands every markup a web chat model really produces for a tool call, not only the one the prompt asked for:
+#   <tool_call>{json}</tool_call>, ```tool_call / ```json / plain fenced JSON, DeepSeek DSML (<｜DSML｜invoke name=..><｜DSML｜parameter name=..>),
+#   Claude-style <function_calls><invoke><parameter>, Qwen/Hermes <function=name><parameter=key>, OpenAI-style {"function":{...}} / {"tool_calls":[...]},
+#   and (last resort) a bare JSON object that names a real tool. A call that was cut off (unbalanced JSON, unclosed <invoke>) is NEVER executed:
+#   it is reported as a problem so the bridge asks for it again instead of running half a command.
+CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|\Z)", re.S)                      # kept for callers/tests that import it
 FENCE_RE = re.compile(r"```tool_call[^\n]*\n(.*?)(?:\n```|\Z)", re.S)
+UI_TOOL_CALL_CHROME_RE = re.compile(
+    r"(?im)^[ \t]*(tool_calls?|tool_use|function_calls?|tool-call)[ \t]*\r?\n[ \t]*(?:Copy(?: code)?|Copied!?)[ \t]*\r?\n(?:[ \t]*(?:Download|Edit|Run|Save|Share)[ \t]*\r?\n)*"
+)
+UI_JSON_CHROME_RE = re.compile(
+    r"(?im)^[ \t]*(json|jsonc)[ \t]*\r?\n[ \t]*(?:Copy(?: code)?|Copied!?)[ \t]*\r?\n(?:[ \t]*(?:Download|Edit|Run|Save|Share)[ \t]*\r?\n)*(?=[ \t]*[\[{])"
+)
+
+
+def normalize_ui_tool_call_chrome(text: str) -> str:
+    """A web page's inner_text() shows a code block as `<language label>\nCopy\n[Download]\n<code>`; put the fence back so the parser and the TextGate see it."""
+    text = UI_TOOL_CALL_CHROME_RE.sub(lambda m: "```" + m.group(1) + "\n", text)
+    return UI_JSON_CHROME_RE.sub(lambda m: "```" + m.group(1) + "\n", text)
 
 
 def loose_json(s: str) -> Any:
@@ -15710,7 +17871,7 @@ def loose_json(s: str) -> Any:
     try:
         import ast
         v = ast.literal_eval(s)
-        if isinstance(v, dict):
+        if isinstance(v, (dict, list)):
             return v
     except Exception:
         pass
@@ -15723,42 +17884,397 @@ def loose_json(s: str) -> Any:
     raise ValueError("invalid JSON")
 
 
+def _balanced_end(s: str, i: int) -> int:
+    """Index just after the bracket that closes the one at s[i] (string- and escape-aware); -1 when the text ends first (= cut off)."""
+    depth, j, n, q = 0, i, len(s), ""
+    while j < n:
+        c = s[j]
+        if q:
+            if c == "\\":
+                j += 2
+                continue
+            if c == q:
+                q = ""
+        elif c in "\"'" and (c == '"' or (j > 0 and s[j - 1] in "{[,:( \n\t")):
+            q = c
+        elif c in "{[":
+            depth += 1
+        elif c in "}]":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return -1
+
+
+def _json_at(s: str, i: int) -> Tuple[Any, int]:
+    """First JSON value at/after i -> (value, end). ValueError('cut off') when it never closes, ValueError('invalid JSON') when it closes but is not JSON."""
+    j = i
+    while j < len(s) and s[j] in " \t\r\n":
+        j += 1
+    if j >= len(s) or s[j] not in "{[":
+        raise ValueError("invalid JSON")
+    try:
+        v, e = json.JSONDecoder().raw_decode(s, j)
+        return v, e
+    except Exception:
+        pass
+    e = _balanced_end(s, j)
+    if e < 0:
+        raise ValueError("cut off")
+    return loose_json(s[j:e]), e
+
+
+_DSML_PFX = r"(?:[｜|]\s*DSML\s*[｜|]\s*)?"
+_INVOKE_RE = re.compile(r"<" + _DSML_PFX + r"invoke\s+name\s*=\s*[\"']?([^\"'>\s]+)[\"']?\s*>(.*?)(<\s*/\s*" + _DSML_PFX + r"invoke\s*>|(?=<" + _DSML_PFX + r"invoke\b)|\Z)", re.S | re.I)
+_PARAM_RE = re.compile(r"<" + _DSML_PFX + r"parameter\s+name\s*=\s*[\"']?([^\"'>\s]+)[\"']?([^>]*)>(.*?)(<\s*/\s*" + _DSML_PFX + r"parameter\s*>|(?=<" + _DSML_PFX + r"parameter\b)|\Z)", re.S | re.I)
+_QWEN_RE = re.compile(r"<function=([^>\s]+)>(.*?)(</function>|\Z)", re.S | re.I)
+_QPARAM_RE = re.compile(r"<parameter=([^>\s]+)>(.*?)(</parameter>|(?=<parameter=)|\Z)", re.S | re.I)
+_WRAP_RE = re.compile(r"<\s*/?\s*" + _DSML_PFX + r"(?:function_calls|tool_calls)\s*>|<\s*/?\s*(?:tool_call|tool_use|function_call)s?\b[^>]*>", re.I)
+_TAG_OPEN_RE = re.compile(r"<(?:tool_call|tool_use|function_call)s?\b[^>]*>", re.I)
+_TAG_CLOSE_RE = re.compile(r"</(?:tool_call|tool_use|function_call)s?\s*>", re.I)
+_FENCE_OPEN_RE = re.compile(r"```[ \t]*([A-Za-z_\-]*)[^\n`]*\n")
+_FENCE_CLOSE_RE = re.compile(r"(?m)^[ \t]*```")
+_TOOL_LABELS = ("tool_call", "tool_calls", "tool", "tool_use", "function_call", "function_calls", "tool-call", "toolcall")
+_PLACEHOLDER_RE = re.compile(r"[\"']name[\"']\s*:\s*[\"']\s*<\s*tool\s+name\s*>\s*[\"']", re.I)
+_MARKUP_HINT_RE = re.compile(r"DSML|<\s*invoke\b|<\s*function_calls|<\s*function=|<tool_call\b|<tool_use\b|```tool_call", re.I)
+
+
+def _resolve_tool(name: Any, tools: Dict[str, Dict[str, Any]], lower: Dict[str, str], canon: Dict[str, str]) -> Optional[str]:
+    name = str(name or "").strip().strip("\"'`").strip()
+    name = re.sub(r"^(functions?|default_api|tools?|api)[./:]", "", name)
+    if name in tools:
+        return name
+    if name.lower() in lower:
+        return lower[name.lower()]
+    c = re.sub(r"[\s\-.]+", "_", name.lower())
+    if c in canon:
+        return canon[c]
+    sfx = [n for n in tools if n.lower().endswith("__" + c)]
+    return sfx[0] if len(sfx) == 1 else None
+
+
+def _coerce_args(tool: Dict[str, Any], args: Dict[str, Any]) -> Dict[str, Any]:
+    """Models (and XML-ish formats, where every value is text) give '5' for an integer or 'true' for a boolean: convert only when the schema says so."""
+    props = ((tool.get("input_schema") or {}).get("properties")) or {}
+    out = dict(args)
+    for k, v in list(out.items()):
+        p = props.get(k)
+        if not isinstance(p, dict) or not isinstance(v, str):
+            continue
+        ty = p.get("type")
+        types = ty if isinstance(ty, list) else [ty]
+        if "string" in types:
+            continue
+        t = v.strip()
+        try:
+            if "integer" in types and re.fullmatch(r"-?\d+", t):
+                out[k] = int(t)
+            elif "number" in types and re.fullmatch(r"-?\d+(\.\d+)?([eE][-+]?\d+)?", t):
+                out[k] = float(t)
+            elif "boolean" in types and t.lower() in ("true", "false"):
+                out[k] = t.lower() == "true"
+            elif ("array" in types or "object" in types) and t[:1] in "[{":
+                out[k] = loose_json(t)
+        except Exception:
+            pass
+    return out
+
+
+def _call_objs(v: Any) -> List[Dict[str, Any]]:
+    """One parsed JSON value -> the list of call-shaped dicts inside it (list of calls, {"tool_calls":[..]}, OpenAI {"function":{..}})."""
+    if isinstance(v, list):
+        return [x for y in v for x in _call_objs(y)]
+    if not isinstance(v, dict):
+        return []
+    for k in ("tool_calls", "calls", "tool_uses"):
+        if isinstance(v.get(k), list):
+            return [x for y in v[k] for x in _call_objs(y)]
+    if isinstance(v.get("function"), dict):
+        f = dict(v["function"])
+        return [f]
+    return [v]
+
+
+def _obj_to_call(obj: Dict[str, Any], tools: Dict[str, Dict[str, Any]], lower: Dict[str, str], canon: Dict[str, str]) -> Tuple[Optional[str], Any, bool]:
+    """(resolved tool name or None, args, explicit) - `explicit` = the object had an arguments/input/parameters key."""
+    name = obj.get("name") or obj.get("tool") or obj.get("tool_name") or obj.get("function_name") or ""
+    real = _resolve_tool(name, tools, lower, canon)
+    for k in ("arguments", "input", "parameters", "args", "params"):
+        if k in obj:
+            args = obj[k]
+            if isinstance(args, str):
+                args = loose_json(args) if args.strip() else {}
+            return real, (args if args is not None else {}), True
+    if real:                                                       # flat form {"name": "Bash", "command": "ls"}
+        props = ((tools[real].get("input_schema") or {}).get("properties")) or {}
+        rest = {k: v for k, v in obj.items() if k not in ("name", "tool", "tool_name", "type", "id", "function_name")}
+        if rest and all(k in props for k in rest):
+            return real, rest, False
+        return real, {}, False
+    return None, {}, False
+
+
+def _xml_params(body: str, rx: "re.Pattern[str]", typed: bool) -> Tuple[Dict[str, Any], bool]:
+    args: Dict[str, Any] = {}
+    closed = True
+    for m in rx.finditer(body):
+        v = m.group(3) if typed else m.group(2)
+        if not (m.group(4) if typed else m.group(3)):
+            closed = False                                          # a parameter that never closed may be a cut-off value
+        if v.startswith("\n"):
+            v = v[1:]
+        if v.endswith("\n"):
+            v = v[:-1]
+        attrs = m.group(2) if typed else ""
+        is_str = re.search(r"string\s*=\s*[\"']?true", attrs, re.I) is not None
+        key = m.group(1)
+        if is_str:
+            args[key] = v
+        else:
+            t = v.strip()
+            try:
+                args[key] = json.loads(t) if t[:1] in "{[\"" or t in ("true", "false", "null") or re.fullmatch(r"-?\d+(\.\d+)?", t) else v
+            except Exception:
+                args[key] = v
+    return args, closed
+
+
 def parse_tool_calls(text: str, tools: Dict[str, Dict[str, Any]], seed: str = "") -> Tuple[str, List[Dict[str, Any]], List[str]]:
     if not tools:
         return text, [], []
-    calls, problems = [], []
-    raws = [m.group(1) for m in CALL_RE.finditer(text)] + [m.group(1) for m in FENCE_RE.finditer(text)]
     lower = {n.lower(): n for n in tools}
-    for raw in raws:
+    canon = {re.sub(r"[\s\-.]+", "_", n.lower()): n for n in tools}
+    found: List[Tuple[int, int, Any, Any, str]] = []       # (start, end, tool-or-None, args-or-None, raw) ; end = span removed from the visible text
+    problems: List[str] = []
+    spans: List[Tuple[int, int]] = []
+    prot: List[Tuple[int, int]] = []                       # code blocks of other languages: never scanned, never cut
+    placeholder = False
+
+    def inside(i: int) -> bool:
+        return any(a_ <= i < b_ for a_, b_ in spans) or any(a_ <= i < b_ for a_, b_ in prot)
+
+    def add_json(start: int, end: int, val: Any, raw: str, strict: bool) -> int:
+        """Register the calls inside one parsed JSON value. strict=False (a plain/json fence or bare JSON): only objects that name a real tool count."""
+        n = 0
+        for obj in _call_objs(val):
+            try:
+                real, args, explicit = _obj_to_call(obj, tools, lower, canon)
+            except Exception as e:
+                if strict:
+                    problems.append(f"could not parse a tool_call block ({e}): {raw[:80]!r}")
+                    n += 1
+                continue
+            if real is None:
+                if strict:
+                    nm = str(obj.get("name") or obj.get("tool") or "")
+                    nm = re.sub(r"^(functions?|default_api|tools?)[./]", "", nm)
+                    problems.append(f"unknown tool '{nm}' (available: {', '.join(list(tools)[:12])})")
+                    n += 1
+                continue
+            if not strict and not explicit:
+                continue
+            found.append((start, end, real, args, raw))
+            n += 1
+        return n
+
+    # 1) <tool_call> ... </tool_call> (also tool_use / function_call), closed or not
+    pos = 0
+    while True:
+        m = _TAG_OPEN_RE.search(text, pos)
+        if not m:
+            break
+        cs = m.end()
+        c = _TAG_CLOSE_RE.search(text, cs)
+        body = text[cs:c.start()] if c else text[cs:]
+        if body.lstrip()[:1] == "<":                                  # DSML / XML inside the wrapper: the XML scan below takes it
+            pos = cs
+            continue
+        raw = body.strip()
+        if _PLACEHOLDER_RE.search(raw):
+            placeholder = True
+            end = c.end() if c else len(text)
+            spans.append((m.start(), end))
+            pos = end
+            continue
+        if not raw:
+            pos = cs
+            continue
         try:
-            obj = loose_json(raw)
-            name = str(obj.get("name") or obj.get("tool") or "")
-            name = re.sub(r"^(functions?|default_api|tools?)[./]", "", name)
-            args = obj.get("arguments", obj.get("input", obj.get("parameters", {})))
-            if isinstance(args, str):
-                args = loose_json(args)
-            real = tools.get(name) and name or lower.get(name.lower())
-            if not real:
-                problems.append(f"unknown tool '{name}' (available: {', '.join(list(tools)[:12])})")
+            val, e = _json_at(body, 0)
+            end = c.end() if c else cs + e
+            if c is None:
+                tail = _TAG_CLOSE_RE.match(text, cs + e)
+                end = tail.end() if tail else cs + e
+            spans.append((m.start(), end))
+            add_json(m.start(), end, val, raw, True)
+            pos = end
+        except ValueError as ve:
+            end = c.end() if c else len(text)
+            spans.append((m.start(), end))
+            problems.append(("the tool call was cut off before it finished (not executed)" if str(ve) == "cut off" else f"could not parse a tool_call block ({ve})") + f": {raw[:80]!r}")
+            pos = end
+
+    # 2) fenced blocks: labelled tool_call = strict, json / plain = only if it names a real tool
+    pos = 0
+    while True:
+        m = _FENCE_OPEN_RE.search(text, pos)
+        if not m:
+            break
+        if inside(m.start()):
+            pos = m.end()
+            continue
+        label = m.group(1).lower()
+        cs = m.end()
+        c = _FENCE_CLOSE_RE.search(text, cs)
+        body = text[cs:c.start()] if c else text[cs:]
+        end_closed = c.end() if c else len(text)
+        if label in _TOOL_LABELS:
+            raw = body.strip()
+            if _PLACEHOLDER_RE.search(raw):
+                placeholder = True
+                spans.append((m.start(), end_closed))
+                pos = end_closed
                 continue
-            if not isinstance(args, dict):
-                problems.append(f"arguments of '{real}' must be a JSON object")
+            if body.lstrip()[:1] == "<" or not raw:
+                pos = cs
                 continue
-            req_keys = (tools[real].get("input_schema") or {}).get("required") or []
-            missing = [k for k in req_keys if k not in args]
-            if missing:
-                problems.append(f"tool '{real}' is missing required argument(s): {', '.join(missing)}")
+            try:
+                val, e = _json_at(body, 0)
+                end = end_closed if c else cs + e
+                spans.append((m.start(), end))
+                add_json(m.start(), end, val, raw, True)
+                pos = end
+            except ValueError as ve:
+                spans.append((m.start(), end_closed))
+                problems.append(("the tool call was cut off before it finished (not executed)" if str(ve) == "cut off" else f"could not parse a tool_call block ({ve})") + f": {raw[:80]!r}")
+                pos = end_closed
+        elif label in ("", "json", "jsonc", "json5"):
+            try:
+                val, e = _json_at(body, 0)
+                if c is None and body[e:].strip():
+                    raise ValueError("trailing text")
+                if not text[end_closed:].strip() and add_json(m.start(), end_closed, val, body.strip(), False):      # a json/plain fence counts only as the LAST thing in the reply
+                    spans.append((m.start(), end_closed))
+            except ValueError:
+                pass
+            pos = end_closed
+        else:
+            prot.append((m.start(), end_closed))
+            pos = end_closed                                          # python/bash/... block: skip it whole, its inner text is not a call
+
+    # 3) XML-ish: DSML / Claude-style <invoke name=..> and Qwen <function=..>
+    for m in _INVOKE_RE.finditer(text):
+        if inside(m.start()):
+            continue
+        if m.group(1) == "TOOL_NAME":                                  # 7.71: the DSML format example echoed back
+            placeholder = True
+            spans.append((m.start(), m.end()))
+            continue
+        real = _resolve_tool(m.group(1), tools, lower, canon)
+        args, pclosed = _xml_params(m.group(2), _PARAM_RE, True)
+        spans.append((m.start(), m.end()))
+        if not m.group(3) or not pclosed:
+            problems.append(f"the tool call '{m.group(1)}' was cut off before it finished (not executed)")
+        elif real is None:
+            problems.append(f"unknown tool '{m.group(1)}' (available: {', '.join(list(tools)[:12])})")
+        else:
+            found.append((m.start(), m.end(), real, args, m.group(0)))
+    for m in _QWEN_RE.finditer(text):
+        if inside(m.start()):
+            continue
+        real = _resolve_tool(m.group(1), tools, lower, canon)
+        args, pclosed = _xml_params(m.group(2), _QPARAM_RE, False)
+        spans.append((m.start(), m.end()))
+        if not m.group(3) or not pclosed:
+            problems.append(f"the tool call '{m.group(1)}' was cut off before it finished (not executed)")
+        elif real is None:
+            problems.append(f"unknown tool '{m.group(1)}' (available: {', '.join(list(tools)[:12])})")
+        else:
+            found.append((m.start(), m.end(), real, args, m.group(0)))
+
+    # 4) last resort: a bare JSON object that names a real tool and carries explicit arguments
+    if not found and not problems and "{" in text:
+        i, tried = 0, 0
+        while tried < 40:
+            i = text.find("{", i)
+            if i < 0:
+                break
+            tried += 1
+            if inside(i):
+                i += 1
                 continue
-            calls.append({"id": "toolu_" + sha(f"{seed}|{len(calls)}|{real}|{jdump(args)}")[:22], "name": real, "input": args})
-        except Exception as e:
-            problems.append(f"could not parse a tool_call block ({e}): {raw[:80]!r}")
-    clean = FENCE_RE.sub("", CALL_RE.sub("", text)).strip()
+            try:
+                val, e = _json_at(text, i)
+            except ValueError:
+                i += 1
+                continue
+            if not text[:i].strip() and not text[e:].strip() and add_json(i, e, val, text[i:e], False):      # injection guard: only a reply that IS the call
+                spans.append((i, e))
+                i = e
+            else:
+                i += 1
+
+    # 5) validate + build
+    calls: List[Dict[str, Any]] = []
+    found.sort(key=lambda t: t[0])
+    last_key = None
+    for start, end, real, args, raw in found:
+        if not isinstance(args, dict):
+            problems.append(f"arguments of '{real}' must be a JSON object")
+            continue
+        args = _coerce_args(tools[real], args)
+        errs_ = validate_args(tools[real].get("input_schema") or {}, args)          # 7.71 (3): the whole schema, not only the required keys
+        if errs_:
+            problems.append(tool_problem(real, errs_))
+            continue
+        key = (start, real, jdump(args))
+        if last_key and last_key[1:] == key[1:] and start - last_key[0] < 4:         # the same call found twice by two scanners
+            continue
+        last_key = key
+        calls.append({"id": "toolu_" + sha(f"{seed}|{len(calls)}|{real}|{jdump(args)}")[:22], "name": real, "input": args})
+
+    # 6) visible text = everything outside the consumed spans
+    cut: List[Tuple[int, int]] = []
+    for a_, b_ in sorted(spans):
+        if cut and a_ <= cut[-1][1]:
+            cut[-1] = (cut[-1][0], max(cut[-1][1], b_))
+        else:
+            cut.append((a_, b_))
+    pieces, p = [], 0
+    for a_, b_ in cut:
+        pieces.append(text[p:a_])
+        p = b_
+    pieces.append(text[p:])
+    clean = "".join(pieces)
+    if calls or problems or cut:
+        clean = _WRAP_RE.sub("", clean)
+    clean = clean.strip()
+    if not calls and not problems and not placeholder:
+        vis = text
+        for a_, b_ in sorted(prot, reverse=True):
+            vis = vis[:a_] + vis[b_:]
+        hm = _MARKUP_HINT_RE.search(vis)
+        if hm:
+            problems.append("the reply contains tool-call markup that could not be understood: " + " ".join(vis[max(0, hm.start() - 10):][:100].split()))
     return clean, calls, problems
+
+
+def _unsent_tail(full: str, sent: str) -> str:
+    """The part of the final text the client has not received yet. The final text is strip()ped and may have had a tool call cut out of it, so compare tolerantly."""
+    if full.startswith(sent):
+        return full[len(sent):]
+    fs, ss = full.strip(), sent.strip()
+    if ss and fs.startswith(ss):
+        rest = fs[len(ss):]
+        return rest.lstrip() if sent[-1:].isspace() else rest
+    return ""
 
 
 class TextGate:
     """Streams plain text to the client but holds back anything that could be the start of a tool call."""
-    MARKERS = ("<tool_call", "```tool_call")
+    MARKERS = ("<tool_call", "```tool_call", "```json", "<tool_use", "<function_call", "<tool_calls", "<invoke", "<function=",
+               "<｜DSML", "<|DSML", "<\uff5cDSML", "<DSML")
 
     def __init__(self, emit: Callable[[str], None], hold: bool):
         self.emit, self.hold, self.buf, self.sent, self.closed = emit, hold, "", 0, False
@@ -16257,7 +18773,10 @@ class RoutingEngine:
                     if rule:
                         pol, prof, how2, tgt = self._resolve_name(str(rule["to"]), cfgd, pinned, key_id, True)
                         return pol, prof, f"client-map>{how2}", tgt
-                    target, how = self.acc.resolve(m, pinned)              # legacy client_model_prefixes -> auto, otherwise the 404
+                    if m.lower() in ("sonnet", "opus", "haiku"):
+                        target, how = (pinned or ""), "claude-native-alias"
+                    else:
+                        target, how = self.acc.resolve(m, pinned)          # legacy client_model_prefixes -> auto, otherwise the 404
         if profile_override:
             how = "profile-alias"
         pol_name = ""
@@ -16388,7 +18907,7 @@ class RoutingEngine:
             ex("session_expired", f"'{label}' needs a login (lifecycle: {lcw})")
         if st in ("login_required", "expired") or (aid and self.acc.catalog(aid).get("status") == "requires_auth" and vid):
             ex("session_expired", f"'{label}' needs a new login (state: {st})")
-        elif st != "ready":
+        elif st != "ready" and not (st == "needs_learning" and a.get("type") != "api"):
             ex("account_not_ready", f"'{label}' is not ready (state: {st or 'unknown'})")
         br = self.acc.blocked_reason(a)
         if br:
@@ -16703,7 +19222,10 @@ class RoutingEngine:
     def explain_none(dec: RouteDecision, kind: str, policy: Dict[str, Any]) -> str:
         why = "; ".join(f"{e['route']}: {e['code']} ({e['detail']})" for e in dec.excluded[:8]) or "no candidate routes exist - add an account in the dashboard"
         more = f" (+{len(dec.excluded) - 8} more)" if len(dec.excluded) > 8 else ""
+        if any(e.get("code") == "account_not_ready" and "needs_learning" in e.get("detail", "") for e in dec.excluded):
+            why += "; the login is saved; a web account can use its assigned personal Chrome tab now, while 'Start learning' is optional and optimizes the request path"
         return f"no eligible route under policy '{dec.policy}' ({kind}). Excluded: {why}{more}"
+
 
     # -- records ----------------------------------------------------------------------------------------------------
     def record(self, dec: RouteDecision) -> None:
@@ -16794,6 +19316,45 @@ def redact_stored(text: Any) -> Tuple[str, int]:
 
 def call_key(name: str, args: Any) -> str:
     return sha(str(name) + "|" + jdump(args if args is not None else {}))
+
+
+def forget_account_routes(config: Dict[str, Any], aid: str) -> Dict[str, Any]:
+    """Remove deleted account references and prune policies that would otherwise become broken."""
+    out = dict(config)
+    policies = {k: dict(v) for k, v in (out.get("policies") or {}).items() if isinstance(v, dict)}
+    removed: set = set()
+    target = "acct:" + aid
+    for name, policy in list(policies.items()):
+        policy["members"] = [r for r in (policy.get("members") or []) if not str(r).startswith(target)]
+        backups = [r for r in (policy.get("backups") or []) if not str(r).startswith(target)]
+        primary = policy.get("primary")
+        if isinstance(primary, str) and primary.startswith(target):
+            primary = backups.pop(0) if backups else ""
+        if "backups" in policy:
+            policy["backups"] = backups
+        if primary:
+            policy["primary"] = primary
+        else:
+            policy.pop("primary", None)
+        if (policy.get("kind") == "fixed" and len(policy.get("members") or []) != 1
+                or policy.get("kind") == "rotation" and not policy.get("members")
+                or policy.get("kind") == "failover" and (not policy.get("primary") or not policy.get("backups"))):
+            removed.add(name)
+            policies.pop(name, None)
+    out["policies"] = policies
+    out["excluded_routes"] = [r for r in (out.get("excluded_routes") or []) if not str(r).startswith(target)]
+    out["client_models"] = [r for r in (out.get("client_models") or [])
+                            if not (isinstance(r, dict) and str(r.get("to") or "").startswith("bridge-pool/")
+                                    and str(r.get("to")).split("/", 1)[1] in removed)]
+    for key in ("aliases", "key_policy", "account_policy"):
+        mapping = dict(out.get(key) or {})
+        for k, val in list(mapping.items()):
+            if (key == "account_policy" and k == aid) or val in removed:
+                mapping.pop(k, None)
+        out[key] = mapping
+    if out.get("default_policy") in removed:
+        out["default_policy"] = ""
+    return out
 
 
 class TaskStore:
@@ -17517,14 +20078,33 @@ class Router:
         return entry.canary.lower() in r.lower()
 
     def _ask_text(self, backend: Any, conv: Any, prompt: str, gate: Optional[TextGate], cancel: threading.Event, model: str = "") -> str:
+        mk = end_marker() if (end_marker() and end_marker() in prompt) else ""     # 7.71: expected only when THIS prompt carried the rule
+        flt = MarkerFilter(mk)
+        if isinstance(conv, dict):
+            conv["marker_expected"], conv["marker_seen"], conv["end_via"], conv["net_used"], conv["net_streams"] = bool(mk), False, "", False, 0
         parts: List[str] = []
         for d in (backend.ask(conv, prompt, cancel, model=model) if model else backend.ask(conv, prompt, cancel)):
-            parts.append(d)
+            out = flt.feed(d)
+            if out:
+                parts.append(out)
+                if gate:
+                    gate.feed(out)
+        tail = flt.finish()
+        if tail:
+            parts.append(tail)
             if gate:
-                gate.feed(d)
+                gate.feed(tail)
         if gate:
             gate.finish()
-        return "".join(parts)
+        text = "".join(parts)
+        if isinstance(conv, dict):
+            conv["marker_seen"] = flt.seen
+            nt = conv.get("net_text")
+            conv["net_text"] = None
+            if isinstance(nt, str) and nt.strip():                       # 7.71 (2): the page's own raw stream agreed with what the page showed: it is the exact text (markdown, no buttons)
+                text, seen2 = strip_marker(nt, mk)
+                conv["net_used"], conv["marker_seen"] = True, bool(flt.seen or seen2)
+        return text
 
     def _summary(self, backend: Any, req: NormReq) -> str:
         """Long sessions: let the model itself condense the part that no longer fits (cached)."""
@@ -17753,9 +20333,15 @@ class Router:
             return out
         recipe = self.acc.recipe(acct["host"]) or {}
         fenced = getattr(backend, "fenced_tools", False)
-        rc = recipe.get("continuity", True)
+        tool_fmt = choose_tool_format(self.cfg, acct["host"], backend)          # 7.71 (6): fenced | tag | dsml
+        t_run0 = time.monotonic()
+        unlearned_ui = bool(getattr(backend, "unlearned_ui", False))
+        # A login-only UI account already keeps the same remote chat tab. Reuse that
+        # observed continuity so later Claude Code turns can send only their delta.
+        rc = recipe.get("continuity", "observed" if unlearned_ui else True)
         site_level = "verified" if rc is True else ("none" if rc in (False, "none", "no", "false", 0) else "observed")   # what the site proved at learn time
         use_cont = bool(self.cfg["continuity"] and site_level != "none")
+        prompt_cfg = _CfgOver(self.cfg, {"fixed_soft_chars": 1}) if unlearned_ui else self.cfg  # complete schemas, compact descriptions on slow UI paths
         sigs = [msg_sig(m) for m in req.messages]
         tsig = sha(jdump({n: (t["description"], t["input_schema"]) for n, t in req.tools.items()}))
         ssig = sha(req.system)
@@ -17796,12 +20382,13 @@ class Router:
                 conv = entry.conv
 
                 def mk(b: int, _t: Dict[str, Any] = trace, _n: int = n) -> str:
-                    c = _CfgOver(self.cfg, {"result_limit": max(1000, b // 4)}) if b else self.cfg
-                    return build_prompt(req, c, fenced, delta_from=_n, vault=self.vault, trace=_t)
+                    return build_prompt(req, _CfgOver(prompt_cfg, {"result_limit": max(1000, b // 4)}) if b else prompt_cfg,
+                                        fenced, delta_from=_n, vault=self.vault, trace=_t, fmt=tool_fmt,
+                                        shown_tools=(conv.get("shown_tools") if isinstance(conv, dict) else None))
                 continued = True
                 prompt = mk(0)
                 try:                                                    # E7: a MEASUREMENT (characters), method stated in context_report()
-                    saved = len(build_prompt(req, self.cfg, fenced, handoff=req.handoff)) - len(prompt)
+                    saved = len(build_prompt(req, prompt_cfg, fenced, handoff=req.handoff, fmt=tool_fmt)) - len(prompt)
                     if saved > 0:
                         self.bump("bytes_saved_continuity", saved)
                 except BridgeError:
@@ -17815,7 +20402,7 @@ class Router:
                 _cn = canary
 
                 def mk(b: int, _t: Dict[str, Any] = trace, _c: str = _cn) -> str:
-                    out_ = build_prompt(req, self.cfg, fenced, summary=self._summary(backend, req), handoff=req.handoff, vault=self.vault, trace=_t, budget=max(0, b - 140) if b else 0)
+                    out_ = build_prompt(req, prompt_cfg, fenced, summary=self._summary(backend, req), handoff=req.handoff, vault=self.vault, trace=_t, budget=max(0, b - 140) if b else 0, fmt=tool_fmt)
                     return out_ + (f"\n\n[bridge session marker: {_c} - if you are later asked for the session marker, reply with exactly this]" if _c else "")
                 prompt = mk(wlimit or wlearn)                           # E3: the route's declared window (else the one learned from the site's own refusals) is the budget (0 = history_limit + fixed parts)
                 if wlimit and len(prompt) > wlimit:
@@ -17884,6 +20471,9 @@ class Router:
             finally:
                 if isinstance(conv, dict) and conv.get("uploads"):
                     conv["uploads"] = []                                 # an uploaded file belongs to the one message it was sent with
+        flags = ({k: conv.get(k) for k in ("marker_expected", "marker_seen", "end_via", "net_used", "net_streams")} if isinstance(conv, dict) else {})
+        if isinstance(conv, dict) and trace.get("tools_shown") is not None:     # 7.71 (5): remember what this remote chat has seen in full
+            conv["shown_tools"] = (sorted(set(conv.get("shown_tools") or []) | set(trace["tools_shown"])) if continued else list(trace["tools_shown"]))
         trace["submission"] = sub
         trace["canary"] = probe_result
         if sub.get("action") == "reduced":
@@ -17899,19 +20489,57 @@ class Router:
                                 "reductions": [{k: v for k, v in r.items() if k != "text"} for r in reds][:30], "omitted_messages": trace.get("omitted_messages", 0), "submission": trace.get("submission"), "canary": probe_result})
         seed = sha("".join(sigs))
         clean, calls, problems = parse_tool_calls(text, req.tools, seed)
+        first_problems, first_n = list(problems), len(calls)
+        if any("cut off" in p_ for p_ in problems) and getattr(backend, "tier", "") == "ui" and not flags.get("net_used"):
+            UI_WAIT.note_cut(host)                                       # 7.70: the UI tier ended this answer too early: that site gets a longer quiet window
+        if self.cfg["replay_record"] and req.tools:
+            REPLAY.record(host, req.tools, text)                         # 7.71 (8): the real reply, credential-masked, for the replay tests
+        pre_n = 0
+        held: List[Dict[str, Any]] = []                                  # 7.72: calls the pre-check refused; released (not lost) if the model still insists after the retries
+        pre_now: List[str] = []
+        if calls:                                                        # 7.71 (4): refuse what provably cannot work, using this request's own history
+            all_calls = list(calls)
+            calls, pre_problems = precheck_calls(req, calls, self.cfg)
+            pre_n = len(pre_problems)
+            pre_now = list(pre_problems)
+            if pre_problems:
+                kept = {call_key(c_["name"], c_["input"]) for c_ in calls}
+                held = [c_ for c_ in all_calls if call_key(c_["name"], c_["input"]) not in kept]
+            problems = problems + pre_problems
         need = req.tool_choice.get("type") in ("any", "tool") and not calls
-        if req.tools and (problems or need) and getattr(backend, "tier", "") != "":
-            fix = ("Your previous reply contained an invalid tool call: " + "; ".join(problems or ["no tool call was made but one is required"]) +
-                   ". Reply again with ONLY the corrected tool call(s) in the exact format.")
+        retries = 0
+        while req.tools and (problems or need) and getattr(backend, "tier", "") != "" and retries < int(self.cfg["fix_retries"]):
+            retries += 1
             try:
-                t2 = self._ask_text(backend, conv, fix, None, cancel, vmodel)
-                c2, calls2, problems2 = parse_tool_calls(t2, req.tools, seed)
-                if calls2:
-                    calls, problems = calls2, []
+                t2 = self._ask_text(backend, conv, fix_message(req, problems, need), None, cancel, vmodel)
             except BridgeError:
-                pass
+                break
+            c2, calls2, problems2 = parse_tool_calls(t2, req.tools, seed)
+            have = {call_key(c_["name"], c_["input"]) for c_ in calls}
+            calls2 = [c_ for c_ in calls2 if call_key(c_["name"], c_["input"]) not in have]      # a model that repeats the whole list must not run a call twice
+            acc2, pre2 = precheck_calls(req, calls2, self.cfg, earlier=calls) if calls2 else ([], [])
+            pre_n += len(pre2)
+            calls = calls + acc2
+            if calls2 or problems2 or pre2:
+                problems = problems2 + pre2
+                pre_now = list(pre2)
+                kept2 = {call_key(c_["name"], c_["input"]) for c_ in acc2}
+                held = [c_ for c_ in calls2 if call_key(c_["name"], c_["input"]) not in kept2] if pre2 else []
+            need = req.tool_choice.get("type") in ("any", "tool") and not calls
+        if held and pre_now and problems == pre_now and retries >= int(self.cfg["fix_retries"]):
+            # 7.72: the pre-check is a guess from this request's own history (a compacted history may have lost an earlier Read). After the model was told twice and still sends the
+            # same call, the real tool is the better judge: release it instead of silently dropping work Claude Code could have done.
+            calls = calls + held
+            problems = []
+            log(f"pre-check released {len(held)} call(s) after {retries} retry(ies): the model insisted", "debug")
         if problems and not calls and not clean:
             clean = "(The model produced a tool call that could not be parsed: " + "; ".join(problems)[:300] + ")"
+        RELIABILITY.record(host, attempted=bool(first_n or first_problems), first_ok=bool(first_n) and not first_problems, final_ok=bool(calls) and not problems,
+                           cut_off=any("cut off" in p_ for p_ in first_problems), retries=retries,
+                           schema_rejects=sum(1 for p_ in first_problems if " is missing required" in p_ or " must be " in p_ or "unexpected argument" in p_ or "is too " in p_),
+                           precheck_rejects=pre_n, marker_expected=bool(flags.get("marker_expected")), marker_seen=bool(flags.get("marker_seen")), net_used=bool(flags.get("net_used")),
+                           net_streams=int(flags.get("net_streams") or 0), end_via=str(flags.get("end_via") or ""), seconds=time.monotonic() - t_run0,
+                           format=detect_tool_format(text) if (first_n or first_problems) else "", error=(problems[0] if problems and not calls else ""))
         self.bump("chars_out", len(text))
         if use_cont:
             ne = ConvEntry(conv, sigs + [outcome_sig(clean, calls)], tsig, ssig, "uncertain", 1)
@@ -17923,6 +20551,7 @@ class Router:
                 ne.trust = "observed"                                                                            # the site proved continuation at learn time; this chat has not been seen continuing yet
             self._put(cid, ne)
         out = Outcome(clean, calls, gate.buf[:gate.sent])
+        out.raw = text                                                   # 7.71: the model's own reply (used by the daily probe to see which format it really wrote)
         out.identity = (conv.get("observed_identity") if isinstance(conv, dict) else None) or getattr(backend, "observed_identity", None)    # only a declaration the site really made
         return out
 
@@ -17982,11 +20611,21 @@ def migrate(store: Store, cfg: Config, acc: "Accounts") -> None:
 class App:
     def __init__(self, store: Store, cfg: Config):
         self.store, self.cfg = store, cfg
+        UI_WAIT.bind(cfg, store)                                 # 7.70: the per-site answer-pause record lives in <data>/ui_wait.json
+        configure_reliability(cfg)                               # 7.71: switches read by code that has no Config object
+        RELIABILITY.bind(store)                                  # 7.71: <data>/reliability.json
+        REPLAY.bind(store.path("replay"), int(cfg["replay_max"]))
         self.acc = Accounts(store, cfg)
         migrate(store, cfg, self.acc)
         self.engine = RoutingEngine(store, cfg, self.acc)
         self.router = Router(self.acc, cfg, self.engine)
+        self.probe = HealthProbe(self)                           # 7.71 (9): the daily tool-call probe (started by main())
         self.acc.on_learned = self._after_learn
+        self.pc_hub = pc_hub(store.home, start=False)
+        self.pc_hub.login_requests_provider = self.acc.browser_login_requests
+        self.pc_hub.login_claim_handler = self.acc.claim_browser_login
+        self.pc_hub.login_confirm_handler = self.acc.confirm_browser_login
+        self.pc_hub.register_tab_handler = self.acc.register_browser_tab
         self.started = now()
         want = str(cfg["tokenizer"])
         if set_tokenizer(want) != want:                          # E3: an unknown plugin name is not fatal; the conservative built-in is used and the choice is visible in /api/context
@@ -18008,6 +20647,72 @@ def pc_api_status() -> Dict[str, Any]:
             "extension_dir": str(hub.root / "extension"), "extension_version": PC_VERSION}
 
 
+def pick_workspace_directory() -> str:
+    """Open the native folder picker on the local machine running the bridge."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            root.attributes("-topmost", True)
+            path = filedialog.askdirectory(parent=root, title="Choose a Claude Code workspace", mustexist=True)
+        finally:
+            root.destroy()
+        return str(Path(path).resolve()) if path else ""
+    except Exception as e:
+        raise BridgeError(f"Windows folder picker could not open: {type(e).__name__}: {e}", "client", 500)
+
+
+def open_workspace_tool(app_name: str, folder: str, port: int, api_key: str, model: str = "", full_access: bool = False) -> Dict[str, Any]:
+    """Launch one supported local tool in a user-selected folder without invoking a shell."""
+    p = Path(folder).expanduser().resolve()
+    if not p.is_dir():
+        raise BridgeError("choose an existing workspace folder first", "client", 400)
+    allowed = {"claude", "vscode", "cursor", "powershell", "cmd"}
+    if app_name not in allowed:
+        raise BridgeError("app must be claude, vscode, cursor, powershell, or cmd", "client", 400)
+    exe_name = {"claude": "claude", "vscode": "code", "cursor": "cursor", "powershell": "powershell", "cmd": "cmd"}[app_name]
+    exe = shutil.which(exe_name) or (shutil.which("pwsh") if app_name == "powershell" else None)
+    if not exe:
+        raise BridgeError(f"'{exe_name}' was not found in PATH; install it or choose another app", "setup", 404)
+    args = [exe]
+    env = os.environ.copy()
+    if app_name == "claude":
+        if not api_key:
+            raise BridgeError("select an API key for Claude Code first", "client", 400)
+        env.update(ANTHROPIC_BASE_URL=f"http://127.0.0.1:{int(port)}", ANTHROPIC_API_KEY=api_key,
+                   ANTHROPIC_MODEL="sonnet", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
+        # Do not set ANTHROPIC_DEFAULT_{SONNET,OPUS,HAIKU}_MODEL to the aliases
+        # themselves. Claude Code treats those as pinned model IDs for a gateway;
+        # self-pinning `sonnet` caused v2.1.304 to warn that the model was unknown.
+        for key in ("ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"):
+            env.pop(key, None)
+        if model:
+            model = str(model)[:100]
+            if not re.fullmatch(r"[A-Za-z0-9._:/-]+", model):
+                raise BridgeError("invalid Claude Code model or pool name", "client", 400)
+            # Claude Code's built-in aliases remain recognized; the Bridge maps
+            # each incoming model name to the owner's configured pool.
+        if full_access:
+            args.append("--dangerously-skip-permissions")
+    elif app_name in ("vscode", "cursor"):
+        args.append(str(p))
+    elif app_name == "powershell":
+        args.extend(["-NoLogo", "-NoExit"])
+    elif app_name == "cmd":
+        args.extend(["/K"])
+    flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if os.name == "nt" else 0
+    try:
+        proc = subprocess.Popen(args, cwd=str(p), env=env, stdin=subprocess.DEVNULL if app_name in ("vscode", "cursor") else None,
+                                stdout=subprocess.DEVNULL if app_name in ("vscode", "cursor") else None,
+                                stderr=subprocess.DEVNULL if app_name in ("vscode", "cursor") else None,
+                                close_fds=(os.name != "nt"), creationflags=flags)
+    except OSError as e:
+        raise BridgeError(f"could not start {exe_name}: {e}", "setup", 500)
+    return {"ok": True, "pid": int(proc.pid), "app": app_name, "folder": str(p)}
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     app: App
@@ -18019,7 +20724,7 @@ class Handler(BaseHTTPRequestHandler):
     _ACCESS_HDRS = ("x-bridge-request-id", "x-bridge-route", "x-bridge-account", "x-bridge-tier", "x-bridge-model", "x-bridge-fallback", "x-bridge-error-category",
                     "x-bridge-error-scope", "x-bridge-retryable", "x-bridge-outcome", "x-bridge-cache", "x-bridge-shortcut", "retry-after")
     _QUIET = ("/health", "/api/state", "/api/log", "/api/logfile", "/api/clientlog", "/api/o12", "/api/rotation", "/api/autonomous", "/api/personal-chrome", "/api/directory", "/api/routing", "/api/context",
-              "/api/decisions", "/api/tasks")
+              "/api/decisions", "/api/tasks", "/api/reliability")
 
     def send_response(self, code: int, message: Optional[str] = None) -> None:
         self._st = code
@@ -18369,17 +21074,31 @@ class Handler(BaseHTTPRequestHandler):
     def _api(self, method: str, path: str) -> None:
         app, acc, cfg = self.app, self.app.acc, self.app.cfg
         parts = path.split("/")[2:]
+        if parts == ["workspace", "select"] and method == "POST":
+            return self._json(200, {"folder": pick_workspace_directory()})
+        if parts == ["workspace", "open"] and method == "POST":
+            body_ = self._body()
+            key_id = str(body_.get("key_id") or "")
+            selected_key = next((str(k.get("key") or "") for k in cfg["keys"] if k.get("id") == key_id), "")
+            selected_model = str(body_.get("model") or "")[:100]
+            try:
+                result_ = open_workspace_tool(str(body_.get("app") or ""), str(body_.get("folder") or ""), int(cfg["port"]), selected_key, selected_model,
+                                              full_access=bool(body_.get("full_access", False)))
+            except BridgeError as e_:
+                return self._json(e_.status, {"error": str(e_)})
+            return self._json(200, result_)
         if path == "/api/personal-chrome" and method == "GET":
             return self._json(200, pc_api_status())
         if path == "/api/personal-chrome/setup" and method == "POST":
             hub_ = pc_hub(app.store.home)
             ext_ = pc_extract(hub_.root)["path"]
             code_ = hub_.new_pairing()
-            chrome_opened_ = folder_opened_ = False
-            try:
-                chrome_opened_ = bool(webbrowser.open_new_tab("chrome://extensions"))
-            except Exception as e:
-                log(f"personal chrome setup: could not open extensions page: {type(e).__name__}", "warn")
+            # Do not launch the browser during setup. On systems with multiple Chrome
+            # profiles this silently chooses the default profile, which is often the
+            # wrong identity for the account the owner is adding. Let the owner first
+            # open the intended Chrome profile, then load the unpacked extension.
+            chrome_opened_ = False
+            folder_opened_ = False
             try:
                 if os.name == "nt":
                     os.startfile(str(ext_))  # type: ignore[attr-defined]
@@ -18405,7 +21124,7 @@ class Handler(BaseHTTPRequestHandler):
                                     "keys": cfg["keys"], "default_account": cfg["default_account"], "presets": PRESETS,
                                     "settings": {k: cfg[k] for k in ("continuity", "tool_desc_limit", "system_limit", "result_limit",
                                                                      "history_limit", "headless_idle_seconds", "health_interval_min", "cache_seconds", "summarize_history")},
-                                    "stats": app.router.stats, "jobs": [j.public() for j in list(acc.jobs.values())[-8:]],
+                                    "stats": app.router.stats, "jobs": [j.public() for j in list(acc.jobs.values())[-8:]], "pc_profiles": app.pc_hub.profiles(),
                                     "home": str(app.store.home)})
         if parts == ["log"]:
             return self._json(200, {"lines": list(_LOG)[-250:], "file": str(_LOGFILE["path"] or "")})
@@ -18498,8 +21217,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"account": a})
             if not d.get("url"):
                 raise BridgeError("url required", "client", 400)
-            a, job = acc.add(d["url"], d.get("label", ""))
-            return self._json(200, {"account": a, "job": job.id})
+            client_id_ = str(d.get("pc_client_id") or "")[:64]
+            if d.get("manual_login") and client_id_ and client_id_ not in (app.pc_hub.state.get("clients") or {}):
+                raise BridgeError("Chrome profile is no longer paired; choose a connected profile and try again", "client", 409)
+            a, job = acc.add(d["url"], d.get("label", ""), learn=bool(d.get("learn", True)), defer_login=bool(d.get("manual_login", False)), pc_client_id=client_id_)
+            return self._json(200, {"account": a, "job": job.id if job else None, "login_pending": bool(d.get("manual_login", False))})
         if len(parts) >= 2 and parts[0] == "accounts":
             aid = parts[1]
             if parts[2:] == ["serving-mode"] and method == "POST":
@@ -18508,11 +21230,54 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, acc.set_serving_mode(aid, str(body_.get("mode") or "")))
                 except BridgeError as e_:
                     return self._json(e_.status, {"error": str(e_)})
+            if parts[2:] == ["chrome-profile"] and method == "POST":
+                body_ = self._body()
+                try:
+                    a_ = acc.get(aid)
+                    if not a_ or a_.get("type") == "api":
+                        raise BridgeError("unknown browser account", "client", 404)
+                    client_id_ = str(body_.get("client_id") or "")[:64]
+                    if client_id_ and client_id_ not in (app.pc_hub.state.get("clients") or {}):
+                        raise BridgeError("Chrome profile is not paired yet", "client", 409)
+                    if any(not j.done and j.account == aid for j in acc.jobs.values()) or acc.inflight.get(aid, 0):
+                        raise BridgeError("cannot change profile while an account job is running", "client", 409)
+                    browser_ = acc.browser(aid)
+                    browser_.close()
+                    tabs_state_ = app.store.read("personal_chrome/tabs.json", {}) or {}
+                    tabs_state_.pop(aid, None)
+                    app.store.write("personal_chrome/tabs.json", tabs_state_, private=True)
+                    a_["pc_client_id"] = client_id_
+                    if a_.get("state") in ("login_pending", "login_claimed"):
+                        a_["login_client_id"] = client_id_
+                        a_["state"] = "login_pending"
+                        a_["login_claimed_at"] = 0
+                    acc.save()
+                    browser_.pc_client_id = client_id_
+                    return self._json(200, {"ok": True, "client_id": client_id_})
+                except BridgeError as e_:
+                    return self._json(e_.status, {"error": str(e_)})
+            if parts[2:] == ["test-connection"] and method == "POST":
+                try:
+                    return self._json(200, acc.test_connection(aid))
+                except BridgeError as e_:
+                    return self._json(e_.status, {"error": str(e_)})
             if method == "DELETE" and len(parts) == 2:
+                routing_ = forget_account_routes(app.engine.config(), aid)
+                route_errors_ = app.engine.save_config(routing_)
+                if route_errors_:
+                    return self._json(409, {"error": "account could not be removed from routing policies", "problems": route_errors_})
+                for key_ in cfg.data.get("keys", []):
+                    if key_.get("account") == aid:
+                        key_["account"] = ""
+                if cfg.data.get("default_account") == aid:
+                    cfg.data["default_account"] = ""
+                cfg.save()
                 acc.remove(aid)
                 return self._json(200, {"ok": True})
             if parts[2:] in (["relogin"], ["relearn"]) and method == "POST":
-                return self._json(200, {"job": acc.relogin(aid, parts[2] == "relearn").id})
+                if parts[2] == "relogin":
+                    return self._json(200, acc.request_browser_login(aid, False))
+                return self._json(200, {"job": acc.relogin(aid, True).id})
             if parts[2:] == ["human-done"] and method == "POST":              # O7: "I solved it"
                 try:
                     return self._json(200, acc.human_done(aid))
@@ -18601,6 +21366,14 @@ class Handler(BaseHTTPRequestHandler):
             n = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("n", ["50"])[0]
             return self._json(200, {"events": app.engine.rotation.recent(int(n) if n.isdigit() else 50), "counts": app.engine.rotation.summary(),
                                     "standby": app.engine.standby(), "soft_limit_mode": str(cfg["soft_limit_mode"])})
+        if parts == ["reliability"] and method == "GET":                # 7.71 (7): per-site reliability numbers, alerts, probe and replay state
+            return self._json(200, reliability_report(app))
+        if parts == ["reliability", "probe"] and method == "POST":       # 7.71 (9): run the tool-call probe now (one tiny real request per ready account)
+            aid_ = str(self._body().get("account") or "")
+            todo_ = [a_ for a_ in list(acc.items) if (not aid_ or a_["id"] == aid_)][:6]
+            return self._json(200, {"results": [app.probe.run_one(a_) for a_ in todo_]})
+        if parts == ["reliability", "replay"] and method == "POST":      # 7.71 (8): run the current parser over every recorded real reply
+            return self._json(200, REPLAY.run(accept=False))
         if parts == ["context"] and method == "GET":                    # E3/E7: what the context engine did + measured savings + continuity table (no prompt text)
             return self._json(200, app.router.context_report())
         if len(parts) == 2 and parts[0] == "vault" and method == "GET":    # E4: full text of a reduced tool result
@@ -18643,7 +21416,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True})
         if parts == ["settings"] and method == "POST":
             for k, v in self._body().items():
-                if k in ("continuity", "tool_desc_limit", "system_limit", "result_limit", "history_limit", "headless_idle_seconds", "health_interval_min", "cache_seconds", "summarize_history"):
+                if k in ("continuity", "tool_desc_limit", "system_limit", "result_limit", "history_limit", "headless_idle_seconds", "health_interval_min", "cache_seconds", "summarize_history",
+                         "ui_adaptive_wait", "ui_quiet_base_s", "ui_quiet_generating_s", "ui_quiet_open_call_s", "ui_quiet_open_call_generating_s", "ui_quiet_max_s"):
+                    if k.startswith("ui_quiet_") and not (isinstance(v, (int, float)) and not isinstance(v, bool) and 0.3 <= float(v) <= 300):
+                        continue                                       # a bad number must never be stored: it would stall or cut every answer
                     cfg.data[k] = v
             cfg.save()
             return self._json(200, {"ok": True})
@@ -18723,8 +21499,9 @@ class AnthropicWriter(_SSEBase):
 
     def finish(self, out: Outcome) -> None:
         self._start()
-        if out.text.startswith(self.sent) and len(out.text) > len(self.sent):
-            self.text(out.text[len(self.sent):])
+        _rest = _unsent_tail(out.text, self.sent)
+        if _rest:
+            self.text(_rest)
         if self.text_open:
             self._ev("content_block_stop", {"type": "content_block_stop", "index": self.idx})
             self.idx += 1
@@ -18773,8 +21550,9 @@ class OpenAIWriter(_SSEBase):
             self._begin()
         if not self.role:
             self._chunk({"role": "assistant", "content": ""})
-        if out.text.startswith(self.sent) and len(out.text) > len(self.sent):
-            self._chunk({"content": out.text[len(self.sent):]})
+        _rest = _unsent_tail(out.text, self.sent)
+        if _rest:
+            self._chunk({"content": _rest})
         for i, c in enumerate(out.calls):
             self._chunk({"tool_calls": [{"index": i, "id": c["id"], "type": "function",
                                          "function": {"name": c["name"], "arguments": json.dumps(c["input"], ensure_ascii=False)}}]})
@@ -18792,28 +21570,33 @@ class OpenAIWriter(_SSEBase):
 # ============================================================================
 DASHBOARD_HTML = r"""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI Web Bridge</title><style>
-:root{--bg:#0f1218;--card:#171c26;--line:#262e3e;--tx:#e6e9ef;--mut:#8b94a7;--acc:#6ea8fe;--ok:#4ade80;--warn:#fbbf24;--bad:#f87171}
-@media(prefers-color-scheme:light){:root{--bg:#f4f6fa;--card:#fff;--line:#dfe3ec;--tx:#1b2130;--mut:#667085;--acc:#2563eb;--ok:#16a34a;--warn:#b45309;--bad:#dc2626}}
+:root{--bg:#10131b;--card:#191e2a;--line:#2b3447;--tx:#eef0f7;--mut:#a2abc0;--acc:#a78bfa;--ok:#4ade80;--warn:#fbbf24;--bad:#fb7185;--shadow:0 12px 32px rgba(0,0,0,.13)}
+:root[data-theme="light"]{--bg:#f5f6fb;--card:#fff;--line:#e2e5ef;--tx:#20243a;--mut:#68708a;--acc:#6d5ce8;--ok:#15803d;--warn:#a16207;--bad:#dc2626;--shadow:0 10px 28px rgba(50,50,90,.06)}
+:root[data-theme="mint"]{--bg:#edf8f4;--card:#fff;--line:#cce6da;--tx:#17362d;--mut:#55776b;--acc:#16876d;--ok:#16803d;--warn:#a16207;--bad:#c24155;--shadow:0 10px 28px rgba(15,70,54,.08)}
+:root[data-theme="berry"]{--bg:#1b1220;--card:#26182d;--line:#493253;--tx:#f7eefa;--mut:#c0a9c5;--acc:#ed82c8;--ok:#72dda4;--warn:#ffd166;--bad:#ff7890;--shadow:0 12px 32px rgba(0,0,0,.18)}
+@media(prefers-color-scheme:light){:root:not([data-theme]){--bg:#f5f6fb;--card:#fff;--line:#e2e5ef;--tx:#20243a;--mut:#68708a;--acc:#6d5ce8;--ok:#15803d;--warn:#a16207;--bad:#dc2626;--shadow:0 10px 28px rgba(50,50,90,.06)}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.65 Vazirmatn,"Segoe UI",Tahoma,system-ui,sans-serif}
 header{display:flex;align-items:center;gap:10px;padding:12px 20px;border-bottom:1px solid var(--line);flex-wrap:wrap}h1{font-size:17px;margin:0}.sp{flex:1}
 .pill{padding:2px 10px;border-radius:99px;background:var(--line);color:var(--mut);font-size:12px}
 nav{display:flex;gap:2px;padding:0 14px;border-bottom:1px solid var(--line);overflow-x:auto}
 nav button{border:0;border-bottom:2px solid transparent;border-radius:0;background:none;padding:10px 14px;color:var(--mut);white-space:nowrap}
 nav button.on{color:var(--tx);border-bottom-color:var(--acc)}
-main{max-width:1060px;margin:0 auto;padding:18px}.view{display:none}.view.on{display:block}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px;min-width:0}
+main{max-width:1240px;margin:0 auto;padding:clamp(12px,2vw,24px)}.view{display:none}.view.on{display:block}
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:clamp(13px,2vw,20px);margin-bottom:14px;min-width:0;box-shadow:var(--shadow)}
 h2{font-size:14px;margin:0 0 10px}h3{font-size:13px;margin:14px 0 6px;color:var(--mut)}
 button,input,select{font:inherit;color:var(--tx);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 10px}
 button{cursor:pointer}button:hover{border-color:var(--acc)}button.p{background:var(--acc);color:#fff;border-color:var(--acc)}button.d:hover{border-color:var(--bad);color:var(--bad)}.sm{font-size:12px;padding:3px 9px}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}.row>input{flex:1;min-width:140px}
+.workspace-tools{display:grid;grid-template-columns:minmax(160px,1fr) minmax(210px,1.35fr) minmax(190px,1fr) auto auto;gap:8px;align-items:end;margin-top:10px}.auto-mode{display:flex;align-items:center;gap:7px;color:var(--mut);font-size:12px;min-height:38px}.auto-mode input{accent-color:var(--acc)}
+.workspace-key-wrap{display:grid;gap:3px;min-width:0;font-size:11px}.workspace-key-wrap select{min-width:0;width:100%;max-width:none}.workspace-tools>select{min-width:0;width:100%;max-width:none}.workspace-tools button{white-space:nowrap;min-height:38px}
 .mut{color:var(--mut)}.ltr{direction:ltr;unicode-bidi:plaintext;text-align:left}.k{font-family:ui-monospace,Consolas,monospace;font-size:12px;word-break:break-all;direction:ltr;text-align:left}
 code,pre{font-family:ui-monospace,Consolas,monospace;font-size:12px}pre{direction:ltr;text-align:left;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;max-height:280px;margin:8px 0 0;white-space:pre-wrap;word-break:break-all}
 table{width:100%;border-collapse:collapse}td,th{text-align:start;padding:7px 6px;border-bottom:1px solid var(--line);vertical-align:middle}th{color:var(--mut);font-weight:500;font-size:12px}
 .b{display:inline-block;padding:0 9px;border-radius:99px;font-size:12px;border:1px solid var(--line);color:var(--mut)}
 .b.ready,.b.direct{color:var(--ok);border-color:var(--ok)}.b.learning,.b.page{color:var(--warn);border-color:var(--warn)}.b.ui{color:var(--acc);border-color:var(--acc)}
-.acc{border-inline-start:4px solid var(--line)}.acc.s-ready{border-inline-start-color:var(--ok)}.acc.s-learning,.acc.s-needs_you{border-inline-start-color:var(--warn)}.acc.s-failed,.acc.s-needs_login{border-inline-start-color:var(--bad)}
+.acc{border-inline-start:4px solid var(--line)}.acc.s-ready,.acc.s-needs_learning{border-inline-start-color:var(--ok)}.acc.s-learning,.acc.s-needs_you{border-inline-start-color:var(--warn)}.acc.s-failed,.acc.s-needs_login{border-inline-start-color:var(--bad)}
 .top{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.top .grow{flex:1;min-width:140px}.stt{font-weight:600}
-.s-ready .stt{color:var(--ok)}.s-learning .stt,.s-needs_you .stt{color:var(--warn)}.s-failed .stt,.s-needs_login .stt{color:var(--bad)}
+.s-ready .stt,.s-needs_learning .stt{color:var(--ok)}.s-learning .stt,.s-needs_you .stt{color:var(--warn)}.s-failed .stt,.s-needs_login .stt{color:var(--bad)}
 ol.steps{display:flex;list-style:none;padding:0;margin:14px 0 8px}ol.steps li{flex:1;text-align:center;position:relative;font-size:12px;color:var(--mut)}
 ol.steps i{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;border:1px solid var(--line);font-style:normal;background:var(--bg);position:relative;z-index:1}
 ol.steps li:not(:last-child)::after{content:"";position:absolute;top:12px;inset-inline-start:calc(50% + 14px);inset-inline-end:calc(-50% + 14px);height:2px;background:var(--line)}
@@ -18827,22 +21610,35 @@ ol.steps li.bad i{background:var(--bad);border-color:var(--bad);color:#fff}ol.st
 .mini{max-height:120px;font-size:11px;margin-top:6px}details{margin-top:10px}summary{cursor:pointer;color:var(--mut);font-size:13px}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:4px 18px}label.f{display:flex;align-items:center;gap:6px;margin:5px 0}input[type=number]{width:96px}
 .acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
+.pool-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:8px;margin:10px 0}.pool-item{display:flex;align-items:center;gap:9px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--surface-2,#fff)}.pool-item input{accent-color:var(--accent)}.pool-item .mut{margin-inline-start:auto}.profile-assign{min-width:min(100%,250px)}
+@media(max-width:760px){.workspace-tools{grid-template-columns:1fr 1fr}.workspace-tools>select,.workspace-key-wrap,.auto-mode{grid-column:span 2}.workspace-tools button{width:100%}}
+@media(max-width:640px){header{padding:10px 12px}nav{padding:0 6px}nav button{padding:9px 11px}main{padding:10px}.row>*{max-width:100%}.row>input,.row>select{min-width:0;flex:1 1 100%}.workspace-tools{grid-template-columns:1fr}.workspace-tools>select,.workspace-key-wrap,.workspace-tools button,.auto-mode{grid-column:auto;width:100%;min-height:42px}table{display:block;overflow-x:auto;white-space:nowrap}.steps li{font-size:10px!important}.card{border-radius:13px}}
+@media(min-width:1600px){main{max-width:1480px}}
 </style></head><body>
-<header><h1>AI Web Bridge <span class="mut ltr">v__VERSION__</span></h1><span class="pill ltr" id="st">…</span><span class="pill ltr" id="sts"></span><span class="sp"></span><button class="sm" id="langbtn" onclick="setLang(lang=='fa'?'en':'fa')"></button></header>
+<header><h1>AI Web Bridge <span class="mut ltr">v__VERSION__</span></h1><span class="pill ltr" id="st">…</span><span class="pill ltr" id="sts"></span><span class="sp"></span><select id="theme" aria-label="Theme" onchange="setTheme(this.value)"><option value="system">System</option><option value="light">Light</option><option value="mint">Mint</option><option value="berry">Berry</option></select><button class="sm" id="langbtn" onclick="setLang(lang=='fa'?'en':'fa')"></button></header>
 <nav id="nav"></nav>
 <main>
 <div class="view on" id="v_accounts">
+<div class="card" id="workflow-card"><h2 id="workflow-title"></h2><p id="workflow-steps" class="mut"></p><p id="workflow-note" class="mut"></p></div>
 <div class="card" id="pcsetup"><h2 data-i="pc_title"></h2><p class="mut" data-i="pc_intro"></p>
 <div class="row" style="margin-top:8px"><button class="p" id="pc_start" onclick="startPcSetup()" data-i="pc_start"></button><span id="pc_state" class="mut"></span></div>
+<p class="mut" id="pc_profile_status"></p>
 <div id="pc_steps" hidden><ol class="steps"><li class="done"><i>1</i><br><span data-i="pc_step1"></span></li><li><i>2</i><br><span data-i="pc_step2"></span></li><li><i>3</i><br><span data-i="pc_step3"></span></li></ol>
 <div class="att"><b data-i="pc_code_label"></b> <code class="ltr" id="pc_code"></code> <button class="sm" onclick="copyPcCode()" data-i="pc_copy"></button><br><span class="mut" data-i="pc_code_note"></span></div>
 <p class="mut"><span data-i="pc_port_label"></span> <code class="ltr" id="pc_port"></code></p><p class="mut"><span data-i="pc_folder_label"></span> <code class="ltr" id="pc_folder"></code></p><p class="mut" data-i="pc_security"></p><a href="chrome://extensions" target="_blank" rel="noreferrer" data-i="pc_open_link"></a></div></div>
 <div class="card"><h2 data-i="add_title"></h2>
-<div class="row" style="margin-top:0"><select id="preset"></select><input id="url" class="ltr" data-ph="url_ph" oninput="urlPrev()"><input id="label" data-ph="label_ph"><button class="p" onclick="addAcc()" data-i="add_btn"></button></div>
+<div class="row" style="margin-top:0"><select id="preset"></select><input id="url" class="ltr" data-ph="url_ph" oninput="urlPrev()"><input id="label" data-ph="label_ph"><select id="account_profile" aria-label="Chrome profile"></select><button class="p" onclick="addAcc()" data-i="add_btn"></button></div>
+<label class="f"><input type="checkbox" id="learn_on_add"><span data-i="learn_on_add"></span></label>
 <p class="mut" id="urlprev" style="margin:6px 0 0"></p><p class="mut" id="urlhint" style="margin:6px 0 0" data-i="add_hint"></p>
 <details><summary data-i="api_title"></summary><div class="row"><select id="akind"><option value="openai">OpenAI-compatible</option><option value="anthropic">Anthropic-compatible</option></select>
 <input id="abase" class="ltr" placeholder="https://api.deepseek.com"><input id="akey" class="ltr" type="password" placeholder="API key"><input id="amodel" class="ltr" placeholder="model id"><input id="alabel" data-ph="label_ph"><button class="p" onclick="addApi()" data-i="api_btn"></button></div></details></div>
-<div id="acc"></div></div>
+<div class="card" id="poolcard"><h2 data-i="strategy_title"></h2><p class="mut" data-i="strategy_hint"></p><div id="strategy_accounts" class="pool-list"></div><div class="row"><label class="mut" for="strategy_kind" data-i="strategy_policy"></label><select id="strategy_kind" onchange="renderStrategy()"><option value="auto" data-i="strategy_auto"></option><option value="rotation" data-i="strategy_rotation"></option><option value="failover" data-i="strategy_failover"></option><option value="lowest_latency" data-i="strategy_latency"></option><option value="best_fit" data-i="strategy_best_fit"></option><option value="manual_approval" data-i="strategy_manual"></option><option value="fixed" data-i="strategy_fixed"></option></select><button class="p" onclick="saveStrategy()" data-i="strategy_save"></button></div><p class="mut" id="strategy_status"></p></div>
+<div class="card" id="profiles_card"><h2 data-i="pc_profiles"></h2><div id="pc_profiles_list" class="pool-list"></div></div>
+<div id="acc"></div>
+<div class="card" id="workspacecard"><h2 data-i="workspace_title"></h2><p class="mut" data-i="workspace_hint"></p>
+<div class="row"><input id="workspace_path" class="ltr" data-ph="workspace_ph" readonly><button class="sm" onclick="selectWorkspace()" data-i="workspace_select"></button></div>
+<div class="workspace-tools"><select id="workspace_app" aria-label="Application" onchange="updateWorkspaceCommand()"><option value="claude">Claude Code</option><option value="vscode">Visual Studio Code</option><option value="cursor">Cursor</option><option value="powershell">PowerShell</option><option value="cmd">Command Prompt</option></select><label class="workspace-key-wrap"><span class="mut" data-i="workspace_key_label"></span><select id="workspace_key" aria-label="API key" onchange="updateWorkspaceCommand()"></select></label><label class="auto-mode"><input id="claude_full_access" type="checkbox"><span id="claude_full_access_label">Full access · skip permission prompts</span></label><button class="p" onclick="openWorkspace()" data-i="workspace_open"></button><button class="sm" onclick="copyWorkspaceCommand()" data-i="workspace_copy"></button></div>
+<pre id="workspace_command" class="mini"></pre><span id="workspace_status" class="mut"></span></div></div>
 
 <div class="view" id="v_connect">
 <div class="card"><h2 data-i="connect_title"></h2><div id="tabs" class="row" style="margin-top:0"></div><pre id="snip"></pre>
@@ -18866,7 +21662,7 @@ ol.steps li.bad i{background:var(--bad);border-color:var(--bad);color:#fff}ol.st
 <label class="f"><span data-i="s_idle"></span> <input type="number" id="s_idle" onchange="saveS()"></label></div>
 <p class="mut ltr" id="home"></p></div></div>
 
-<div class="view" id="v_adv">
+<div class="view on" id="v_adv">
 <div class="card" id="analysiscard"><h2>Site analysis</h2>
 <div class="row"><input id="rep_host" class="ltr" placeholder="chat.example.com"><button id="rep_show" class="sm" data-i="rep_show"></button><button id="req_show" class="sm" data-i="req_show"></button><button id="evidence_download" class="sm" data-i="evidence_download"></button></div><div id="req_nav" class="row" hidden><button id="req_prev" class="sm" data-i="req_prev"></button><span id="req_page" class="mut"></span><button id="req_next" class="sm" data-i="req_next"></button></div><div id="req_out" class="mut" style="display:none"></div><pre id="rep_out" class="mut" style="display:none"></pre></div>
 <div class="card" id="dircard"><h2>Site directory</h2><div id="dir_meta" class="mut"></div>
@@ -18876,12 +21672,17 @@ ol.steps li.bad i{background:var(--bad);border-color:var(--bad);color:#fff}ol.st
 <div class="card" id="o12card"><h2>Direct path &amp; validation</h2><div id="o12_meta" class="mut ltr"></div>
 <div id="o12_cards"></div>
 <table><thead><tr><th>Account</th><th>State</th><th>Validation</th><th>Supervisor (last tick)</th><th>Actions</th></tr></thead><tbody id="o12_rows"></tbody></table></div>
+<div class="card" id="decisioncard"><h2>Recent route decisions</h2><p id="decision_meta" class="mut"></p><table><thead><tr><th>Time</th><th>Requested</th><th>Selected account / model</th><th>Policy</th><th>Outcome</th><th>Fallback / exclusions</th></tr></thead><tbody id="decision_rows"></tbody></table></div>
 <div class="card" id="ctxcard"><h2>Context &amp; submission</h2><div id="ctx_meta" class="mut ltr"></div>
 <table><thead><tr><th>Counter</th><th>Value</th><th>Kind</th></tr></thead><tbody id="ctx_cnt"></tbody></table>
 <h3>Learned windows (per route)</h3><table><thead><tr><th>Route</th><th>Chars</th><th>Kind</th><th>Refused at</th></tr></thead><tbody id="ctx_win"></tbody></table>
 <h3>Long-paste signal discovery</h3><p class="mut" style="margin:0 0 6px" data-i="disc_hint"></p>
 <div class="row"><select id="ctx_acc"></select><button class="sm" onclick="discoverSignal()" data-i="disc_btn"></button></div><pre id="ctx_disc" style="display:none"></pre>
-<h3>Recent requests (no prompt text)</h3><table><thead><tr><th>When</th><th>Mode</th><th>Size</th><th>Submission</th><th>Canary</th></tr></thead><tbody id="ctx_rec"></tbody></table></div></div>
+<h3>Recent requests (no prompt text)</h3><table><thead><tr><th>When</th><th>Mode</th><th>Size</th><th>Submission</th><th>Canary</th></tr></thead><tbody id="ctx_rec"></tbody></table></div>
+<div class="card" id="relcard"><h2>Reliability per site</h2><div id="rel_meta" class="mut ltr"></div>
+<table><thead><tr><th>Site</th><th>Parsed first time</th><th>Cut off</th><th>Retries</th><th>Marker followed</th><th>Ended by</th><th>Time p50 / p90</th></tr></thead><tbody id="rel_rows"></tbody></table>
+<h3>Alerts</h3><div id="rel_alerts" class="mut"></div>
+<div class="row"><button class="sm" onclick="relProbe()">Run the tool-call probe now</button><button class="sm" onclick="relReplay()">Replay recorded replies</button><span id="rel_msg" class="mut"></span></div></div></div>
 
 <div class="view" id="v_log"><div class="card"><h2 data-i="log"></h2><label class="f"><input type="checkbox" id="hidetech" checked> <span data-i="hide_tech"></span></label>
 <div class="row"><button class="sm p" id="lgcp" data-i="log_cp"></button><button class="sm" id="lgdl" data-i="log_dl"></button><span id="lgmsg" class="mut"></span></div>
@@ -18892,20 +21693,20 @@ const _clog=(kind,msg,x)=>{try{if(_clog.n++>40)return;fetch('/api/clientlog',{me
 window.addEventListener('error',e=>_clog('js_error',e.message,{src:String(e.filename||'').split('/').pop(),line:e.lineno,col:e.colno,stack:e.error&&e.error.stack?String(e.error.stack):''}));
 window.addEventListener('unhandledrejection',e=>{const r=e.reason;_clog('promise_rejected',r&&r.message?r.message:String(r),{stack:r&&r.stack?String(r.stack):''})});
 ['error','warn'].forEach(m=>{const o=console[m];console[m]=function(){try{_clog('console_'+m,Array.prototype.map.call(arguments,String).join(' '))}catch(e){}return o.apply(console,arguments)}});
-const api=async(p,m='GET',b)=>{let r;try{r=await fetch('/api/'+p,{method:m,headers:{'x-admin-key':K,'content-type':'application/json'},body:b?JSON.stringify(b):undefined})}catch(e){if(p!='clientlog')_clog('api_network_error',m+' /api/'+p+': '+e.message);throw e}if(!r.ok){const tx=await r.text();if(p!='clientlog')_clog('api_http_'+r.status,m+' /api/'+p+' -> '+tx.slice(0,300));throw new Error(tx)}const t=await r.text();try{return JSON.parse(t)}catch(e){return t}};
+const api=async(p,m='GET',b)=>{if(m&&typeof m==='object'){b=m;m='GET'}m=String(m||'GET').toUpperCase();const opts={method:m,headers:{'x-admin-key':K,'content-type':'application/json'}};if(b!==undefined&&m!=='GET'&&m!=='HEAD')opts.body=JSON.stringify(b);let r;try{r=await fetch('/api/'+p,opts)}catch(e){if(p!='clientlog')_clog('api_network_error',m+' /api/'+p+': '+e.message);throw e}if(!r.ok){const tx=await r.text();if(p!='clientlog')_clog('api_http_'+r.status,m+' /api/'+p+' -> '+tx.slice(0,300));throw new Error(tx)}const t=await r.text();try{return JSON.parse(t)}catch(e){return t}};
 const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const escJ=s=>esc(JSON.stringify(String(s)));
 const L={en:{
-accounts:'Accounts',connect:'Connect tools',keys:'API keys',sites:'Learned sites',settings:'Settings',advanced:'Advanced',log:'Log',
-add_title:'Add an account',add_btn:'Add account (opens browser)',url_ph:'chat.example.com',label_ph:'name (optional)',preset:'Choose a site…',
-pc_title:'Connect your own Chrome (one-time setup)',pc_intro:'Make the bridge work with your normal Chrome profile. This guided setup opens the extension page and the extension folder, then gives you a one-time pairing code.',pc_start:'Set up Chrome connection',pc_step1:'Enable Developer mode and choose “Load unpacked”.',pc_step2:'Select the opened “extension” folder.',pc_step3:'Open the extension toolbar icon and enter the port and code.',pc_code_label:'One-time pairing code:',pc_code_note:'Valid for 10 minutes. Keep it private; it can only pair this local bridge.',pc_copy:'Copy code',pc_port_label:'Bridge port:',pc_folder_label:'Extension folder:',pc_security:'Chrome requires you to approve loading this local extension yourself. The bridge cannot silently install extensions into a personal Chrome profile.',pc_open_link:'Open Chrome extensions page again',pc_opening:'Preparing the extension and opening the setup windows…',pc_ready:'Setup is ready. Complete the three steps above in Chrome.',pc_error:'Could not prepare setup: ',pc_copied:'Copied.',
-add_hint:'A browser window opens once so YOU can log in. The bridge then learns how the site works. Keep that window open until the card turns Ready.',
+accounts:'Manage accounts',connect:'Connect tools',keys:'API keys',sites:'Learned sites',settings:'Settings',advanced:'Advanced',log:'Log',
+add_title:'Add an account',add_btn:'Add account (opens browser)',url_ph:'chat.example.com',label_ph:'name (optional)',preset:'Choose a site…',learn_on_add:'Start learning after login (sends a few test messages; optional)',choose_model:'Account model',default_model:'Use site default',workspace_title:'Open a tool in a workspace',workspace_hint:'Choose a folder, then choose an app and API key. Claude Code uses the selected bridge API key.',workspace_ph:'Choose a workspace folder…',workspace_select:'Select folder…',workspace_open:'Open here',workspace_copy:'Copy command',workspace_ready:'Workspace selected.',workspace_cancel:'Folder selection cancelled.',workspace_error:'Could not open workspace: ',workspace_opened:'Application opened in the selected folder.',workspace_copied:'Command copied.',workspace_key_none:'No API key is configured',workspace_key_choose:'Choose an API key…',workspace_key_required:'Choose an API key for Claude Code.',
+pc_title:'Connect your own Chrome (one-time setup)',pc_intro:'Choose the Chrome profile you want to use first, open the Bridge dashboard in that profile, then prepare the extension folder and pairing code.',pc_start:'Prepare Chrome connection',pc_step1:'In your chosen Chrome profile, open Extensions and enable Developer mode.',pc_step2:'Choose “Load unpacked” and select the extension folder shown below.',pc_step3:'Open the extension toolbar icon and enter the port and code.',pc_code_label:'One-time pairing code:',pc_code_note:'Valid for 10 minutes. Keep it private; it can only pair this local bridge.',pc_copy:'Copy code',pc_port_label:'Bridge port:',pc_folder_label:'Extension folder:',pc_security:'Chrome requires you to approve loading this local extension yourself. The bridge does not open Chrome automatically, so your selected profile stays in control.',pc_open_link:'Open Chrome extensions page again',pc_opening:'Preparing the extension folder and pairing code…',pc_ready:'Setup is ready. Use the Chrome profile you chose and complete the three steps above.',pc_error:'Could not prepare setup: ',pc_copied:'Copied.',
+add_hint:'A browser window opens for you to log in. Learning is optional; if it stays off, only the login is saved and a new site needs Start learning later.',
 api_title:'…or add an official API account instead',api_btn:'Add API account',no_acc:'No accounts yet - add one above.',
 connect_title:'Connect your tools',key_used:'key used in the snippet',key_create:'Create key',klabel_ph:'label e.g. cursor',key_pin:'Pin a key to an account to force that provider for the tool using it.',
 th_site:'Site',th_tier:'Mode',th_mem:'Chat memory',import:'Import recipe',
 s_cont:"Reuse the site's own chat memory (send only new messages)",s_sum:'Summarize old history with the model instead of cutting it',s_tool:'Tool description limit (chars)',s_sys:'System prompt limit (chars)',s_res:'Tool result limit (chars)',s_his:'History limit (chars)',s_hc:'Health check every (min, 0 = off)',s_cache:'Cache identical requests (s, 0 = off)',s_idle:'Close idle browser after (s)',
 rep_show:'Show analysis report',req_show:'Show captured requests',evidence_download:'Download source + requests',req_prev:'Previous',req_next:'Next',
 disc_hint:'Spends exactly 3 real requests on the chosen account to find the response field in which the site reports turning long text into an attachment. Nothing is sent until you confirm.',disc_btn:'Discover signal (3 real requests)',hide_tech:'Hide technical lines (DEBUG / tracebacks)',log_cp:'Copy diagnostic report',log_dl:'Download full log file',log_hint:'The report holds the version, account states, Chrome-extension state and the latest log lines (no keys, no message text). Paste it into the chat instead of describing the page.',log_copied:'Copied. Paste it into the chat.',log_failed:'Could not copy automatically; the report was downloaded instead.',
-s_ready:'Ready',s_learning:'Working',s_needs_you:'Needs you',s_needs_login:'Login needed',s_failed:'Failed',s_cooling:'Cooling down',
+s_ready:'Ready',s_learning:'Working',s_needs_you:'Needs you',s_needs_login:'Login needed',s_needs_learning:'Login saved · needs_learning (Chrome UI ready)',s_failed:'Failed',s_cooling:'Cooling down',
 m_direct:'direct (fast)',m_page:'via browser page',m_ui:'via browser typing (slow)',
 st_open:'Open site',st_login:'Log in',st_learn:'Learn',st_analyse:'Analyse',st_verify:'Verify',st_finish:'Save',
 d_open:'Opening the site in a browser window…',d_login:'Waiting for you to log in inside the browser window.',d_learn:'Sending 3 short test messages through the site while recording the traffic.',d_analyse:'Working out how to talk to the site.',d_verify:'Testing which mode works: direct, then page, then browser typing.',d_finish:'Saving the recording and analysing it offline (up to ~30 s).',
@@ -18916,22 +21717,22 @@ a_check_t:'The site is checking your browser',a_check_b:'Complete the check in t
 a_check_h:'Stuck on "Just a moment…" for more than 1-2 minutes? Then the site is rejecting this automated window. Press F5 once in that window. If it still loops, close it and use an official API account (top of this page) for this site.',
 f_title:'It did not finish',h_check:'The site kept showing its human check and never let this automated window through. Retry once with Re-login (press F5 if it spins). If it loops again, this site cannot be learned this way: use its official API account instead.',
 h_closed:'The browser window was closed before the process finished. Press Re-login and leave the window open until the card says Ready.',h_generic:'Open the Log tab for details, then press Re-learn.',
-b_relogin:'Re-login',b_relearn:'Re-learn',b_recheck:'Try without browser',b_default:'Make default',b_remove:'Remove',def:'default',details:'Technical details',last_lines:'Last steps',transport:'Serving path',mode_auto:'Automatic · direct + browser fallback',mode_browser:'Browser only',mode_direct:'Direct only',mode_unavailable:'Direct mode unlocks after verification',
+b_relogin:'Re-login',b_relearn:'Re-learn',b_start_learn:'Start learning',b_recheck:'Try without browser',b_default:'Make default',b_remove:'Remove',b_use:'Use for routing',def:'default',details:'Technical details',last_lines:'Last steps',transport:'Serving path',mode_auto:'Automatic · direct + browser fallback',mode_browser:'Browser only',mode_direct:'Direct only',mode_unavailable:'Direct mode unlocks after verification',
 req:'requests',fails:'fails',healthy:'healthy',unhealthy:'unhealthy',
 c_copy:'Copy',c_revoke:'Revoke',docs:'Docs',tool:'Tool',export:'Export',forget:'Forget',yes:'yes',no:'no',any_acc:'any account',running:'running on port ',errors:'errors',
 cf_rm:'Remove this account and its browser profile?',cf_forget:'Forget the learned recipe for this site? It will be re-learned on next login.'
 },fa:{
-accounts:'حساب‌ها',connect:'اتصال ابزارها',keys:'کلیدهای API',sites:'سایت‌های یادگرفته‌شده',settings:'تنظیمات',advanced:'پیشرفته',log:'گزارش',
-pc_title:'اتصال Chrome شخصی (راه‌اندازی یک‌باره)',pc_intro:'برنامه را به پروفایل معمول Chrome شما وصل می‌کند. این راهنما صفحه‌ی افزونه‌ها و پوشه‌ی افزونه را باز می‌کند و کد یک‌بارمصرف اتصال را می‌دهد.',pc_start:'راه‌اندازی اتصال Chrome',pc_step1:'Developer mode را روشن کنید و «Load unpacked» را بزنید.',pc_step2:'پوشه‌ی بازشده‌ی «extension» را انتخاب کنید.',pc_step3:'آیکن افزونه در نوار Chrome را باز و پورت و کد را وارد کنید.',pc_code_label:'کد یک‌بارمصرف اتصال:',pc_code_note:'۱۰ دقیقه اعتبار دارد. آن را خصوصی نگه دارید؛ فقط برای اتصال همین bridge محلی است.',pc_copy:'کپی کد',pc_port_label:'درگاه اتصال برنامه:',pc_folder_label:'پوشه‌ی افزونه:',pc_security:'Chrome لازم می‌داند بارگذاری این افزونه‌ی محلی را خودتان تأیید کنید. برنامه نمی‌تواند افزونه را بی‌صدا در پروفایل شخصی نصب کند.',pc_open_link:'باز کردن دوباره‌ی صفحه‌ی افزونه‌های Chrome',pc_opening:'در حال آماده‌سازی افزونه و باز کردن پنجره‌های راه‌اندازی…',pc_ready:'راه‌اندازی آماده است. سه مرحله‌ی بالا را در Chrome انجام دهید.',pc_error:'آماده‌سازی راه‌اندازی انجام نشد: ',pc_copied:'کپی شد.',
-add_title:'افزودن حساب',add_btn:'افزودن حساب (مرورگر باز می‌شود)',url_ph:'chat.example.com',label_ph:'نام (اختیاری)',preset:'انتخاب سایت…',
-add_hint:'یک پنجره‌ی مرورگر باز می‌شود تا خودتان وارد شوید. سپس برنامه روش کار سایت را یاد می‌گیرد. تا وقتی کارت «آماده» نشده پنجره را نبندید.',
+accounts:'مدیریت حساب‌ها',connect:'اتصال ابزارها',keys:'کلیدهای API',sites:'سایت‌های یادگرفته‌شده',settings:'تنظیمات',advanced:'پیشرفته',log:'گزارش',
+pc_title:'اتصال Chrome شخصی (راه‌اندازی یک‌باره)',pc_intro:'اول همان پروفایل Chrome را که می‌خواهید برای حساب استفاده کنید باز کنید و داشبورد Bridge را در همان پروفایل بیاورید؛ بعد پوشه‌ی افزونه و کد اتصال را آماده کنید.',pc_start:'آماده‌سازی اتصال Chrome',pc_step1:'در پروفایل دلخواه Chrome، صفحه‌ی Extensions را باز و Developer mode را روشن کنید.',pc_step2:'روی «Load unpacked» بزنید و پوشه‌ی افزونه‌ی زیر را انتخاب کنید.',pc_step3:'آیکن افزونه در نوار Chrome را باز و درگاه و کد را وارد کنید.',pc_code_label:'کد یک‌بارمصرف اتصال:',pc_code_note:'۱۰ دقیقه اعتبار دارد. آن را خصوصی نگه دارید؛ فقط برای اتصال همین bridge محلی است.',pc_copy:'کپی کد',pc_port_label:'درگاه اتصال برنامه:',pc_folder_label:'پوشه‌ی افزونه:',pc_security:'Chrome بارگذاری افزونه را به تأیید خودتان می‌سپارد. برنامه Chrome را خودکار باز نمی‌کند تا پروفایلی که انتخاب کرده‌اید کنترل ورود را در دست داشته باشد.',pc_open_link:'باز کردن صفحه‌ی افزونه‌های Chrome',pc_opening:'در حال آماده‌سازی پوشه‌ی افزونه و کد اتصال…',pc_ready:'آماده است. با همان پروفایل Chrome انتخاب‌شده مراحل بالا را انجام دهید.',pc_error:'آماده‌سازی راه‌اندازی انجام نشد: ',pc_copied:'کپی شد.',
+add_title:'افزودن حساب',add_btn:'افزودن حساب (مرورگر باز می‌شود)',url_ph:'chat.example.com',label_ph:'نام (اختیاری)',preset:'انتخاب سایت…',learn_on_add:'بعد از ورود، یادگیری شروع شود (چند پیام آزمایشی می‌فرستد؛ اختیاری)',choose_model:'مدل این حساب',default_model:'مدل پیش‌فرض سایت',workspace_title:'باز کردن ابزار در workspace',workspace_hint:'اول پوشه را انتخاب کنید، بعد برنامه و کلید API را مشخص کنید. Claude Code از کلید انتخاب‌شده‌ی Bridge استفاده می‌کند.',workspace_ph:'پوشه‌ی workspace را انتخاب کنید…',workspace_select:'انتخاب پوشه…',workspace_open:'باز کردن',workspace_copy:'کپی دستور',workspace_ready:'پوشه انتخاب شد.',workspace_cancel:'انتخاب پوشه لغو شد.',workspace_error:'باز کردن workspace ناموفق بود: ',workspace_opened:'برنامه در پوشه‌ی انتخاب‌شده باز شد.',workspace_copied:'دستور کپی شد.',workspace_key_none:'هیچ کلید APIای ساخته نشده',workspace_key_choose:'انتخاب کلید API…',workspace_key_required:'برای Claude Code یک کلید API انتخاب کنید.',
+add_hint:'یک پنجره‌ی مرورگر برای ورود باز می‌شود. یادگیری اختیاری است؛ اگر خاموش باشد فقط ورود ذخیره می‌شود و برای سایت جدید باید بعداً «شروع یادگیری» را بزنید.',
 api_title:'…یا به‌جای آن یک حساب API رسمی اضافه کنید',api_btn:'افزودن حساب API',no_acc:'هنوز حسابی نیست؛ از بالا اضافه کنید.',
 connect_title:'اتصال ابزارهای شما',key_used:'کلیدی که در دستور استفاده می‌شود',key_create:'ساخت کلید',klabel_ph:'برچسب، مثلا cursor',key_pin:'کلید را به یک حساب وصل کنید تا ابزار فقط از همان سرویس استفاده کند.',
 th_site:'سایت',th_tier:'حالت',th_mem:'حافظه‌ی چت',import:'وارد کردن recipe',
 s_cont:'استفاده از حافظه‌ی خود سایت (فقط پیام‌های جدید ارسال شود)',s_sum:'خلاصه‌کردن تاریخچه‌ی قدیمی با مدل به‌جای بریدن',s_tool:'حد توضیح ابزار (حرف)',s_sys:'حد پرامپت سیستم (حرف)',s_res:'حد نتیجه‌ی ابزار (حرف)',s_his:'حد تاریخچه (حرف)',s_hc:'بررسی سلامت هر (دقیقه، 0 = خاموش)',s_cache:'کش درخواست‌های یکسان (ثانیه، 0 = خاموش)',s_idle:'بستن مرورگر بی‌کار بعد از (ثانیه)',
 rep_show:'نمایش گزارش تحلیل',req_show:'نمایش درخواست‌های ثبت‌شده',evidence_download:'دانلود سورس و درخواست‌ها',req_prev:'قبلی',req_next:'بعدی',
 disc_hint:'دقیقا ۳ درخواست واقعی روی حساب انتخابی مصرف می‌کند. تا تایید نکنید چیزی ارسال نمی‌شود.',disc_btn:'کشف سیگنال (۳ درخواست واقعی)',hide_tech:'پنهان‌کردن خطوط فنی (DEBUG و traceback)',log_cp:'کپی گزارش تشخیصی',log_dl:'دانلود کامل فایل لاگ',log_hint:'گزارش شامل نسخه، وضعیت حساب‌ها، وضعیت افزونه‌ی کروم و آخرین خطوط لاگ است (بدون کلید و بدون متن پیام‌ها). به جای توضیح صفحه، همین را در چت بگذارید.',log_copied:'کپی شد. در چت بگذارید.',log_failed:'کپی خودکار نشد؛ گزارش دانلود شد.',
-s_ready:'آماده',s_learning:'در حال کار',s_needs_you:'نیاز به شما',s_needs_login:'نیاز به ورود',s_failed:'ناموفق',s_cooling:'در حال استراحت',
+s_ready:'\u0622\u0645\u0627\u062f\u0647',s_learning:'\u062f\u0631 \u062d\u0627\u0644 \u06a9\u0627\u0631',s_needs_you:'\u0646\u06cc\u0627\u0632 \u0628\u0647 \u0634\u0645\u0627',s_needs_login:'\u0646\u06cc\u0627\u0632 \u0628\u0647 \u0648\u0631\u0648\u062f',s_needs_learning:'\u0648\u0631\u0648\u062f \u0630\u062e\u06cc\u0631\u0647 \u0634\u062f \u00b7 needs_learning (\u0645\u0633\u06cc\u0631 Chrome \u0641\u0639\u0627\u0644)',s_failed:'\u0646\u0627\u0645\u0648\u0641\u0642',s_cooling:'\u062f\u0631 \u062d\u0627\u0644 \u0627\u0633\u062a\u0631\u0627\u062d\u062a',
 m_direct:'مستقیم (سریع)',m_page:'از طریق صفحه‌ی مرورگر',m_ui:'تایپ در مرورگر (کند)',
 st_open:'باز کردن',st_login:'ورود',st_learn:'یادگیری',st_analyse:'تحلیل',st_verify:'آزمایش',st_finish:'ذخیره',
 d_open:'در حال باز کردن سایت در پنجره‌ی مرورگر…',d_login:'منتظر ورود شما داخل پنجره‌ی مرورگر…',d_learn:'ارسال ۳ پیام آزمایشی کوتاه به سایت و ضبط ترافیک.',d_analyse:'در حال کشف روش ارتباط با سایت.',d_verify:'آزمایش اینکه کدام حالت کار می‌کند: مستقیم، بعد صفحه، بعد تایپ در مرورگر.',d_finish:'ذخیره‌ی ضبط و تحلیل آفلاین (حداکثر حدود ۳۰ ثانیه).',
@@ -18942,22 +21743,30 @@ a_check_t:'سایت در حال بررسی مرورگر شماست',a_check_b:'�
 a_check_h:'اگر بیش از ۱ تا ۲ دقیقه روی «Just a moment…» ماند، یعنی سایت این پنجره‌ی خودکار را قبول نمی‌کند. یک بار F5 بزنید. اگر باز هم چرخید، پنجره را ببندید و برای این سایت از حساب API رسمی (بالای همین صفحه) استفاده کنید.',
 f_title:'کار تمام نشد',h_check:'سایت مدام صفحه‌ی بررسی انسان را نشان داد و این پنجره‌ی خودکار را عبور نداد. یک بار با «ورود دوباره» تلاش کنید (اگر چرخید F5 بزنید). اگر باز هم تکرار شد، این سایت از این راه قابل یادگیری نیست؛ از حساب API رسمی‌اش استفاده کنید.',
 h_closed:'پنجره‌ی مرورگر قبل از پایان کار بسته شد. «ورود دوباره» را بزنید و تا وقتی کارت «آماده» نشده پنجره را باز بگذارید.',h_generic:'برای جزئیات تب «گزارش» را ببینید، بعد «یادگیری دوباره» را بزنید.',
-b_relogin:'ورود دوباره',b_relearn:'یادگیری دوباره',b_recheck:'امتحان بدون مرورگر',b_default:'پیش‌فرض شود',b_remove:'حذف',def:'پیش‌فرض',details:'جزئیات فنی',last_lines:'آخرین مراحل',transport:'مسیر ارسال',mode_auto:'خودکار · مسیر مستقیم + پشتیبان مرورگر',mode_browser:'فقط مرورگر',mode_direct:'فقط مستقیم',mode_unavailable:'مسیر مستقیم پس از تأیید فعال می‌شود',
+b_relogin:'ورود دوباره',b_relearn:'یادگیری دوباره',b_start_learn:'شروع یادگیری',b_recheck:'امتحان بدون مرورگر',b_default:'پیش‌فرض شود',b_remove:'حذف',b_use:'استفاده در مسیریابی',def:'پیش‌فرض',details:'جزئیات فنی',last_lines:'آخرین مراحل',transport:'مسیر ارسال',mode_auto:'خودکار · مسیر مستقیم + پشتیبان مرورگر',mode_browser:'فقط مرورگر',mode_direct:'فقط مستقیم',mode_unavailable:'مسیر مستقیم پس از تأیید فعال می‌شود',
 req:'درخواست',fails:'خطا',healthy:'سالم',unhealthy:'ناسالم',
 c_copy:'کپی',c_revoke:'ابطال',docs:'مستندات',tool:'ابزار',export:'خروجی',forget:'فراموش کن',yes:'بله',no:'خیر',any_acc:'هر حسابی',running:'اجرا روی پورت ',errors:'خطا',
 cf_rm:'این حساب و پروفایل مرورگرش حذف شود؟',cf_forget:'recipe یادگرفته‌شده‌ی این سایت فراموش شود؟ در ورود بعدی دوباره یاد گرفته می‌شود.'}};
+L.en.add_btn='Add web account';L.en.add_hint='The account is saved as soon as you confirm login in the selected Chrome profile. Learning is optional and can be started later.';L.en.account_profile='Chrome profile';L.en.profile_any='Any paired profile';L.en.profile_unpaired='No paired Chrome profiles yet';L.en.pc_profiles='Chrome profiles';L.en.profile_assign='Use in profile';L.en.login_queued='Login request queued. Open the AI Web Bridge extension in the selected Chrome profile.';L.en.strategy_title='Claude Code account pool';L.en.strategy_hint='Choose the accounts Claude Code may use and how it selects among them. Only enabled, eligible accounts in this list are considered.';L.en.strategy_save='Save routing strategy';L.en.strategy_fixed='Fixed account';L.en.strategy_auto='Automatic selection';L.en.strategy_rotation='Rotate conversations through selected accounts';L.en.strategy_failover='Primary, then retry-safe failover';L.en.strategy_latency='Lowest measured latency';L.en.strategy_best_fit='Best fit for the request';L.en.strategy_manual='Ask before changing account';L.en.strategy_policy='Selection strategy';L.en.strategy_saved='Routing strategy saved.';L.en.strategy_empty='Select at least one account.';L.en.strategy_choose_one='Fixed routing requires exactly one selected account.';L.en.strategy_needs_two='This strategy needs at least two selected accounts.';L.en.profile_disconnected='Disconnected';L.en.profile_connected='Connected';L.en.profile_none='No Chrome profiles paired. Set one up above.';L.en.profile_changed='Account profile saved.';
+L.fa.add_btn='\u0627\u0641\u0632\u0648\u062f\u0646 \u062d\u0633\u0627\u0628 \u0648\u0628';L.fa.add_hint='\u067e\u0633 \u0627\u0632 \u062a\u0623\u06cc\u06cc\u062f \u0648\u0631\u0648\u062f\u060c Claude Code \u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u062f \u0647\u0645\u0627\u0646 \u062d\u0633\u0627\u0628 \u0631\u0627 \u0627\u0632 \u067e\u0631\u0648\u0641\u0627\u06cc\u0644 Chrome \u0634\u062e\u0635\u06cc\u0650 \u062a\u062e\u0635\u06cc\u0635\u200c\u06cc\u0627\u0641\u062a\u0647 \u0627\u0633\u062a\u0641\u0627\u062f\u0647 \u06a9\u0646\u062f. \u06cc\u0627\u062f\u06af\u06cc\u0631\u06cc \u0627\u062e\u062a\u06cc\u0627\u0631\u06cc \u0627\u0633\u062a \u0648 \u0628\u0639\u062f\u0627\u064b \u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u062f \u0645\u0633\u06cc\u0631 \u0633\u0631\u06cc\u0639\u200c\u062a\u0631 \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0631\u0627 \u0627\u0636\u0627\u0641\u0647 \u06a9\u0646\u062f.';L.fa.account_profile='\u067e\u0631\u0648\u0641\u0627\u06cc\u0644 Chrome';L.fa.profile_any='\u0647\u0631 \u067e\u0631\u0648\u0641\u0627\u06cc\u0644 \u0645\u062a\u0635\u0644';L.fa.profile_unpaired='\u0647\u0646\u0648\u0632 \u067e\u0631\u0648\u0641\u0627\u06cc\u0644 Chrome \u0645\u062a\u0635\u0644 \u0646\u06cc\u0633\u062a';L.fa.pc_profiles='\u067e\u0631\u0648\u0641\u0627\u06cc\u0644\u200c\u0647\u0627\u06cc Chrome';L.fa.profile_assign='\u067e\u0631\u0648\u0641\u0627\u06cc\u0644 \u0627\u0633\u062a\u0641\u0627\u062f\u0647';L.fa.login_queued='\u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0648\u0631\u0648\u062f \u062b\u0628\u062a \u0634\u062f\u061b \u0627\u0641\u0632\u0648\u0646\u0647\u200c\u06cc AI Web Bridge \u0631\u0627 \u062f\u0631 \u067e\u0631\u0648\u0641\u0627\u06cc\u0644 Chrome \u0627\u0646\u062a\u062e\u0627\u0628\u200c\u0634\u062f\u0647 \u0628\u0627\u0632 \u06a9\u0646\u06cc\u062f.';L.fa.strategy_title='\u062d\u0633\u0627\u0628\u200c\u0647\u0627\u06cc \u0642\u0627\u0628\u0644 \u0627\u0633\u062a\u0641\u0627\u062f\u0647 \u062f\u0631 Claude Code';L.fa.strategy_hint='\u062d\u0633\u0627\u0628\u200c\u0647\u0627\u06cc \u0645\u062c\u0627\u0632 Claude Code \u0648 \u0631\u0648\u0634 \u0627\u0646\u062a\u062e\u0627\u0628 \u0631\u0627 \u0645\u0634\u062e\u0635 \u06a9\u0646. \u062d\u0633\u0627\u0628 \u0648\u0627\u0631\u062f\u0634\u062f\u0647 \u0628\u0627 \u0648\u0636\u0639\u06cc\u062a needs_learning \u0647\u0645 \u0627\u0632 \u067e\u0631\u0648\u0641\u0627\u06cc\u0644 Chrome \u0634\u062e\u0635\u06cc\u0650 \u062a\u062e\u0635\u06cc\u0635\u200c\u06cc\u0627\u0641\u062a\u0647 \u0642\u0627\u0628\u0644 \u0627\u0633\u062a\u0641\u0627\u062f\u0647 \u0627\u0633\u062a. \u06cc\u0627\u062f\u06af\u06cc\u0631\u06cc \u0627\u062e\u062a\u06cc\u0627\u0631\u06cc \u0627\u0633\u062a \u0648 \u0645\u0633\u06cc\u0631 \u0633\u0631\u06cc\u0639\u200c\u062a\u0631 \u0633\u0627\u06cc\u062a \u0631\u0627 \u0627\u0636\u0627\u0641\u0647 \u0645\u06cc\u200c\u06a9\u0646\u062f\u061b \u0627\u06cc\u0646 \u062d\u0633\u0627\u0628 \u0628\u0647 Playwright \u0645\u0646\u062a\u0642\u0644 \u0646\u0645\u06cc\u200c\u0634\u0648\u062f.';L.fa.strategy_save='\u0630\u062e\u06cc\u0631\u0647\u200c\u06cc \u0633\u06cc\u0627\u0633\u062a \u0627\u0633\u062a\u0641\u0627\u062f\u0647';L.fa.strategy_fixed='\u06cc\u06a9 \u062d\u0633\u0627\u0628 \u062b\u0627\u0628\u062a';L.fa.strategy_auto='\u0627\u0646\u062a\u062e\u0627\u0628 \u062e\u0648\u062f\u06a9\u0627\u0631';L.fa.strategy_rotation='\u0686\u0631\u062e\u0634 \u06af\u0641\u062a\u200c\u0648\u06af\u0648\u0647\u0627 \u0645\u06cc\u0627\u0646 \u062d\u0633\u0627\u0628\u200c\u0647\u0627\u06cc \u0627\u0646\u062a\u062e\u0627\u0628\u200c\u0634\u062f\u0647';L.fa.strategy_failover='\u062d\u0633\u0627\u0628 \u0627\u0635\u0644\u06cc\u060c \u0633\u067e\u0633 \u062c\u0627\u06cc\u06af\u0632\u06cc\u0646\u06cc \u0627\u0645\u0646 \u062f\u0631 \u062e\u0637\u0627\u06cc \u0642\u0627\u0628\u0644\u200c\u062a\u06a9\u0631\u0627\u0631';L.fa.strategy_latency='\u06a9\u0645\u062a\u0631\u06cc\u0646 \u0632\u0645\u0627\u0646 \u067e\u0627\u0633\u062e \u0627\u0646\u062f\u0627\u0632\u0647\u200c\u06af\u06cc\u0631\u06cc\u200c\u0634\u062f\u0647';L.fa.strategy_best_fit='\u0627\u0646\u062a\u062e\u0627\u0628 \u0645\u0646\u0627\u0633\u0628\u200c\u062a\u0631 \u0628\u0631\u0627\u06cc \u062f\u0631\u062e\u0648\u0627\u0633\u062a';L.fa.strategy_manual='\u067e\u06cc\u0634 \u0627\u0632 \u062a\u063a\u06cc\u06cc\u0631 \u062d\u0633\u0627\u0628 \u062a\u0623\u06cc\u06cc\u062f \u0628\u06af\u06cc\u0631';L.fa.strategy_policy='\u0631\u0648\u0634 \u0627\u0646\u062a\u062e\u0627\u0628 \u062d\u0633\u0627\u0628';L.fa.strategy_saved='\u0633\u06cc\u0627\u0633\u062a \u0645\u0633\u06cc\u0631\u06cc\u0627\u0628\u06cc \u0630\u062e\u06cc\u0631\u0647 \u0634\u062f.';L.fa.strategy_empty='\u062d\u062f\u0627\u0642\u0644 \u06cc\u06a9 \u062d\u0633\u0627\u0628 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f.';L.fa.strategy_choose_one='\u0645\u0633\u06cc\u0631\u06cc\u0627\u0628\u06cc \u062b\u0627\u0628\u062a \u0628\u0647 \u062f\u0642\u06cc\u0642\u0627\u064b \u06cc\u06a9 \u062d\u0633\u0627\u0628 \u0646\u06cc\u0627\u0632 \u062f\u0627\u0631\u062f.';L.fa.strategy_needs_two='\u0627\u06cc\u0646 \u0631\u0648\u0634 \u062d\u062f\u0627\u0642\u0644 \u0628\u0647 \u062f\u0648 \u062d\u0633\u0627\u0628 \u0627\u0646\u062a\u062e\u0627\u0628\u200c\u0634\u062f\u0647 \u0646\u06cc\u0627\u0632 \u062f\u0627\u0631\u062f.';L.fa.profile_disconnected='\u0642\u0637\u0639';L.fa.profile_connected='\u0645\u062a\u0635\u0644';L.fa.profile_none='\u0647\u0646\u0648\u0632 \u067e\u0631\u0648\u0641\u0627\u06cc\u0644 Chrome \u062c\u0641\u062a \u0646\u0634\u062f\u0647 \u0627\u0633\u062a\u061b \u0627\u0628\u062a\u062f\u0627 \u0627\u0632 \u0628\u0627\u0644\u0627 \u06cc\u06a9\u06cc \u0631\u0627 \u0648\u0635\u0644 \u06a9\u0646\u06cc\u062f.';L.fa.profile_changed='\u067e\u0631\u0648\u0641\u0627\u06cc\u0644 \u062d\u0633\u0627\u0628 \u0630\u062e\u06cc\u0631\u0647 \u0634\u062f.';
+L.en.workspace_key_label='Bridge API key';L.fa.workspace_key_label='کلید API در Bridge';
+L.en.add_hint='After confirming login, Claude Code can use that account through the assigned personal Chrome profile. Learning is optional and can add a faster request protocol later.';
+L.fa.add_hint='\u0628\u0639\u062f \u0627\u0632 \u062a\u0623\u06cc\u06cc\u062f \u0648\u0631\u0648\u062f\u060c Claude Code \u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u062f \u0647\u0645\u0627\u0646 \u062d\u0633\u0627\u0628 \u0631\u0627 \u0627\u0632 \u067e\u0631\u0648\u0641\u0627\u06cc\u0644 Chrome \u0634\u062e\u0635\u06cc\u0650 \u062a\u062e\u0635\u06cc\u0635\u200c\u06cc\u0627\u0641\u062a\u0647 \u0627\u0633\u062a\u0641\u0627\u062f\u0647 \u06a9\u0646\u062f. \u06cc\u0627\u062f\u06af\u06cc\u0631\u06cc \u0627\u062e\u062a\u06cc\u0627\u0631\u06cc \u0627\u0633\u062a \u0648 \u0628\u0639\u062f\u0627\u064b \u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u062f \u0645\u0633\u06cc\u0631 \u0633\u0631\u06cc\u0639\u200c\u062a\u0631 \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0631\u0627 \u0627\u0636\u0627\u0641\u0647 \u06a9\u0646\u062f.';
+L.en.strategy_hint='Choose accounts Claude Code may use and how it selects them. A saved login marked needs_learning is still usable through its assigned personal Chrome profile. Optional learning can add a faster site protocol; it never switches this account to Playwright.';
+L.fa.strategy_hint='\u062d\u0633\u0627\u0628\u200c\u0647\u0627\u06cc \u0645\u062c\u0627\u0632 Claude Code \u0648 \u0631\u0648\u0634 \u0627\u0646\u062a\u062e\u0627\u0628 \u0631\u0627 \u0645\u0634\u062e\u0635 \u06a9\u0646. \u062d\u0633\u0627\u0628 \u0648\u0627\u0631\u062f\u0634\u062f\u0647 \u0628\u0627 \u0648\u0636\u0639\u06cc\u062a needs_learning \u0647\u0645 \u0627\u0632 \u067e\u0631\u0648\u0641\u0627\u06cc\u0644 Chrome \u0634\u062e\u0635\u06cc\u0650 \u062a\u062e\u0635\u06cc\u0635\u200c\u06cc\u0627\u0641\u062a\u0647 \u0642\u0627\u0628\u0644 \u0627\u0633\u062a\u0641\u0627\u062f\u0647 \u0627\u0633\u062a. \u06cc\u0627\u062f\u06af\u06cc\u0631\u06cc \u0627\u062e\u062a\u06cc\u0627\u0631\u06cc \u0627\u0633\u062a \u0648 \u0645\u0633\u06cc\u0631 \u0633\u0631\u06cc\u0639\u200c\u062a\u0631 \u0633\u0627\u06cc\u062a \u0631\u0627 \u0627\u0636\u0627\u0641\u0647 \u0645\u06cc\u200c\u06a9\u0646\u062f\u061b \u0627\u06cc\u0646 \u062d\u0633\u0627\u0628 \u0628\u0647 Playwright \u0645\u0646\u062a\u0642\u0644 \u0646\u0645\u06cc\u200c\u0634\u0648\u062f.';
 let lang=localStorage.lang||'fa';const t=k=>(L[lang]&&L[lang][k])??L.en[k]??k;
+function setTheme(v){if(v==='system')document.documentElement.removeAttribute('data-theme');else document.documentElement.dataset.theme=v;localStorage.setItem('theme',v)}
 const STAGES=['open','login','learn','analyse','verify','finish'];
-const VIEWS=[['accounts','accounts'],['connect','connect'],['sites','sites'],['settings','settings'],['adv','advanced'],['log','log']];let view='accounts';
-let S=null,C=null,O=null,O12E='',tab='claude-ps',editing=false,openDet=new Set();
+const VIEWS=[['accounts','accounts'],['connect','connect'],['sites','sites'],['settings','settings'],['log','log']];let view='accounts';
+let S=null,C=null,RL=null,O=null,O12E='',RC=null,routePoolDraft=null,routeKindDraft='',tab='claude-ps',editing=false,openDet=new Set();
 function setLang(l){lang=l;localStorage.lang=l;document.documentElement.lang=l;document.documentElement.dir=l=='fa'?'rtl':'ltr';$('langbtn').textContent=l=='fa'?'English':'فارسی';
-document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));document.querySelectorAll('[data-ph]').forEach(e=>e.placeholder=t(e.dataset.ph));
+document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));document.querySelectorAll('[data-ph]').forEach(e=>e.placeholder=t(e.dataset.ph));$('workflow-title').textContent=l==='fa'?'از اینجا شروع کن':'Start here';$('workflow-steps').textContent=l==='fa'?'۱) پروفایل Chrome موردنظرت را باز کن و به سایت هوش مصنوعی برو. ۲) افزونه Bridge را باز کن و «افزودن حساب از زبانه‌ی فعلی» را بزن. ۳) اگر لازم بود وارد شو و در همان زبانه «وارد شدم — تأیید» را بزن. ۴) حالا Claude Code می‌تواند از همان تب Chrome استفاده کند؛ «شروع یادگیری» فقط برای ساخت مسیر سریع‌تر و اختیاری است.':'1) Open the Chrome profile you want and visit the AI site. 2) Open the Bridge extension and choose “Add this site from current tab.” 3) Sign in if needed, then confirm from that same tab. 4) Claude Code can now use that Chrome tab; “Start learning” is optional and builds a faster protocol.';$('workflow-note').textContent=l==='fa'?'وضعیت needs_learning یعنی ورود ذخیره شده اما پروتکل سریع هنوز ساخته نشده؛ مسیر UI در همان Chrome شخصی آماده‌ی استفاده است. یادگیری را فقط اگر خواستی اجرا کن.':'needs_learning means the login is saved but the fast protocol is not built yet; the assigned personal Chrome UI is ready to use. Start learning only if you choose.';
 if(S&&S.presets&&$('preset').options.length)$('preset').options[0].textContent=t('preset');navRender();render();renderCtx()}
 function navRender(){$('nav').innerHTML=VIEWS.map(v=>`<button class="${v[0]==view?'on':''}" onclick="go('${v[0]}')">${esc(t(v[1]))}</button>`).join('')}
-function go(v){view=v;document.querySelectorAll('.view').forEach(e=>e.classList.toggle('on',e.id=='v_'+v));navRender()}
-function snippets(k,port){const u='http://127.0.0.1:'+port;return{'claude-ps':`$env:ANTHROPIC_BASE_URL="${u}"\n$env:ANTHROPIC_API_KEY="${k}"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nclaude`,
-'claude-sh':`export ANTHROPIC_BASE_URL=${u}\nexport ANTHROPIC_API_KEY=${k}\nexport CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
-'claude-cmd':`set ANTHROPIC_BASE_URL=${u}\nset ANTHROPIC_API_KEY=${k}\nset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
+function go(v){view=v;document.querySelectorAll('.view').forEach(e=>e.classList.toggle('on',e.id=='v_'+v||(v=='accounts'&&e.id=='v_adv')));navRender()}
+function snippets(k,port,model){const u='http://127.0.0.1:'+port;return{'claude-ps':`Remove-Item Env:ANTHROPIC_DEFAULT_SONNET_MODEL,Env:ANTHROPIC_DEFAULT_OPUS_MODEL,Env:ANTHROPIC_DEFAULT_HAIKU_MODEL -ErrorAction SilentlyContinue\n$env:ANTHROPIC_BASE_URL="${u}"\n$env:ANTHROPIC_API_KEY="${k}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nclaude`,
+'claude-sh':`unset ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL\nexport ANTHROPIC_BASE_URL=${u}\nexport ANTHROPIC_API_KEY=${k}\nexport ANTHROPIC_MODEL=sonnet\nexport CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
+'claude-cmd':`set ANTHROPIC_DEFAULT_SONNET_MODEL=\nset ANTHROPIC_DEFAULT_OPUS_MODEL=\nset ANTHROPIC_DEFAULT_HAIKU_MODEL=\nset ANTHROPIC_BASE_URL=${u}\nset ANTHROPIC_API_KEY=${k}\nset ANTHROPIC_MODEL=sonnet\nset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
 'openai':`Base URL : ${u}/v1\nAPI key  : ${k}\nModel    : bridge-auto   (or acct:<id> / the exact account label to force one account)\n\nCursor / VS Code agents / Continue / Cline / any OpenAI-compatible client:\nuse the "OpenAI compatible" provider with the values above.`}}
 const names={'claude-ps':'Claude Code (PowerShell)','claude-sh':'Claude Code (bash)','claude-cmd':'Claude Code (cmd)','openai':'Cursor / VS Code / OpenAI-compatible'};
 const mmss=s=>{s=Math.max(0,Math.floor(s));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
@@ -18965,11 +21774,14 @@ function jobOf(a){const js=(S.jobs||[]).filter(j=>j.account===a.id);return js[js
 function stepper(j){const cur=Math.max(0,STAGES.indexOf(j.stage)),fin=j.done&&j.ok;
 return '<ol class="steps">'+STAGES.map((s,i)=>{let c=fin||i<cur?'done':(i==cur?(j.done?'bad':'cur'):'');return `<li class="${c}"><i>${c=='done'?'✓':(c=='bad'?'✕':i+1)}</i><div>${esc(t('st_'+s))}</div></li>`}).join('')+'</ol>'}
 function failHint(e){e=String(e||'');if(/verification step|human check|not completed in time/i.test(e))return t('h_check');if(/closed|TargetClosed/i.test(e))return t('h_closed');return t('h_generic')}
+function profileOptions(current){const ps=S.pc_profiles||[];return `<option value="">${esc(t('profile_any'))}</option>`+ps.map(p=>`<option value="${esc(p.id)}" ${current===p.id?'selected':''}>${esc(p.name)}${p.connected?' · '+esc(t('profile_connected')):''}</option>`).join('')+(current&&!ps.some(p=>p.id===current)?`<option value="${esc(current)}" selected>${esc(current)} · ${esc(t('profile_disconnected'))}</option>`:'')}
 function accCard(a){const j=jobOf(a),run=j&&!j.done,fail=j&&j.done&&!j.ok&&a.state!=='ready',att=run&&j.attention&&j.attention.kind?j.attention:null;
-let s;if(run)s=att?'needs_you':'learning';else if(a.human)s='needs_you';else if(fail)s='failed';else if(a.state==='ready')s=a.cooling?'cooling':'ready';else if(a.state==='login_required')s='needs_login';else if(a.state==='learning')s='learning';else s=a.state||'learning';
+let s;if(run)s=att?'needs_you':'learning';else if(a.human)s='needs_you';else if(fail)s='failed';else if(a.state==='ready')s=a.cooling?'cooling':'ready';else if(a.state==='login_required')s='needs_login';else if(a.state==='needs_learning')s='needs_learning';else if(a.state==='learning')s='learning';else s=a.state||'learning';
 const label=t('s_'+s)==='s_'+s?s:t('s_'+s);let h=`<div class="card acc s-${esc(s)}"><div class="top"><div class="grow"><b>${esc(a.label)}</b> <span class="mut ltr">${esc(a.host)}</span> ${S.default_account==a.id?`<span class="b">${esc(t('def'))}</span>`:''}</div>`+
 (a.tier?`<span class="b ${esc(a.tier)}" title="${esc(t('m_'+a.tier))}">${esc(t('m_'+a.tier))}</span>`:'')+`<span class="stt">● ${esc(label)}${a.cooling?' '+esc(a.cooling)+'s':''}</span></div>`;
-if(a.type!=='api'){const v=a.serving||{mode:'auto',browser:false,direct:false};h+=`<div class="row"><label class="mut">${esc(t('transport'))}</label><select aria-label="${esc(t('transport'))}" onchange="setServingMode(${escJ(a.id)},this.value)"><option value="auto" ${v.mode==='auto'?'selected':''}>${esc(t('mode_auto'))}</option><option value="browser" ${v.mode==='browser'?'selected':''} ${!v.browser&&v.mode!=='browser'?'disabled':''}>${esc(t('mode_browser'))}</option><option value="direct" ${v.mode==='direct'?'selected':''} ${!v.direct&&v.mode!=='direct'?'disabled':''}>${esc(t('mode_direct'))}</option></select>${!v.direct?`<span class="mut">${esc(t('mode_unavailable'))}</span>`:''}</div>`}
+if(a.type!=='api'){const v=a.serving||{mode:'auto',browser:false,direct:false};h+=`<div class="row"><label class="mut">${esc(t('transport'))}</label><select aria-label="${esc(t('transport'))}" onchange="setServingMode(${escJ(a.id)},this.value)"><option value="auto" ${v.mode==='auto'?'selected':''}>${esc(t('mode_auto'))}</option><option value="browser" ${v.mode==='browser'?'selected':''} ${!v.browser&&v.mode!=='browser'?'disabled':''}>${esc(t('mode_browser'))}</option><option value="direct" ${v.mode==='direct'?'selected':''} ${!v.direct&&v.mode!=='direct'?'disabled':''}>${esc(t('mode_direct'))}</option></select>${!v.direct?`<span class="mut">${esc(t('mode_unavailable'))}</span>`:''}<label class="f mut"><input type="checkbox" ${a.disabled?'':'checked'} onchange="o12Toggle(${escJ(a.id)},this.checked)"> ${esc(t('b_use'))}</label><label class="mut">${esc(t('profile_assign'))}</label><select class="profile-assign" aria-label="${esc(t('profile_assign'))}" onchange="setAccountProfile(${escJ(a.id)},this.value)">${profileOptions(a.pc_client_id||'')}</select></div>`}
+else h+=`<div class="row"><label class="f mut"><input type="checkbox" ${a.disabled?'':'checked'} onchange="o12Toggle(${escJ(a.id)},this.checked)"> ${esc(t('b_use'))}</label></div>`;
+const mc=a.model_choice||{},ms=mc.selector||{},choice=mc.choice||{};if(ms.present){h+=`<div class="row"><label class="mut">${esc(t('choose_model'))}</label><select aria-label="${esc(t('choose_model'))}" onchange="setModelChoice(${escJ(a.id)},this.value)"><option value="" ${choice.mode==='fixed'?'':'selected'}>${esc(t('default_model'))}</option>${ms.options.map(o=>`<option value="${esc(o.id)}" ${choice.mode==='fixed'&&choice.variant===o.id?'selected':''}>${esc(o.display)} · ${esc(o.mode||'default')}</option>`).join('')}</select></div>`}
 if(run){h+=stepper(j);const p=j.progress||{};const info=(j.stage=='learn'&&p.total)?`${t('probe')} ${p.cur}/${p.total}`:(j.stage=='analyse'&&p.total?`${t('round')} ${p.cur}/${p.total}`:'');
 h+=`<div class="mut">${esc(t('d_'+j.stage))} ${info?'<b>'+esc(info)+'</b>':''} · ${esc(t('elapsed'))} ${mmss(Date.now()/1000-j.started)}</div>`;if(p.total)h+=`<div class="bar"><div style="width:${Math.round(100*p.cur/p.total)}%"></div></div>`}
 if(att){const kd=att.kind=='first_msg'?'a_first':(att.kind=='login'?'a_login':'a_check'),lg=kd!='a_check';h+=`<div class="att"><b>${esc(t(kd+'_t'))}</b> <span class="mut">(${mmss(Date.now()/1000-att.since)})</span><div>${esc(t(kd+'_b'))}</div>`+(lg?'':`<div class="mut" style="margin-top:4px">${esc(t('a_check_h'))}</div>`)+
@@ -18983,20 +21795,34 @@ if(a.learn_budget)det.push(`<div class="mut ltr">learning used ${esc(a.learn_bud
 if(a.native_learning){const n=a.native_learning;det.push(`<div class="mut ltr">native path: ${esc(n.status||'unknown')}${n.rounds!=null?` · rounds ${esc(n.rounds)}`:''}${n.requests!=null?` · Brain requests ${esc(n.requests)}/${esc(n.budget??'?')}`:''}${n.review?` · review ${esc(n.review.outcome||'unknown')} (${esc(n.review.confirmed_defects||0)} confirmed)`:''}${n.gates?.length?` · gates ${esc(n.gates.join(', '))}`:''}${n.reason?` · ${esc(n.reason)}`:''}</div>`)}
 det.push(`<div class="mut ltr">${a.requests||0}${a.inflight?' ('+a.inflight+' live)':''} ${esc(t('req'))} · ${a.fail||0} ${esc(t('fails'))}${a.ema_ms?' · '+(a.ema_ms/1000).toFixed(1)+'s avg':''}${a.health?(a.health.ok?' · '+esc(t('healthy')):' · '+esc(t('unhealthy'))):''}</div>`);
 h+=`<details data-id="${esc(a.id)}" ${openDet.has(a.id)?'open':''} ontoggle="togDet(this)"><summary>${esc(t('details'))}</summary>${det.join('')}</details>`;
-h+=`<div class="acts">`+(a.type=='api'?'':`<button class="sm" onclick="act(${escJ(a.id)},'relogin')">${esc(t('b_relogin'))}</button><button class="sm" onclick="act(${escJ(a.id)},'relearn')">${esc(t('b_relearn'))}</button>`+(a.tier=='direct'?'':`<button class="sm" onclick="recheckDirect(${escJ(a.id)})">${esc(t('b_recheck'))}</button>`))+
+h+=`<div class="acts">`+(a.type=='api'?'':`<button class="sm" onclick="testAccount(${escJ(a.id)})">${lang==='fa'?'آزمایش اتصال':'Test connection'}</button><button class="sm" onclick="act(${escJ(a.id)},'relogin')">${esc(t('b_relogin'))}</button><button class="sm ${a.state==='needs_learning'?'p':''}" onclick="act(${escJ(a.id)},'relearn')">${esc(t(a.state==='needs_learning'?'b_start_learn':'b_relearn'))}</button>`+(a.tier=='direct'?'':`<button class="sm" onclick="recheckDirect(${escJ(a.id)})">${esc(t('b_recheck'))}</button>`))+
 `<button class="sm" onclick="act(${escJ(a.id)},'default')">${esc(t('b_default'))}</button><button class="sm d" onclick="delAcc(${escJ(a.id)})">${esc(t('b_remove'))}</button></div></div>`;return h}
 function togDet(el){const id=el.dataset.id;if(el.open)openDet.add(id);else openDet.delete(id)}
 function render(){if(!S)return;$('st').textContent=t('running')+S.port;$('sts').textContent=S.stats.requests+' requests · '+S.stats.errors+' '+t('errors');
 $('acc').innerHTML=S.accounts.map(accCard).join('')||`<div class="card mut">${esc(t('no_acc'))}</div>`;
+const profiles=S.pc_profiles||[];$('pc_profile_status').textContent=profiles.length?profiles.map(p=>`${p.name}: ${p.connected?t('profile_connected'):t('profile_disconnected')}`).join(' · '):t('profile_none');
+$('pc_profiles_list').innerHTML=profiles.map(p=>`<div class="pool-item"><b>${esc(p.name)}</b><span class="mut ltr">${esc(p.id.slice(0,12))}</span><span class="b ${p.connected?'ready':'learning'}">${esc(t(p.connected?'profile_connected':'profile_disconnected'))}</span></div>`).join('')||`<p class="mut">${esc(t('profile_none'))}</p>`;
+const ap=$('account_profile'),oldProfile=ap.value;ap.innerHTML=profileOptions('');if(oldProfile)ap.value=oldProfile;else if(profiles.length)ap.value=profiles[0].id;
+renderStrategy();
 if(!editing){const ks=$('keysel'),cur=ks.value;ks.innerHTML=S.keys.map(k=>`<option value="${esc(k.key)}">${esc(k.label)}</option>`).join('');if(cur)ks.value=cur;
 $('kacc').innerHTML=`<option value="">${esc(t('any_acc'))}</option>`+S.accounts.map(a=>`<option value="${esc(a.id)}">${esc(a.label)}</option>`).join('')}
 $('keys').innerHTML=S.keys.map(k=>`<tr><td><b>${esc(k.label)}</b>${k.account?` <span class="b">→ ${esc((S.accounts.find(a=>a.id==k.account)||{}).label||k.account)}</span>`:''}<div class="k">${esc(k.key)}</div></td><td style="text-align:end"><button class="sm" onclick="navigator.clipboard.writeText(${escJ(k.key)})">${esc(t('c_copy'))}</button> <button class="sm d" onclick="delKey(${escJ(k.id)})">${esc(t('c_revoke'))}</button></td></tr>`).join('');
+ $('workspace_key').innerHTML=(S.keys.length?S.keys.map(k=>{const pin=k.account?(S.accounts.find(a=>a.id===k.account)||{}).label:'';return `<option value="${esc(k.id)}">${esc(k.label)}${pin?' · '+esc(pin):''} · ${esc(k.key.slice(0,8))}…</option>`}).join(''):`<option value="">${esc(t('workspace_key_none'))}</option>`);
+if(!$('workspace_key').value&&S.keys.length)$('workspace_key').value=S.keys[0].id;
+$('workspace_app').value=localStorage.workspaceApp||'claude';$('workspace_path').value=localStorage.workspacePath||'';updateWorkspaceCommand();
 $('rec').innerHTML=S.recipes.map(r=>`<tr><td class="ltr">${esc(r.host)}</td><td><span class="b ${esc(r.tier)}">${esc(r.tier)}</span></td><td>${r.continuity?t('yes'):t('no')}</td><td style="text-align:end"><button class="sm" onclick="showDoc(${escJ(r.host)})">${esc(t('docs'))}</button> <button class="sm" onclick="getTool(${escJ(r.host)})">${esc(t('tool'))}</button> <button class="sm" onclick="expRec(${escJ(r.host)})">${esc(t('export'))}</button> <button class="sm d" onclick="delRec(${escJ(r.host)})">${esc(t('forget'))}</button></td></tr>`).join('')||`<tr><td class="mut" colspan="4">-</td></tr>`;
 $('tabs').innerHTML=Object.keys(names).map(x=>`<button class="sm ${x==tab?'p':''}" onclick="tab='${x}';render()">${names[x]}</button>`).join('');
-$('snip').textContent=snippets($('keysel').value||(S.keys[0]||{}).key||'',S.port)[tab];
+const selectedKey=S.keys.find(k=>k.key===$('keysel').value)||(S.keys[0]||{}),selectedModel=selectedKey.account?'acct:'+selectedKey.account:((RC&&RC.config&&RC.config.policies&&RC.config.policies['user-claude-pool'])?'bridge-pool/user-claude-pool':'bridge-auto');$('snip').textContent=snippets(selectedKey.key||'',S.port,selectedModel)[tab];
 const s=S.settings;if(document.activeElement.tagName!='INPUT'){$('s_cont').checked=s.continuity;$('s_tool').value=s.tool_desc_limit;$('s_sys').value=s.system_limit;$('s_res').value=s.result_limit;$('s_his').value=s.history_limit;$('s_idle').value=s.headless_idle_seconds;$('s_sum').checked=s.summarize_history;$('s_hc').value=s.health_interval_min;$('s_cache').value=s.cache_seconds}
 $('home').textContent='Data folder: '+S.home}
 async function setServingMode(id,mode){try{await api('accounts/'+encodeURIComponent(id)+'/serving-mode','POST',{mode});await tick()}catch(e){alert(errMsg(e));await tick()}}
+async function setModelChoice(id,variant){try{if(variant)await api('accounts/'+encodeURIComponent(id)+'/model-choice','POST',{mode:'fixed',variant});else await api('accounts/'+encodeURIComponent(id)+'/model-choice','DELETE');await tick()}catch(e){alert(errMsg(e));await tick()}}
+async function setAccountProfile(id,clientId){try{await api('accounts/'+encodeURIComponent(id)+'/chrome-profile','POST',{client_id:clientId});$('strategy_status').textContent=t('profile_changed');await tick()}catch(e){alert(errMsg(e));await tick()}}
+function renderStrategy(){if(!S)return;const accts=S.accounts.filter(a=>!a.disabled),policies=(RC&&RC.config&&RC.config.policies)||{};const current=policies['user-claude-pool'];if(routePoolDraft===null)routePoolDraft=(current&&current.members||[]).map(x=>String(x).replace(/^acct:/,'').split('/')[0]);if(!routeKindDraft)routeKindDraft=current&&current.kind||'auto';const kind=$('strategy_kind');if(kind&&kind.value!==routeKindDraft)kind.value=routeKindDraft;
+$('strategy_accounts').innerHTML=accts.map(a=>`<div class="pool-item"><label class="grow"><input type="checkbox" value="${esc(a.id)}" ${routePoolDraft.includes(a.id)?'checked':''} onchange="toggleRouteAccount(this)"><b>${esc(a.label)}</b><br><span class="mut ltr">${esc(a.host)}</span></label><span class="b ${a.state==='ready'?'ready':'learning'}">${esc(a.state==='needs_learning'?(lang==='fa'?'نیازمند یادگیری':'needs_learning'):(a.state||''))}</span>${a.state==='needs_learning'?`<button class="sm p" onclick="act(${escJ(a.id)},'relearn')">${lang==='fa'?'شروع یادگیری':'Start learning'}</button>`:''}<button class="sm d" title="${lang==='fa'?'حذف کامل حساب':'Delete account'}" onclick="delAcc(${escJ(a.id)})">${lang==='fa'?'حذف':'Remove'}</button></div>`).join('')||`<p class="mut">${esc(t('no_acc'))}</p>`;
+const sel=$('strategy_kind');if(sel)routeKindDraft=sel.value;}
+function toggleRouteAccount(el){const id=el.value;routePoolDraft=routePoolDraft||[];routePoolDraft=el.checked?[...new Set([...routePoolDraft,id])]:routePoolDraft.filter(x=>x!==id)}
+async function saveStrategy(){const members=[...(routePoolDraft||[])].filter(id=>S.accounts.some(a=>a.id===id&&!a.disabled)).map(id=>'acct:'+id);if(!members.length){$('strategy_status').textContent=t('strategy_empty');return}const kind=$('strategy_kind').value;if(kind==='fixed'&&members.length!==1){$('strategy_status').textContent=t('strategy_choose_one');return}if((kind==='failover'||kind==='rotation')&&members.length<2){$('strategy_status').textContent=t('strategy_needs_two');return}const config={...(RC&&RC.config||{}),policies:{...((RC&&RC.config&&RC.config.policies)||{})}};let policy={kind,profile:'balanced',members};if(kind==='rotation'){policy={kind,profile:'balanced',members,strategy:'round_robin',unit:'conversation'}}else if(kind==='failover'){policy={kind,profile:'balanced',primary:members[0],backups:members.slice(1)}}config.policies['user-claude-pool']=policy;config.client_models=(config.client_models||[]).filter(r=>!(r&&r.match==='exact'&&['sonnet','opus','haiku'].includes(String(r.value||'').toLowerCase())));for(const value of ['sonnet','opus','haiku'])config.client_models.push({match:'exact',value,to:'bridge-pool/user-claude-pool'});try{await api('routing','POST',config);RC={...(RC||{}),config};routePoolDraft=members.map(x=>x.replace(/^acct:/,''));routeKindDraft=kind;$('strategy_status').textContent=t('strategy_saved');renderStrategy();updateWorkspaceCommand()}catch(e){$('strategy_status').textContent=errMsg(e)}}
  $('rep_show').onclick=async()=>{let h=$('rep_host').value.trim();if(!h)return;try{if(/^https?:\/\//i.test(h))h=new URL(h).hostname;if(!/^[a-z0-9.:[\]-]+$/i.test(h)||h.includes('..'))throw new Error('Enter a site hostname or URL, such as claude.ai');$('rep_host').value=h;$('rep_out').style.display='block';const r=await api('analysis/'+encodeURIComponent(h)+'/report');$('rep_out').textContent=r.markdown||'no report yet for this site'}catch(e){$('rep_out').style.display='block';$('rep_out').textContent='✘ '+e.message}};
 let reqOffset=0,reqTotal=0;async function showRequests(offset=0){let h=$('rep_host').value.trim();if(!h)return;if(/^https?:\/\//i.test(h))h=new URL(h).hostname;$('rep_host').value=h;reqOffset=Math.max(0,offset);try{const r=await api('analysis/'+encodeURIComponent(h)+'/requests?offset='+reqOffset+'&limit=100');reqTotal=r.total||0;$('req_out').style.display='block';$('req_nav').hidden=false;$('req_page').textContent=(reqTotal?`${reqOffset+1}-${Math.min(reqOffset+r.rows.length,reqTotal)}`:'0')+' / '+reqTotal;$('req_prev').disabled=reqOffset===0;$('req_next').disabled=reqOffset+r.rows.length>=reqTotal;$('req_out').innerHTML=(r.rows||[]).map(x=>`<details class="card"><summary><b>#${esc(x.seq??'')} ${esc(x.method)} ${esc(x.status||'')}</b> <span class="ltr mut">${esc(x.url)}</span> <span class="mut">${esc(x.type)} · ${esc(x.duration_s??'')}s</span></summary><div class="ltr"><b>Request (${esc(x.request_format)}):</b><pre class="mini">${esc(x.request||'(no text preview)')}</pre><b>Response (${esc(x.response_format)}):</b><pre class="mini">${esc(x.response||'(no text preview)')}</pre>${x.failed?'<div class="err">'+esc(x.failed)+'</div>':''}</div></details>`).join('')||'<p class="mut">No captured requests for this site.</p>'}catch(e){$('req_out').style.display='block';$('req_out').textContent='✘ '+errMsg(e)}}
 $('req_show').onclick=()=>showRequests(0);$('req_prev').onclick=()=>showRequests(reqOffset-100);$('req_next').onclick=()=>showRequests(reqOffset+100);
@@ -19009,7 +21835,7 @@ $('dir_meta').textContent=D.label;const cs=$('dir_cat');if(cs.options.length<2){
 const q=$('dir_q').value.trim().toLowerCase(),cat=cs.value;
 const L=D.entries.filter(e=>(!cat||e.category==cat)&&(!q||(e.name+' '+e.host+' '+(e.notes||'')).toLowerCase().includes(q)));
 $('dir_rows').innerHTML=L.map(e=>`<tr><td class="k">${esc(e.name)}<br><span class="mut ltr">${esc(e.url)}</span>${e.notes?'<br><span class="mut">'+esc(e.notes)+'</span>':''}</td><td>${esc(e.category)}</td><td><span class="b ${e.status=='added'?'ready':(e.status=='needs login'?'direct':'learning')}">${esc(e.status)}</span><br><span class="mut">verified: ${esc(e.verified_at||'not verified')}</span></td><td class="mut">${esc(e.how_to_add)}</td><td>${e.category=='api_compatible'||e.status!='not added'?'':`<button class="sm p" onclick="dirStart('${esc(e.id)}')">Add account</button> `}<button class="sm" onclick="dirDel('${esc(e.id)}')">Remove</button></td></tr>`).join('')||'<tr><td class="mut" colspan="5">No sites match</td></tr>'}
-async function dirStart(id){const e=(D.entries||[]).find(x=>x.id==id);if(!e)return;try{await api('accounts','POST',{url:e.url,label:e.name})}catch(x){alert(errMsg(x))}loadDir();tick()}
+async function dirStart(id){const e=(D.entries||[]).find(x=>x.id==id);if(!e)return;try{await api('accounts','POST',{url:e.url,label:e.name,learn:false,manual_login:true,pc_client_id:$('account_profile').value})}catch(x){alert(errMsg(x))}loadDir();tick()}
 async function dirDel(id){if(!confirm('Remove this entry from the directory? (accounts are not touched)'))return;try{await api('directory/'+encodeURIComponent(id),'DELETE')}catch(x){alert(errMsg(x))}loadDir()}
 async function dirAdd(){try{await api('directory','POST',{name:$('dir_name').value,url:$('dir_url').value,category:$('dir_newcat').value});$('dir_name').value='';$('dir_url').value=''}catch(x){alert(errMsg(x))}loadDir()}
 const fmtT=t=>t?new Date(t*1000).toLocaleString():'-';
@@ -19023,7 +21849,15 @@ let vt='-';if(v){vt=esc(v.runs_ok)+'/'+esc(v.runs_total)+' runs ok · need '+esc
 if(rp)vt+='<br><span class="mut">repair: '+esc(rp.status)+' (attempts '+esc(rp.attempts??0)+')</span>';
 let st='-';if(sp){st=esc((sp.did||[]).join(', ')||'nothing due');if(sp.skipped)st+='<br><span class="mut">skipped: '+esc(sp.skipped)+'</span>';if(sp.error)st+='<br><span class="mut">error: '+esc(sp.error)+'</span>'}
 return `<tr><td class="k">${esc(a.label||a.id)}<br><span class="mut">${esc(a.host)} · tier ${esc(a.tier||'-')}</span></td><td><span class="b ${stB(l.state)}">${esc(l.state||'-')}</span><br><span class="mut">${esc(l.reason||'')}</span></td><td>${vt}</td><td>${st}</td><td><button class="sm" onclick="o12Toggle('${esc(a.id)}',${a.disabled?'true':'false'})">${a.disabled?'Enable':'Disable'}</button> <button class="sm" onclick="recheckDirect('${esc(a.id)}')">Re-check direct</button></td></tr>`}).join('')||'<tr><td class="mut" colspan="5">No browser accounts yet</td></tr>'}
-function renderCtx(){if(!C)return;const x=C.tokenizer||{};
+let RD=null,RDE='';
+function renderDecisions(){const body=$('decision_rows');if(!RD){$('decision_meta').textContent=RDE?'Could not load routing decisions: '+RDE:'Loading recent decisions…';body.innerHTML='';return}const rows=RD.decisions||[];$('decision_meta').textContent=rows.length?'Recent route choices. Prompts and credentials are never shown here.':'No requests have been routed in this session yet.';body.innerHTML=rows.map(d=>{const s=d.selected||{},ex=(d.excluded||[]).slice(0,3).map(x=>x.code||x.reason||'').filter(Boolean).join(', '),account=(S.accounts.find(a=>a.id===s.account)||{}).label||s.account||'-';return `<tr><td class="mut">${esc(fmtT(d.ts))}</td><td class="k">${esc(d.requested_model||'-')}</td><td>${esc(account)}<br><span class="mut k">${esc(s.variant||s.route||'-')}</span></td><td>${esc(d.policy||'default')} · ${esc(d.policy_kind||'auto')}</td><td><span class="b ${d.outcome==='ok'?'ready':'learning'}">${esc(d.outcome||'pending')}</span></td><td>${d.fallback?'fallback · ':''}${esc(ex||'-')}</td></tr>`}).join('')||'<tr><td class="mut" colspan="6">No decisions yet.</td></tr>'}
+function renderRel(){if(!RL)return;const s=RL.settings||{};$('rel_meta').textContent='end marker '+(s.end_marker?'on':'off')+' · network text '+(s.net_text?'on':'off')+' · schema '+s.schema_validation+' · tools per turn '+s.tools_per_turn_max+' · probe every '+((RL.probe||{}).hours||0)+' h · recorded replies '+((RL.replay||{}).cases||0);
+$('rel_rows').innerHTML=(RL.hosts||[]).map(r=>`<tr><td class="k">${esc(r.host)}</td><td>${esc(r.parse_ok_pct??'-')}% <span class="mut">of ${esc(r.tool_attempts)}</span></td><td>${esc(r.cut_off_pct??'-')}%</td><td>${esc(r.retries)}</td><td>${esc(r.marker_pct??'-')}%</td><td class="mut">${esc(Object.entries(r.ended_by||{}).map(e=>e[0]+':'+e[1]).join(' '))}</td><td>${esc(r.p50_s??'-')} / ${esc(r.p90_s??'-')} s</td></tr>`).join('')||'<tr><td class="mut" colspan="7">-</td></tr>';
+$('rel_alerts').innerHTML=(RL.alerts||[]).map(a=>`<div>${esc(new Date(a.t*1000).toLocaleString())} · ${esc(a.kind)} · ${esc(a.host)} · ${esc(a.message)}</div>`).join('')||'-'}
+async function relProbe(){if(!confirm('This sends one small test request to every ready site. Continue?'))return;$('rel_msg').textContent='running…';
+try{const r=await api('reliability/probe','POST',{});$('rel_msg').textContent=(r.results||[]).map(x=>(x.host||'?')+': '+(x.ran===false?x.reason:(x.ok?'ok':'FAILED '+x.reason))).join(' | ')||'nothing to probe'}catch(e){$('rel_msg').textContent=errMsg(e)}tick()}
+async function relReplay(){$('rel_msg').textContent='running…';try{const r=await api('reliability/replay','POST',{});$('rel_msg').textContent=r.total+' replies: '+r.same+' unchanged, '+(r.improved||[]).length+' improved, '+(r.regressions||[]).length+' regressions'}catch(e){$('rel_msg').textContent=errMsg(e)}}
+function renderCtx(){renderRel();if(!C)return;const x=C.tokenizer||{};
 $('ctx_meta').textContent='Token counting: '+(x.kind||'estimate')+' · tokenizer '+(x.active||'?')+' · '+(x.chars_per_token||'?')+' chars/token · '+((C.continuity||{}).chats||[]).length+' remembered chat(s)';
 const rows=[];for(const [k,v] of Object.entries(C.measured||{}))rows.push([k,v,'measured']);for(const [k,v] of Object.entries(C.estimated||{}))rows.push([k,v,'estimated']);
 $('ctx_cnt').innerHTML=rows.map(r=>`<tr><td class="k">${esc(r[0])}</td><td>${esc(r[1])}</td><td><span class="b ${kindB(r[2])}">${esc(r[2])}</span></td></tr>`).join('')||'<tr><td class="mut" colspan="3">-</td></tr>';
@@ -19037,18 +21871,27 @@ const el=$('ctx_disc');el.style.display='block';el.textContent='Running 3 probe 
 try{const r=await api('accounts/'+encodeURIComponent(id)+'/paste-discover','POST');el.textContent='Requests used: '+r.requests_used+(r.ran?'':' (did not run)')+'\nApplied: '+(r.applied?'yes':'no')+(r.suggestion?'\nSuggested signal: '+JSON.stringify(r.suggestion):'')+(r.reason?'\n'+r.reason:'')}catch(e){el.textContent='Failed: '+e.message}
 tick()}
 let busy=false;
-async function tick(){if(busy)return;busy=true;try{S=await api('state');try{C=await api('context')}catch(e){}try{O=await api('o12');O12E=''}catch(e){O12E=errMsg(e)}
+async function tick(){if(busy)return;busy=true;try{if(!$('claude_full_access').dataset.ready){$('claude_full_access').checked=localStorage.claudeFullAccess==='1';$('claude_full_access').onchange=()=>{localStorage.claudeFullAccess=$('claude_full_access').checked?'1':'0';updateWorkspaceCommand()};$('claude_full_access_label').textContent=lang==='fa'?'دسترسی کامل · بدون درخواست اجازه':'Full access · skip permission prompts';$('claude_full_access').dataset.ready='1'}S=await api('state');try{C=await api('context')}catch(e){}try{RL=await api('reliability')}catch(e){}try{O=await api('o12');O12E=''}catch(e){O12E=errMsg(e)}try{RD=await api('decisions?n=30');RDE=''}catch(e){RD=null;RDE=errMsg(e)}try{RC=await api('routing')}catch(e){}
 if(!$('preset').options.length){$('preset').innerHTML='<option value="">'+esc(t('preset'))+'</option>'+S.presets.map(p=>`<option value="${esc(p.url)}" data-n="${esc(p.name)}">${esc(p.name)}</option>`).join('');$('preset').onchange=()=>{$('url').value=$('preset').value;$('label').value=$('preset').selectedOptions[0].dataset.n||'';urlPrev()}}
 if(view=='log'||!$('log').textContent){const lg=await api('log');const hide=$('hidetech').checked;let ls=lg.lines;if(hide)ls=ls.filter(l=>!/ DEBUG /.test(l)).map(l=>String(l).split('\n')[0]);const el=$('log'),atEnd=el.scrollTop+el.clientHeight>=el.scrollHeight-20;el.textContent=(lg.file?'Log file: '+lg.file+'\n':'')+ls.join('\n');if(atEnd)el.scrollTop=el.scrollHeight}
-render();renderCtx();renderO12()}catch(e){$('st').textContent='disconnected'}finally{busy=false}}
-async function addAcc(){const url=$('url').value.trim();if(!url)return alert(t('url_ph'));try{await api('accounts','POST',{url,label:$('label').value.trim()});$('url').value='';$('label').value='';$('urlprev').textContent='';tick()}catch(e){alert(errMsg(e))}}
-async function startPcSetup(){const b=$('pc_start'),s=$('pc_state');b.disabled=true;s.textContent=t('pc_opening');try{const r=await api('personal-chrome/setup','POST',{});$('pc_code').textContent=r.code;$('pc_port').textContent=r.port;$('pc_folder').textContent=r.extension_dir;$('pc_steps').hidden=false;s.textContent=t('pc_ready')+(r.chrome_page_opened&&r.folder_opened?'':' · '+(r.chrome_page_opened?'':'Chrome page did not open automatically; use the link.'))}catch(e){s.textContent=t('pc_error')+errMsg(e)}finally{b.disabled=false}}
+render();renderCtx();renderO12();renderDecisions()}catch(e){$('st').textContent='disconnected'}finally{busy=false}}
+async function addAcc(){const url=$('url').value.trim();if(!url)return alert(t('url_ph'));try{await api('accounts','POST',{url,label:$('label').value.trim(),learn:$('learn_on_add').checked,manual_login:true,pc_client_id:$('account_profile').value});$('url').value='';$('label').value='';$('urlprev').textContent='';tick()}catch(e){alert(errMsg(e))}}
+async function selectWorkspace(){try{const r=await api('workspace/select','POST',{});if(r.folder){$('workspace_path').value=r.folder;localStorage.workspacePath=r.folder;$('workspace_status').textContent=t('workspace_ready')}else $('workspace_status').textContent=t('workspace_cancel');updateWorkspaceCommand()}catch(e){$('workspace_status').textContent=t('workspace_error')+errMsg(e)}}
+function workspaceModel(){return 'sonnet'}
+ function updateWorkspaceCommand(){const app=$('workspace_app').value,folder=$('workspace_path').value,keyValue=(S&&S.keys.find(k=>k.id===$('workspace_key').value)||{}).key||'',base='http://127.0.0.1:'+(S?S.port:'8788'),policy=workspaceModel();localStorage.workspaceApp=app;localStorage.claudeFullAccess=$('claude_full_access').checked?'1':'0';let cmd='';const psPath="'"+folder.replace(/'/g,"''")+"'";
+ if(!folder)cmd=t('workspace_ph');else if(app==='claude'&&!keyValue)cmd=t('workspace_key_required');else if(app==='claude'){const full=$('claude_full_access').checked,flag=full?' --dangerously-skip-permissions':'';cmd=`Remove-Item Env:ANTHROPIC_DEFAULT_SONNET_MODEL,Env:ANTHROPIC_DEFAULT_OPUS_MODEL,Env:ANTHROPIC_DEFAULT_HAIKU_MODEL -ErrorAction SilentlyContinue\n$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_API_KEY="${keyValue}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nSet-Location -LiteralPath ${psPath}\nclaude${flag}`}
+else if(app==='vscode')cmd=`code "${folder}"`;else if(app==='cursor')cmd=`cursor "${folder}"`;else if(app==='cmd')cmd=`cd /d "${folder}"`;else cmd=`Set-Location -LiteralPath ${psPath}`;
+ $('workspace_command').textContent=cmd||'Select a workspace folder to prepare the command.'}
+async function copyWorkspaceCommand(){updateWorkspaceCommand();const cmd=$('workspace_command').textContent;if(!cmd||cmd===t('workspace_ph')||cmd===t('workspace_key_required'))return;try{await navigator.clipboard.writeText(cmd);$('workspace_status').textContent=t('workspace_copied')}catch(e){$('workspace_status').textContent=cmd}}
+async function openWorkspace(){const folder=$('workspace_path').value;if(!folder)return alert(t('workspace_ph'));if($('workspace_app').value==='claude'&&!(S&&S.keys.some(k=>k.id===$('workspace_key').value)))return alert(t('workspace_key_required'));try{const r=await api('workspace/open','POST',{app:$('workspace_app').value,folder,key_id:$('workspace_key').value,model:workspaceModel(),full_access:$('claude_full_access').checked});$('workspace_status').textContent=t('workspace_opened')+' (PID '+r.pid+')'}catch(e){$('workspace_status').textContent=t('workspace_error')+errMsg(e)}}
+async function startPcSetup(){const b=$('pc_start'),s=$('pc_state');b.disabled=true;s.textContent=t('pc_opening');try{const r=await api('personal-chrome/setup','POST',{});$('pc_code').textContent=r.code;$('pc_port').textContent=r.port;$('pc_folder').textContent=r.extension_dir;$('pc_steps').hidden=false;s.textContent=t('pc_ready')}catch(e){s.textContent=t('pc_error')+errMsg(e)}finally{b.disabled=false}}
 async function copyPcCode(){try{await navigator.clipboard.writeText($('pc_code').textContent);$('pc_state').textContent=t('pc_copied')}catch(e){$('pc_state').textContent=$('pc_code').textContent}}
 let _up=0;async function urlPrev(){const v=$('url').value.trim(),el=$('urlprev'),my=++_up;if(!v){el.textContent='';return}try{const r=await api('sites/normalize','POST',{input:v});if(my===_up)el.textContent='→ '+r.open_url+'  ·  '+r.identity_host+(r.notes.length?'  ·  '+r.notes.join('; '):'')}catch(e){if(my===_up)el.textContent='✘ '+errMsg(e)}}
 function errMsg(e){let m=e.message;try{const j=JSON.parse(m);const x=j.error;m=typeof x==='string'?x:((x&&x.message)||m)}catch(_){}return m}
 async function jobDone(id){await api('jobs/'+id+'/done','POST');tick()}
 async function addApi(){const b={type:'api',kind:$('akind').value,base:$('abase').value,key:$('akey').value,model:$('amodel').value,label:$('alabel').value};try{await api('accounts','POST',b);['abase','akey','amodel','alabel'].forEach(i=>$(i).value='');tick()}catch(e){alert(errMsg(e))}}
 async function recheckDirect(id){try{const r=await api('accounts/'+id+'/recheck-direct','POST');alert((r.ok?'OK: ':'')+r.reason)}catch(e){alert(errMsg(e))}tick()}
+async function testAccount(id){try{const r=await api('accounts/'+encodeURIComponent(id)+'/test-connection','POST');alert((r.status==='valid'?(lang==='fa'?'اتصال موفق است؛ ورود ذخیره شده.':'Connection is valid; login is saved.'):(lang==='fa'?'وضعیت اتصال: ':'Connection status: ')+r.status+' · '+r.reason))}catch(e){alert(errMsg(e))}tick()}
 async function act(id,a){try{await api('accounts/'+id+'/'+a,'POST')}catch(e){alert(errMsg(e))}tick()}
 async function delAcc(id){if(confirm(t('cf_rm'))){await api('accounts/'+id,'DELETE');tick()}}
 async function newKey(){await api('keys','POST',{label:$('klabel').value||'client',account:$('kacc').value});$('klabel').value='';tick()}
@@ -19064,7 +21907,7 @@ const _saveTxt=(txt,name)=>{const a=document.createElement('a');a.href=URL.creat
 const _stamp=()=>new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
 $('lgdl').addEventListener('click',async()=>{try{const x=await api('logfile?level=all&full=1&tail=200000&report=1');_saveTxt(x.text,'bridge-log-'+_stamp()+'.txt')}catch(e){$('lgmsg').textContent=e.message}});
 $('lgcp').addEventListener('click',async()=>{let x;try{x=await api('logfile?level=info&tail=300&report=1')}catch(e){$('lgmsg').textContent=e.message;return}const txt=x.text+'\n===== dashboard: '+navigator.userAgent+' | tab: '+(typeof view!=='undefined'?view:'')+' | lang: '+lang+' =====';try{await navigator.clipboard.writeText(txt);$('lgmsg').textContent=t('log_copied')}catch(e){_saveTxt(txt,'bridge-report-'+_stamp()+'.txt');$('lgmsg').textContent=t('log_failed')}});
-setLang(lang);loadDir();tick();setInterval(tick,2000);
+const savedTheme=localStorage.getItem('theme')||'system';$('theme').value=savedTheme;setTheme(savedTheme);setLang(lang);loadDir();tick();setInterval(tick,2000);
 </script></body></html>"""
 
 
@@ -19171,6 +22014,9 @@ def main() -> int:
     ap.add_argument("--pc-install", action="store_true", help="7.24: write the embedded Chrome extension into <data>/personal_chrome/extension, verify it and print the one-time install steps, then exit")
     ap.add_argument("--pc-pair", action="store_true", help="7.24: show a one-time pairing code for the extension (valid 10 minutes) and wait until it is paired")
     ap.add_argument("--pc-status", action="store_true", help="7.24: print the personal-Chrome status and which browser capabilities are / are not equivalent to the old Playwright browser, then exit")
+    ap.add_argument("--reliability", action="store_true", help="7.71: print the per-site reliability numbers and alerts from the data folder, then exit")
+    ap.add_argument("--replay", action="store_true", help="7.71: parse every recorded real model reply with the current code and report same / improved / regressions (exit code 1 on a regression), then exit")
+    ap.add_argument("--replay-accept", action="store_true", help="with --replay: store the current results as the new expectation")
     ap.add_argument("--quick", action="store_true", help="with --selftest: only a <10 s smoke check (start the server on a free port, one request through the mock site, shut down)")
     args = ap.parse_args()
     if args.selftest:
@@ -19180,6 +22026,8 @@ def main() -> int:
         HOME = Path(args.home)
     if args.pc_install or args.pc_pair or args.pc_status:
         return pc_cli(args)
+    if args.reliability or args.replay:
+        return reliability_cli(args)
     if args.analyze:
         try:
             st_ = Store(HOME)
@@ -19215,6 +22063,7 @@ def main() -> int:
     threading.Thread(target=bootstrap_toolchain, args=(store, cfg), daemon=True, name="tool-bootstrap").start()
     app = App(store, cfg)
     app.acc.start_health_loop()
+    app.probe.start()                                                    # 7.71 (9): the daily tool-call probe (tool_probe_hours; 0 = off)
     if cfg["o9_supervisor_seconds"]:
         app.acc.o9_supervisor().standby = app.engine.standby_tick                # type: ignore[attr-defined]
         app.acc.o9_supervisor().start(float(cfg["o9_supervisor_seconds"]))
@@ -19500,6 +22349,36 @@ def run_selftest(quick: bool = False) -> int:
                 _, calls, _ = parse_tool_calls(txt, tools, "s")
                 self.assertEqual([c["name"] for c in calls], want, txt)
             self.assertEqual(parse_tool_calls("<tool_call>x</tool_call>", {}, "s")[1], [])                  # no tools -> text untouched
+
+        def test_deepseek_tool_call_codeblock_toolbar_is_restored_for_parser(self) -> None:
+            raw = ('I don\'t have a clock built in, but I can check the system time for you.\n\n'
+                   'tool_call\nCopy\nDownload\n{"name": "Bash", "arguments": '
+                   '{"command": "date", "description": "Show current system date and time"}}')
+            restored = normalize_ui_tool_call_chrome(raw)
+            self.assertIn("```tool_call\n", restored)
+            self.assertNotIn("Copy", restored)
+            self.assertNotIn("Download", restored)
+            tools = {"Bash": {"description": "", "input_schema": {"required": ["command"]}}}
+            clean, calls, problems = parse_tool_calls(restored, tools, "deepseek")
+            self.assertEqual([call["name"] for call in calls], ["Bash"])
+            self.assertEqual(calls[0]["input"]["command"], "date")
+            self.assertEqual(problems, [])
+            self.assertIn("I don't have a clock built in", clean)
+
+        def test_deepseek_tool_call_toolbar_stream_prefix_is_gateable(self) -> None:
+            partial = normalize_ui_tool_call_chrome("tool_call\nCopy\nDownload\n{\"name\":")
+            self.assertTrue(partial.startswith("```tool_call\n"))
+            gate = TextGate(lambda _chunk: None, True)
+            gate.feed(partial)
+            self.assertEqual(gate.sent, 0)
+
+        def test_echoed_tool_schema_placeholder_is_not_retried_as_an_unknown_tool(self) -> None:
+            tools = {"Bash": {"description": "", "input_schema": {}}}
+            sample = 'Here is the format:\n```tool_call\n{"name": "<tool name>", "arguments": { ... }}\n```\nPlain answer.'
+            clean, calls, problems = parse_tool_calls(sample, tools, "s")
+            self.assertEqual(calls, [])
+            self.assertEqual(problems, [])
+            self.assertIn("Plain answer.", clean)
 
     class TestStreamDecoder(unittest.TestCase):
         def test_every_single_byte_split_matches_the_unsplit_stream(self) -> None:
@@ -20483,6 +23362,98 @@ def run_selftest(quick: bool = False) -> int:
                                 {**default_routing(), **(cfgd or {})}, breaker)
             return [c for c, _d in r["codes"]]
 
+        def test_login_only_web_account_is_routable_through_personal_chrome(self) -> None:
+            from unittest import mock
+            a = self.acc.get("a1")
+            a.update(state="needs_learning", type="browser", serving_mode="browser", url="https://chatgpt.com/", host="chatgpt.com", tier="ui")
+            self.assertNotIn("account_not_ready", self.codes("acct:a1"))
+            selected, _decision = self.plan()
+            self.assertEqual(selected["acct"]["id"], "a1")
+            with mock.patch.object(self.acc, "browser", return_value=object()):
+                backend = self.acc.backend(a)
+            self.assertIsInstance(backend, UIBackend)
+            self.assertTrue(backend.fenced_tools)
+            self.assertTrue(backend.unlearned_ui)
+            self.assertEqual(backend.sel, '[data-message-author-role="assistant"]')
+            self.assertFalse(backend.diff)
+            self.assertFalse(backend.recipe["continuity"])
+
+        def test_unlearned_ui_uses_assistant_selector_and_scans_challenges_outside_composer(self) -> None:
+            from unittest import mock
+            a = self.acc.get("a1")
+            a.update(state="needs_learning", type="browser", serving_mode="browser", url="https://chatgpt.com/", host="chatgpt.com")
+            with mock.patch.object(self.acc, "browser", return_value=object()):
+                backend = self.acc.backend(a)
+            self.assertEqual(backend.sel, '[data-message-author-role="assistant"]')
+            self.assertFalse(backend.diff)
+            self.assertIn("cloneNode(true)", UI_STATE_JS)
+            self.assertIn("e.textContent = ''", UI_STATE_JS)
+
+        def test_unlearned_deepseek_and_claude_use_assistant_message_nodes(self) -> None:
+            from unittest import mock
+            a = self.acc.get("a1")
+            cases = [
+                ("chat.deepseek.com", "https://chat.deepseek.com/", ".ds-assistant-message-main-content.ds-markdown"),
+                ("claude.ai", "https://claude.ai/", ".font-claude-response"),
+            ]
+            for host, url, expected in cases:
+                with self.subTest(host=host):
+                    a.update(state="needs_learning", type="browser", serving_mode="browser", url=url, host=host, tier="ui")
+                    with mock.patch.object(self.acc, "browser", return_value=object()):
+                        backend = self.acc.backend(a)
+                    self.assertIn(expected, backend.sel)
+                    self.assertFalse(backend.diff)
+
+        def test_generic_ui_diff_drops_page_title_and_non_answer_metadata(self) -> None:
+            response = "\n".join(ui_diff_lines("New chat\nAI-generated, for reference only\nDoing well — good to see you.\nWhat are we working on?",
+                                                   set(), "hi babe, how are you doin?"))
+            self.assertNotIn("New chat", response)
+            self.assertNotIn("AI-generated", response)
+            self.assertEqual(response, "Doing well — good to see you.\nWhat are we working on?")
+
+        def test_generic_ui_diff_removes_echoed_prompt_and_chat_controls(self) -> None:
+            prompt = "<system>\nx-anthropic-billing-header: example\nBefore saving, check for an existing file.\n</system>\nhi"
+            body = "Share\nYou said:\n" + prompt + "\nClaude responded: Hi!\nHi! What would you like to work on?"
+            response = "\n".join(ui_diff_lines(body, set(), prompt))
+            self.assertNotIn("anthropic-billing-header", response.lower())
+            self.assertNotIn("Before saving", response)
+            self.assertNotIn("Share", response)
+            self.assertIn("Hi!", response)
+            self.assertIn("What would you like to work on?", response)
+
+        def test_generic_ui_diff_removes_reflowed_multiline_prompt_from_same_text_block(self) -> None:
+            prompt = "<system>\nx-anthropic-billing-header: cli\nUse the tool schema below.\n</system>\n<tool name>"
+            body = "You said: " + prompt.replace("\n", "   ") + " Claude responded: I didn't make a tool call."
+            response = "\n".join(ui_diff_lines(body, set(), prompt))
+            self.assertNotIn("anthropic-billing-header", response.lower())
+            self.assertNotIn("<tool name>", response.lower())
+            self.assertIn("I didn't make a tool call.", response)
+
+        def test_unlearned_ui_preserves_the_owner_tab_if_new_chat_control_is_unavailable(self) -> None:
+            from unittest import mock
+            class Loc:
+                def count(self): return 0
+            class Page:
+                url = "https://chatgpt.com/"
+                def __init__(self): self.gotos = []
+                def is_closed(self): return False
+                def locator(self, _selector): return Loc()
+                def get_by_role(self, *_args, **_kwargs): return Loc()
+                def get_by_text(self, *_args, **_kwargs): return Loc()
+                def inner_text(self, _selector): return "ChatGPT"
+                def wait_for_timeout(self, _ms): pass
+                def goto(self, url, **_kwargs): self.gotos.append(url); self.url = url
+            class Browser:
+                def __init__(self, page): self.page_cache = {"page": page}
+                def run(self, fn, *_args): return fn(self)
+            page = Page()
+            be = UIBackend({"base": "https://chatgpt.com", "entry": "https://chatgpt.com/", "tier": "ui", "ui": {"diff": True}}, Browser(page))
+            cancel = threading.Event()
+            cancel.set()
+            with mock.patch(__name__ + ".ui_type_and_send"), mock.patch(__name__ + ".ui_input_ready", return_value=True):
+                list(be.ask(be.new_conv(), "hello", cancel=cancel))
+            self.assertEqual(page.gotos, [])
+
         # -- C1: validator
         def test_validator_rejects_impossible_configs_with_precise_messages(self) -> None:
             add_acct(self.app, "d4", "Delta", "delta.test", state="login_required")
@@ -20526,6 +23497,13 @@ def run_selftest(quick: bool = False) -> int:
             with self.assertRaises(ApprovalRequired) as cx2:
                 self.plan(m2)
             self.assertEqual(cx2.exception.kind, "approval_required")
+
+        def test_explicit_rotation_pool_uses_only_the_accounts_the_owner_selected(self) -> None:
+            name = self.setup_policy("user-claude-pool", kind="rotation", members=["acct:a1", "acct:b2"], strategy="round_robin", unit="request")
+            first = self.plan(name)[0]["acct"]["id"]
+            second = self.plan(name)[0]["acct"]["id"]
+            self.assertEqual({first, second}, {"a1", "b2"})
+            self.assertNotIn("c3", {first, second})
 
         def test_policy_auto_ranks_eligible_routes(self) -> None:
             self.acc.inflight["a1"] = 3
@@ -22118,6 +25096,38 @@ def run_selftest(quick: bool = False) -> int:
             return build_prompt(self.req(messages, **kw), self.cfg, False, vault=self.rt.vault, trace=tr), tr
 
         U1 = {"role": "user", "content": "fix the failing test"}
+
+        def test_ui_fast_prompt_compacts_tool_prose_but_keeps_tool_schema(self) -> None:
+            req = self.req([self.U1])
+            trace: Dict[str, Any] = {}
+            prompt = build_prompt(req, _CfgOver(self.cfg, {"fixed_soft_chars": 1}), False, trace=trace)
+            self.assertTrue(any(r.get("kind") == "tool_descriptions_compacted" for r in trace["reductions"]))
+            self.assertIn('"command"', prompt)
+            self.assertIn('"required":["command"]', prompt)
+
+        def test_login_only_ui_reuses_remote_chat_and_sends_only_new_turn(self) -> None:
+            from unittest import mock
+            class Backend:
+                tier, fenced_tools, unlearned_ui = "ui", True, True
+                def __init__(self): self.convs, self.prompts = [], []
+                def new_conv(self, _model=None):
+                    conv = {"url": None, "turn": 0}; self.convs.append(conv); return conv
+                def ask(self, conv, prompt, _cancel=None, model=None):
+                    self.prompts.append((conv, prompt))
+                    yield "first answer" if len(self.prompts) == 1 else "second answer"
+            backend = Backend()
+            first = self.req([{"role": "user", "content": "first question"}], tools=False)
+            second = self.req([{"role": "user", "content": "first question"},
+                               {"role": "assistant", "content": "first answer"},
+                               {"role": "user", "content": "second question"}], tools=False)
+            with mock.patch.object(self.acc, "backend", return_value=backend):
+                self.assertEqual(self.rt._run(self.a1, first, lambda _t: None, threading.Event()).text, "first answer")
+                self.assertEqual(self.rt._run(self.a1, second, lambda _t: None, threading.Event()).text, "second answer")
+            self.assertEqual(len(backend.convs), 1)
+            self.assertIs(backend.prompts[0][0], backend.prompts[1][0])
+            self.assertIn("second question", backend.prompts[1][1])
+            self.assertNotIn("first question", backend.prompts[1][1])
+            self.assertNotIn("<system>", backend.prompts[1][1])
 
         # -- E3 + E4: the relevant line of a huge log survives, the full text is kept, a typed error replaces silent cutting ---------
         def test_error_line_from_the_middle_of_a_200k_log_reaches_the_model_and_nothing_is_lost(self) -> None:
@@ -24830,6 +27840,252 @@ def run_selftest(quick: bool = False) -> int:
             for fn in (o18_translate, o18_validate, o18_write, o18_load, o18_run, o18_build_request, o18_load_source):
                 self.assertNotIn("ask", inspect.signature(fn).parameters)
 
+    class TestToolCallParser(unittest.TestCase):
+        """7.70: the parser must understand every markup a chat model produces for a tool call, never run a cut-off call, and never obey injected text."""
+        TOOLS = {
+            "Bash": {"description": "", "input_schema": {"required": ["command"], "properties": {"command": {"type": "string"}, "timeout": {"type": "integer"}, "background": {"type": "boolean"}}}},
+            "Read": {"description": "", "input_schema": {"required": ["file_path"], "properties": {"file_path": {"type": "string"}, "limit": {"type": "integer"}}}},
+            "mcp__srv__Search": {"description": "", "input_schema": {"required": ["q"], "properties": {"q": {"type": "string"}}}},
+        }
+        D = "\uff5c"
+
+        def parse(self, text: str) -> Tuple[str, List[Dict[str, Any]], List[str]]:
+            return parse_tool_calls(text, self.TOOLS, "s")
+
+        def names(self, text: str) -> List[str]:
+            return [c["name"] for c in self.parse(text)[1]]
+
+        def dsml(self, ascii_pipe: bool = False) -> str:
+            d = "|" if ascii_pipe else self.D
+            return (f'Let me check.\n<{d}DSML{d}function_calls>\n<{d}DSML{d}invoke name="Bash">\n<{d}DSML{d}parameter name="command" string="true">git status</{d}DSML{d}parameter>\n'
+                    f'<{d}DSML{d}parameter name="timeout" string="false">5000</{d}DSML{d}parameter>\n</{d}DSML{d}invoke>\n</{d}DSML{d}function_calls>')
+
+        def test_every_supported_markup(self) -> None:
+            cases = [
+                ("tag", '<tool_call>{"name":"Bash","arguments":{"command":"ls"}}</tool_call>', ["Bash"]),
+                ("tag unclosed", '<tool_call>{"name":"Bash","arguments":{"command":"ls"}}', ["Bash"]),
+                ("fence", 'hi\n```tool_call\n{"name":"Bash","arguments":{"command":"ls"}}\n```', ["Bash"]),
+                ("json fence last", '```json\n{"name":"Read","arguments":{"file_path":"/a"}}\n```', ["Read"]),
+                ("plain fence last", '```\n{"name":"Read","arguments":{"file_path":"/a"}}\n```', ["Read"]),
+                ("claude style", '<function_calls><invoke name="Read"><parameter name="file_path">/a/b.py</parameter></invoke></function_calls>', ["Read"]),
+                ("qwen", "<function=Bash><parameter=command>ls -la</parameter></function>", ["Bash"]),
+                ("openai", '```json\n{"tool_calls":[{"function":{"name":"Bash","arguments":"{\\"command\\":\\"ls\\"}"}}]}\n```', ["Bash"]),
+                ("anthropic block", '<tool_call>{"type":"tool_use","name":"Bash","input":{"command":"ls"}}</tool_call>', ["Bash"]),
+                ("bare json = whole reply", '{"name":"Bash","arguments":{"command":"pwd"}}', ["Bash"]),
+                ("mcp suffix", '<tool_call>{"name":"Search","arguments":{"q":"hi"}}</tool_call>', ["mcp__srv__Search"]),
+                ("case + prefix", '<tool_call>{"name":"functions.bash","arguments":{"command":"ls"}}</tool_call>', ["Bash"]),
+                ("braces in string", '<tool_call>{"name":"Bash","arguments":{"command":"echo }"}}</tool_call>', ["Bash"]),
+                ("trailing comma", '<tool_call>{"name":"Bash","arguments":{"command":"ls",},}</tool_call>', ["Bash"]),
+                ("two calls", '<tool_call>{"name":"Read","arguments":{"file_path":"/a"}}</tool_call><tool_call>{"name":"Bash","arguments":{}}</tool_call>', None),
+            ]
+            for name, text, want in cases:
+                with self.subTest(name):
+                    if want is None:
+                        self.assertEqual(self.names(text), ["Read"])           # Bash needs `command`: reported, never executed half-built
+                        self.assertTrue(self.parse(text)[2])
+                    else:
+                        self.assertEqual(self.names(text), want)
+                        self.assertEqual(self.parse(text)[2], [])
+
+        def test_dsml_both_pipe_styles_with_typed_values(self) -> None:
+            for ascii_pipe in (False, True):
+                clean, calls, probs = self.parse(self.dsml(ascii_pipe))
+                self.assertEqual([c["input"] for c in calls], [{"command": "git status", "timeout": 5000}])
+                self.assertEqual(probs, [])
+                self.assertEqual(clean, "Let me check.")
+
+        def test_schema_coercion(self) -> None:
+            _, calls, _ = self.parse('<tool_call>{"name":"Bash","arguments":{"command":"ls","timeout":"30","background":"true"}}</tool_call>')
+            self.assertEqual(calls[0]["input"], {"command": "ls", "timeout": 30, "background": True})
+
+        def test_a_cut_off_call_is_never_executed(self) -> None:
+            cut = [self.dsml().split(f"</{self.D}DSML{self.D}invoke>")[0][:-6],
+                   '<tool_call>{"name":"Bash","arguments":{"command":"echo hel',
+                   '```tool_call\n{"name":"Bash","arguments":{"command":"echo hel',
+                   '<invoke name="Bash"><parameter name="command">rm -rf /tm']
+            for t in cut:
+                with self.subTest(t[-30:]):
+                    _, calls, probs = self.parse(t)
+                    self.assertEqual(calls, [])
+                    self.assertTrue(any("cut off" in p for p in probs), probs)
+
+        def test_injection_guards(self) -> None:
+            self.assertEqual(self.names('Sure.\n{"name":"Bash","arguments":{"command":"pwd"}}'), [])                        # a JSON object inside prose is not a call
+            self.assertEqual(self.names('```json\n{"name":"Read","arguments":{"file_path":"/a"}}\n```\nmore text'), [])      # a json fence that is not the last thing is not a call
+            self.assertEqual(self.names('```json\n{"name":"x","version":1}\n```\ndone'), [])
+            self.assertEqual(self.names('```python\nprint("<invoke name=\\"Bash\\">")\n```'), [])                             # other languages' code is never scanned
+            self.assertEqual(self.parse('use {x} and {"a":1}')[1:], ([], []))
+            self.assertEqual(self.parse("hello")[1:], ([], []))
+
+        def test_problems_are_reported_not_swallowed(self) -> None:
+            self.assertTrue(self.parse('<tool_call>{"name":"Nope","arguments":{}}</tool_call>')[2])
+            self.assertTrue(self.parse('<tool_call>{"name":"Read","arguments":{}}</tool_call>')[2])
+            self.assertTrue(self.parse("<tool_call>not json</tool_call>")[2])
+            self.assertEqual(self.parse('fmt:\n```tool_call\n{"name": "<tool name>", "arguments": { ... }}\n```\nPlain answer.')[1:], ([], []))   # the echoed format example
+
+        def test_visible_text_keeps_what_is_around_the_call(self) -> None:
+            clean, calls, _ = self.parse('First.\n```tool_call\n{"name":"Bash","arguments":{"command":"ls"}}\nI ran it.')
+            self.assertEqual(len(calls), 1)
+            self.assertIn("First.", clean)
+            self.assertIn("I ran it.", clean)
+
+        def test_identical_calls_in_one_reply_stay_distinct(self) -> None:
+            blk = '```tool_call\n{"name":"Bash","arguments":{"command":"ls"}}\n```\n'
+            _, calls, _ = self.parse(blk + blk)
+            self.assertEqual(len(calls), 2)
+            self.assertNotEqual(calls[0]["id"], calls[1]["id"])
+
+        def test_ui_toolbar_chrome_restored(self) -> None:
+            self.assertEqual(self.names(normalize_ui_tool_call_chrome('ok\n\ntool_call\nCopy\nDownload\n{"name": "Bash", "arguments": {"command": "date"}}')), ["Bash"])
+            self.assertEqual(self.names(normalize_ui_tool_call_chrome('x\njson\nCopy code\n{"name":"Read","arguments":{"file_path":"/a"}}')), ["Read"])
+            self.assertEqual(normalize_ui_tool_call_chrome("json\nCopy\nplain words"), "json\nCopy\nplain words")                   # an ordinary line is left alone
+
+        def test_gate_holds_every_call_start_even_when_split(self) -> None:
+            D = self.D
+            for chunks, want in ((["Hello <", "tool_call>{}"], "Hello "), ([f"Hi <{D}", "DSML"], "Hi "), (["a ``", "`json\n{"], "a "),
+                                 (["x <inv", "oke name='a'>"], "x "), (["plain 1 < 2 text"], "plain 1 < 2 text")):
+                out: List[str] = []
+                g = TextGate(out.append, True)
+                for c in chunks:
+                    g.feed(c)
+                g.finish()
+                self.assertEqual("".join(out), want, chunks)
+
+        def test_open_call_detector(self) -> None:
+            D = self.D
+            for t, want in (('hi ```tool_call\n{"name":', True), ('```tool_call\n{}\n```', False), ("plain", False), (f'<{D}DSML{D}invoke name="Bash">', True),
+                            ("<tool_call>{...}</tool_call>", False), ('<invoke name="a"><parameter name="b">x</parameter></invoke>', False), ("", False)):
+                self.assertEqual(ui_tool_call_open(t), want, t)
+
+        def test_history_is_rendered_in_the_format_the_model_is_told_to_use(self) -> None:
+            msg = {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]}
+            self.assertIn("```tool_call", build_prompt(NormReq("", [{"role": "user", "content": [{"type": "text", "text": "go"}]}, msg, {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}],
+                                                              dict(self.TOOLS), {}, False, 100, "m", "anthropic"), Config.__new__(Config) if False else _CfgOver({"result_limit": 5000, "fixed_soft_chars": 48000, "tool_desc_limit": 500, "history_limit": 60000,
+                                                              "context_hard_chars": 0, "digest_chars": 6000, "system_limit": 12000}, {}), True))
+
+        def test_unsent_tail_tolerates_strip(self) -> None:
+            self.assertEqual(_unsent_tail("Hello world", "Hello "), "world")
+            self.assertEqual(_unsent_tail("Hello world", "  Hello "), "world")
+            self.assertEqual(_unsent_tail("Different", "Hello"), "")
+
+    class TestUIWait(unittest.TestCase):
+        """7.70: the per-site quiet window is configurable, learned from that site's own pauses, lengthened by a cut-off call, capped, and persisted."""
+        def mk(self, **over: Any) -> "UIWait":
+            return UIWait({**UIWait.KEYS, **over}, None)
+
+        def test_defaults_match_the_documented_numbers(self) -> None:
+            w = self.mk()
+            self.assertEqual(w.quiet_s("a.test", False, False), 1.6)
+            self.assertEqual(w.quiet_s("a.test", True, False), 1.0)
+            self.assertEqual(w.quiet_s("a.test", False, True), 12.0)
+            self.assertEqual(w.quiet_s("a.test", True, True), 8.0)
+
+        def test_learns_a_sites_own_pauses_and_only_where_it_matters(self) -> None:
+            w = self.mk()
+            for g in (0.2, 0.3, 4.0, 5.0, 6.0, 0.4):
+                w.observe("slow.test", g)
+            self.assertGreater(w.quiet_s("slow.test", False, False), 5.0)             # no stop control: the learned pause decides
+            self.assertEqual(w.quiet_s("slow.test", True, False), 1.0)                 # a stop control tells the truth by itself
+            for g in (9.0, 9.0):
+                w.observe("slow.test", g)
+            self.assertGreater(w.quiet_s("slow.test", False, True), 12.0)              # an open call waits at least twice the longest usual pause
+            self.assertEqual(w.quiet_s("other.test", False, False), 1.6)               # another site is not affected
+
+        def test_too_few_samples_change_nothing(self) -> None:
+            w = self.mk()
+            for g in (9.0, 9.0, 9.0):
+                w.observe("a.test", g)
+            self.assertEqual(w.quiet_s("a.test", False, False), 1.6)
+
+        def test_a_cut_call_lengthens_that_sites_wait_and_it_is_capped(self) -> None:
+            w = self.mk()
+            w.note_cut("a.test")
+            self.assertEqual(w.quiet_s("a.test", False, False), 2.4)
+            for _ in range(10):
+                w.note_cut("a.test")
+            self.assertEqual(w.quiet_s("a.test", False, False), 5.4)                   # x1.5 at most three times
+            self.assertEqual(self.mk(ui_quiet_max_s=3.0).quiet_s("a.test", False, True), 3.0)
+
+        def test_adaptive_can_be_switched_off(self) -> None:
+            w = self.mk(ui_adaptive_wait=False)
+            for g in (5.0,) * 8:
+                w.observe("a.test", g)
+            self.assertEqual(w.quiet_s("a.test", False, False), 1.6)
+
+        def test_garbage_input_is_ignored(self) -> None:
+            w = self.mk()
+            for bad in (-1, 9999, "x", None, float("nan")):
+                w.observe("a.test", bad)                                                 # type: ignore[arg-type]
+            self.assertEqual(w.view().get("a.test", {"samples": 0})["samples"], 0)
+
+        def test_record_survives_a_restart(self) -> None:
+            tmp = Path(tempfile.mkdtemp(prefix="bridge_uiwait_"))
+            try:
+                st = Store(tmp)
+                w = UIWait({**UIWait.KEYS}, st)
+                for g in (1.0, 2.0, 3.0, 4.0, 5.0):
+                    w.observe("a.test", g)
+                w.note_cut("a.test")                                                      # a cut forces a save
+                w2 = UIWait({**UIWait.KEYS}, st)
+                self.assertEqual(w2.view()["a.test"]["samples"], 5)
+                self.assertEqual(w2.view()["a.test"]["cuts"], 1)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        def test_settings_are_in_config_and_a_bad_number_is_refused_by_the_api_list(self) -> None:
+            for k in UIWait.KEYS:
+                self.assertIn(k, Config.DEFAULTS)
+
+    class TestUIAnswerReader(unittest.TestCase):
+        """7.70: runs the real in-page reader in headless Chromium when Playwright and a browser exist (skipped otherwise)."""
+        PAGE = ('<html><body><div class="m u">hi</div><div class="m a"><p>Let me check.</p><div class="cb"><div class="h">tool_call</div><button>Copy</button><button>Download</button>'
+                '<pre><code>{"name": "Bash", "arguments": {"command": "git status"}}</code></pre></div><p>Done.</p></div>'
+                '<div class="m a"><invoke name="Read"><parameter name="file_path">/a/b.py</parameter></invoke></div></body></html>')
+
+        @classmethod
+        def setUpClass(cls) -> None:
+            cls.pw, cls.br = None, None
+            try:
+                from playwright.sync_api import sync_playwright
+                cls.pw = sync_playwright().start()
+                cls.br = cls.pw.chromium.launch()
+            except Exception:
+                cls.br = None
+
+        @classmethod
+        def tearDownClass(cls) -> None:
+            for o in (cls.br, cls.pw):
+                try:
+                    if o is not None:
+                        o.close() if o is cls.br else o.stop()
+                except Exception:
+                    pass
+
+        def setUp(self) -> None:
+            if self.br is None:
+                self.skipTest("no Playwright/Chromium in this environment")
+            self.pg = self.br.new_page()
+            self.pg.set_content(self.PAGE)
+
+        def tearDown(self) -> None:
+            if getattr(self, "pg", None) is not None:
+                self.pg.close()
+
+        def test_reads_every_answer_element_with_real_fences_and_no_buttons(self) -> None:
+            n, text = ui_read_answers(self.pg, ".m.a", 0) or (0, "")
+            self.assertEqual(n, 2)
+            self.assertNotIn("Copy", text)
+            self.assertNotIn("Download", text)
+            self.assertIn("```tool_call\n", text)
+            clean, calls, probs = parse_tool_calls(text, {"Bash": {"input_schema": {"required": ["command"]}}, "Read": {"input_schema": {"required": ["file_path"]}}}, "x")
+            self.assertEqual([c["name"] for c in calls], ["Bash", "Read"])             # the second call survived only because swallowed tags were restored
+            self.assertEqual(probs, [])
+
+        def test_only_new_elements_after_n0_and_bad_selector_falls_back(self) -> None:
+            n, text = ui_read_answers(self.pg, ".m.a", 1) or (0, "")
+            self.assertNotIn("Let me check", text)
+            self.assertIsNone(ui_read_answers(self.pg, "text=foo", 0))
+
     class TestQuickSmoke(unittest.TestCase):
         """--selftest --quick: the whole path in one go (server on a free port, one request through the mock, clean shutdown)."""
         def test_server_request_shutdown(self) -> None:
@@ -26531,7 +29787,7 @@ const chrome = {
   alarms: {create() {}, onAlarm: ev()}, action: {setBadgeText() {}, setBadgeBackgroundColor() {}, setTitle() {}},
 };
 const f2 = (u, o = {}) => fetch(u, Object.assign({}, o, {headers: Object.assign({}, o.headers, {Origin: ORIGIN})}));
-const sandbox = vm.createContext({chrome, fetch: f2, setTimeout, clearTimeout, AbortController, console});
+const sandbox = vm.createContext({chrome, fetch: f2, setTimeout, clearTimeout, AbortController, crypto: require('crypto').webcrypto, console});
 vm.runInContext(fs.readFileSync(bgPath, 'utf8'), sandbox, {filename: 'background.js'});
 setTimeout(() => handlers.msg({type: 'pair', port: +port, code}, {id: 'stubid'}, r => { console.log('pair', JSON.stringify(r)); }), 50);
 setTimeout(() => process.exit(0), 60000);
@@ -27465,6 +30721,172 @@ setTimeout(() => process.exit(0), 60000);
             for name in ("chatgpt", "openai", "gemini", "claude", "anthropic", "deepseek", "kimi", "qwen", "grok", "perplexity", "mistral", "copilot", "poe.com"):
                 self.assertNotIn(name, body)
 
+    class TestWorkspaceAndOptionalLearning(unittest.TestCase):
+        """Local workspace launch safety and owner-controlled login/learning split."""
+
+        def test_workspace_launch_uses_fixed_app_names_and_never_a_shell(self) -> None:
+            from unittest import mock
+            tmp = Path(tempfile.mkdtemp(prefix="bridge_workspace_test_"))
+            try:
+                popen = mock.Mock(return_value=types.SimpleNamespace(pid=456))
+                with mock.patch("shutil.which", return_value="C:/Tools/claude.exe"), mock.patch("subprocess.Popen", popen):
+                    result = open_workspace_tool("claude", str(tmp), 8788, "bridge-key")
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["pid"], 456)
+                args, kw = popen.call_args
+                self.assertEqual(args[0], ["C:/Tools/claude.exe"])
+                self.assertEqual(kw["cwd"], str(tmp.resolve()))
+                self.assertFalse(kw.get("shell", False))
+                self.assertEqual(kw["env"]["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8788")
+                self.assertEqual(kw["env"]["ANTHROPIC_API_KEY"], "bridge-key")
+                with mock.patch("shutil.which", return_value="C:/Tools/claude.exe"), mock.patch("subprocess.Popen", popen):
+                    open_workspace_tool("claude", str(tmp), 8788, "bridge-key", "bridge-pool/user-claude-pool")
+                self.assertEqual(popen.call_args.kwargs["env"]["ANTHROPIC_MODEL"], "sonnet")
+                self.assertNotIn("ANTHROPIC_DEFAULT_SONNET_MODEL", popen.call_args.kwargs["env"])
+                self.assertNotIn("ANTHROPIC_DEFAULT_OPUS_MODEL", popen.call_args.kwargs["env"])
+                self.assertNotIn("ANTHROPIC_DEFAULT_HAIKU_MODEL", popen.call_args.kwargs["env"])
+                with mock.patch("shutil.which", return_value="C:/Tools/claude.exe"), mock.patch("subprocess.Popen", popen):
+                    open_workspace_tool("claude", str(tmp), 8788, "bridge-key", "bridge-auto", full_access=True)
+                self.assertIn("--dangerously-skip-permissions", popen.call_args.args[0])
+                self.assertEqual(popen.call_args.kwargs["env"]["ANTHROPIC_MODEL"], "sonnet")
+                with self.assertRaises(BridgeError):
+                    open_workspace_tool("claude", str(tmp), 8788, "bridge-key", 'bad model; exit')
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        def test_workspace_rejects_unknown_apps_missing_paths_and_missing_executables(self) -> None:
+            from unittest import mock
+            tmp = Path(tempfile.mkdtemp(prefix="bridge_workspace_test_"))
+            try:
+                with self.assertRaises(BridgeError):
+                    open_workspace_tool("unknown", str(tmp), 8788, "key")
+                with self.assertRaises(BridgeError):
+                    open_workspace_tool("claude", str(tmp / "missing"), 8788, "key")
+                with mock.patch("shutil.which", return_value=None), self.assertRaises(BridgeError):
+                    open_workspace_tool("claude", str(tmp), 8788, "key")
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        def test_login_only_add_skips_learning_budget_and_keeps_learning_explicit(self) -> None:
+            from unittest import mock
+            tmp, store, cfg, app = mk_env()
+            try:
+                job = types.SimpleNamespace(id="job1")
+                with mock.patch.object(app.acc, "site_guard", return_value=""), mock.patch.object(app.acc, "start_job", return_value=job) as start:
+                    account, started = app.acc.add("https://new.example.com", "New site", learn=False)
+                self.assertIs(started, job)
+                self.assertNotIn("learn_budget", account)
+                self.assertEqual(account["serving_mode"], "browser")
+                self.assertEqual(start.call_args.args[1], "login-only")
+                account["state"] = "needs_learning"
+                self.assertEqual(lc_derive(account, False)[0], "degraded_fallback")
+                self.assertTrue(app.acc.usable(account))
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        def test_profile_bound_login_is_separate_from_optional_learning(self) -> None:
+            from unittest import mock
+            tmp, store, cfg, app = mk_env()
+            try:
+                with mock.patch.object(app.acc, "site_guard", return_value=""):
+                    account, job = app.acc.add("https://claude.ai", "Personal Claude", learn=False, defer_login=True, pc_client_id="profile-a")
+                self.assertIsNone(job)
+                self.assertEqual(account["state"], "login_pending")
+                self.assertNotIn("learn_budget", account)
+                initial_request = app.acc.browser_login_requests("profile-a")
+                self.assertEqual([r["id"] for r in initial_request], [account["id"]])
+                self.assertFalse(initial_request[0]["claimed"])  # assignment to a profile must not disable its login button
+                self.assertEqual(app.acc.browser_login_requests("profile-b"), [])
+                status, _ = app.acc.claim_browser_login("profile-b", {"account_id": account["id"]})
+                self.assertEqual(status, 409)
+                status, _ = app.acc.claim_browser_login("profile-a", {"account_id": account["id"]})
+                self.assertEqual(status, 200)
+                self.assertTrue(app.acc.browser_login_requests("profile-a")[0]["claimed"])
+                with mock.patch.object(app.acc, "start_job", return_value=types.SimpleNamespace(id="login-job")) as start:
+                    status, result = app.acc.confirm_browser_login("profile-a", {"account_id": account["id"], "tab": 9, "url": "https://claude.ai/"})
+                self.assertEqual((status, result["job"]), (200, "login-job"))
+                self.assertEqual(start.call_args.args[1], "login-only")
+                self.assertTrue(start.call_args.kwargs["owner_confirmed"])
+                self.assertEqual(account["pc_client_id"], "profile-a")
+                self.assertEqual(account["pc_login_tab"], 9)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        def test_register_current_browser_tab_creates_profile_bound_login_without_learning(self) -> None:
+            from unittest import mock
+            tmp, store, cfg, app = mk_env()
+            try:
+                with mock.patch.object(app.acc, "site_guard", return_value=""):
+                    row = app.acc.register_browser_tab("profile-a", {"tab": 27, "url": "https://chatgpt.com/", "title": "ChatGPT"})
+                account = app.acc.get(row["account_id"])
+                self.assertEqual((row["tab"], account["pc_client_id"], account["pc_login_tab"]), (27, "profile-a", 27))
+                self.assertEqual(account["state"], "login_claimed")
+                self.assertFalse(account["login_learn"])
+                requests = app.acc.browser_login_requests("profile-a")
+                self.assertEqual(len(requests), 1)
+                self.assertTrue(requests[0]["claimed"])
+                self.assertEqual(app.acc.browser_login_requests("profile-b"), [])
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        def test_login_only_does_not_start_heavy_request_capture(self) -> None:
+            from unittest import mock
+            tmp, store, cfg, app = mk_env()
+            try:
+                job = types.SimpleNamespace(kind="login-only")
+                with mock.patch.object(app.acc, "_learn_inner"), mock.patch("__main__.CdpRecorder") as recorder:
+                    app.acc._learn(types.SimpleNamespace(), {"id": "a", "host": "example.com"}, job)
+                recorder.assert_not_called()
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        def test_dashboard_integrates_advanced_panels_and_workspace_picker(self) -> None:
+            self.assertIn("workspace/select", DASHBOARD_HTML)
+            self.assertIn("workspace/open", DASHBOARD_HTML)
+            self.assertIn("learn_on_add", DASHBOARD_HTML)
+            self.assertIn("function go(v){view=v;", DASHBOARD_HTML)
+            self.assertNotIn("['adv','advanced']", DASHBOARD_HTML)
+            self.assertIn("id=\"decisioncard\"", DASHBOARD_HTML)
+            self.assertIn("data-theme=\"mint\"", DASHBOARD_HTML)
+            self.assertIn("@media(max-width:640px)", DASHBOARD_HTML)
+            self.assertIn("o12Toggle", DASHBOARD_HTML)
+            self.assertIn("b_use", DASHBOARD_HTML)
+            self.assertIn("setModelChoice", DASHBOARD_HTML)
+            self.assertIn("ms.options.map", DASHBOARD_HTML)
+            self.assertIn("/pc/login-claim", PC_BACKGROUND_JS)
+            self.assertIn("function saveStrategy()", DASHBOARD_HTML)
+            self.assertIn("ANTHROPIC_MODEL", DASHBOARD_HTML)
+            self.assertIn("pc_profiles_list", DASHBOARD_HTML)
+            self.assertIn("typeof m==='object'", DASHBOARD_HTML)
+            self.assertIn(".acc.s-ready,.acc.s-needs_learning", DASHBOARD_HTML)
+            self.assertIn(".s-ready .stt,.s-needs_learning .stt", DASHBOARD_HTML)
+            self.assertIn("a.state==='ready'?'ready':'learning'", DASHBOARD_HTML)
+            self.assertIn("a.state==='needs_learning'?(lang==='fa'?'نیازمند یادگیری':'needs_learning')", DASHBOARD_HTML)
+            self.assertIn("register_active_tab", PC_BACKGROUND_JS)
+            self.assertIn("async function testAccount(id)", DASHBOARD_HTML)
+            self.assertIn("Start here", DASHBOARD_HTML)
+            self.assertIn("Remove-Item Env:ANTHROPIC_DEFAULT_SONNET_MODEL", DASHBOARD_HTML)
+            self.assertIn("it never switches this account to Playwright", DASHBOARD_HTML)
+            self.assertIn("--dangerously-skip-permissions", DASHBOARD_HTML)
+            self.assertIn("A saved login marked needs_learning is still usable through its assigned personal Chrome profile", DASHBOARD_HTML)
+            self.assertIn("Start learning", DASHBOARD_HTML)
+            self.assertIn("function workspaceModel(){return 'sonnet'}", DASHBOARD_HTML)
+
+        def test_account_deletion_prunes_its_routes_without_breaking_other_pools(self) -> None:
+            cfg = {"policies": {"pool": {"kind": "rotation", "members": ["acct:a1", "acct:a2"]},
+                                "fixed": {"kind": "fixed", "members": ["acct:a1"]}},
+                   "aliases": {"use-pool": "pool", "use-fixed": "fixed"},
+                   "key_policy": {"key1": "fixed", "key2": "pool"},
+                   "account_policy": {"a1": "fixed"}, "default_policy": "fixed",
+                   "excluded_routes": ["acct:a1", "acct:a2/model:x"]}
+            cleaned = forget_account_routes(cfg, "a1")
+            self.assertEqual(cleaned["policies"], {"pool": {"kind": "rotation", "members": ["acct:a2"]}})
+            self.assertEqual(cleaned["aliases"], {"use-pool": "pool"})
+            self.assertEqual(cleaned["key_policy"], {"key2": "pool"})
+            self.assertEqual(cleaned["account_policy"], {})
+            self.assertEqual(cleaned["default_policy"], "")
+            self.assertEqual(cleaned["excluded_routes"], ["acct:a2/model:x"])
+
     class TestServingModesAndEvidence(unittest.TestCase):
         """Owner-selected serving path and credential-safe learning evidence exports; mock data only."""
 
@@ -27481,6 +30903,9 @@ setTimeout(() => process.exit(0), 60000);
                          "unresolved": ["ui only"], "ui": {"answer": "div.answer"}}
             self.store.write("recipes/mode.test.json", ui_recipe)
             acc.browser = lambda _aid: object()  # type: ignore[assignment]
+            self.assertEqual(acc.serving_mode_view(a)["mode"], "auto")  # legacy accounts keep their saved/default behavior
+            a["serving_mode"] = "browser"
+            self.assertIsInstance(acc.backend(a), UIBackend)
             with self.assertRaises(BridgeError):
                 acc.set_serving_mode("mode1", "direct")
             self.assertEqual(acc.set_serving_mode("mode1", "browser")["mode"], "browser")
@@ -27752,9 +31177,9 @@ setTimeout(() => process.exit(0), 60000);
             except Exception:
                 return r.status, data
 
-        def pair(self) -> str:
+        def pair(self, client_id: str = "legacy", client_name: str = "Chrome profile") -> str:
             code = self.hub.new_pairing()
-            st, j = self.post("/pc/pair", {"code": code}, origin=self.ORIGIN)
+            st, j = self.post("/pc/pair", {"code": code, "client_id": client_id, "client_name": client_name}, origin=self.ORIGIN)
             self.assertEqual(st, 200)
             return j["token"]
 
@@ -27861,6 +31286,31 @@ setTimeout(() => process.exit(0), 60000);
             c.close()
             self.assertGreaterEqual(self.hub.stats["rejected"], 3)
 
+        def test_multiple_chrome_profiles_are_isolated_and_can_repair_independently(self) -> None:
+            tok_a = self.pair("profile-a", "Personal")
+            tok_b = self.pair("profile-b", "Work")
+            self.assertEqual(self.hub.client_for_token(self.ORIGIN, tok_a), "profile-a")
+            self.assertEqual(self.hub.client_for_token(self.ORIGIN, tok_b), "profile-b")
+            a, b = _PCCmd("ping", {}, "profile-a"), _PCCmd("ping", {}, "profile-b")
+            with self.hub.cv:
+                self.hub.cmds[a.id], self.hub.cmds[b.id] = a, b
+                self.hub.queue.extend((a, b))
+            got = self.hub._poll(0, "worker-a", "profile-a")
+            self.assertEqual([x["id"] for x in got], [a.id])
+            self.assertFalse(self.hub._result({"id": a.id, "ok": True, "result": {}}, "profile-b")["ok"])
+            self.assertTrue(self.hub._result({"id": a.id, "ok": True, "result": {}}, "profile-a")["ok"])
+            status, renamed = self.post("/pc/profile-name", {"name": "Personal Dev"}, origin=self.ORIGIN, token=tok_a)
+            self.assertEqual(status, 200)
+            self.assertEqual(renamed["name"], "Personal Dev")
+            code = self.hub.new_pairing()
+            status, repaired = self.post("/pc/pair", {"code": code, "client_id": "profile-a", "client_name": "Personal Dev"}, origin=self.ORIGIN)
+            self.assertEqual(status, 200)
+            self.assertFalse(self.hub.client_for_token(self.ORIGIN, tok_a))
+            self.assertEqual(self.hub.client_for_token(self.ORIGIN, repaired["token"]), "profile-a")
+            self.assertEqual(self.hub.client_for_token(self.ORIGIN, tok_b), "profile-b")
+            self.assertEqual(self.hub.profiles()[1]["name"], "Work")
+
+
         def test_pairing_rules(self) -> None:
             code = self.hub.new_pairing()
             self.assertEqual(self.post("/pc/pair", {"code": code}, origin="https://evil.example")[0], 403)                # only an extension origin may pair
@@ -27960,11 +31410,11 @@ setTimeout(() => process.exit(0), 60000);
 
         def test_context_pages_goto_evaluate_and_close_only_own_tabs(self) -> None:
             e = self.fake()
-            e.tabs[5] = {"id": 5, "url": "https://personal.example/", "title": "mine", "owned": False}                   # the user's own tab
-            ctx = self.ctx(e)
-            self.assertEqual(ctx.pages, [])
-            pg = ctx.new_page()
+            e.tabs[5] = {"id": 5, "url": "https://personal.example/", "title": "mine", "owned": False, "consented": True} # selected by the owner
+            ctx = self.ctx(e, login_tab=5)
             self.assertEqual(len(ctx.pages), 1)
+            pg = ctx.new_page()
+            self.assertEqual(len(ctx.pages), 2)
             e.evals["document.title"] = "Hello"
             pg.goto("https://site.test/", wait_until="domcontentloaded", timeout=5000)
             self.assertEqual(pg.url, "https://site.test/")
@@ -27978,8 +31428,77 @@ setTimeout(() => process.exit(0), 60000);
             with self.assertRaises(PCError):
                 pg.goto("javascript:alert(1)")
             ctx.close()
-            self.assertIn(5, e.tabs)                                                                                     # the user's tab was never closed
+            self.assertIn(5, e.tabs)                                                                                     # the selected user tab is borrowed, never closed
             self.assertEqual([t for t in e.tabs if e.tabs[t].get("owned")], [])
+
+        def test_the_owners_tab_is_found_again_after_the_context_was_closed_and_never_replaced_by_a_new_tab(self) -> None:
+            e = self.fake()
+            e.tabs[5] = {"id": 5, "url": "https://site.test/chat", "title": "mine", "owned": False, "consented": True}
+            creates = lambda: sum(1 for x in e.executed if x[0] == "tab.create")                                         # noqa: E731
+            for _round in range(3):                                                                                      # idle close + next request, three times
+                ctx = self.ctx(e, login_tab=5, site_host="site.test")
+                self.assertEqual([p.tab_id for p in ctx.pages], [5])
+                pg = ctx.pages[0] if ctx.pages else ctx.new_page()
+                self.assertEqual(pg.tab_id, 5)
+                ctx.close()
+            self.assertEqual(creates(), 0)
+            self.assertIn(5, e.tabs)                                                                                     # still the owner's tab, still open
+
+        def test_when_the_remembered_tab_is_gone_another_consented_tab_of_the_same_site_is_used_and_kept_open(self) -> None:
+            e = self.fake()
+            e.tabs[7] = {"id": 7, "url": "https://chat.site.test/c/1", "title": "other", "owned": False, "consented": True}
+            e.tabs[8] = {"id": 8, "url": "https://elsewhere.test/", "title": "no", "owned": False, "consented": True}
+            ctx = self.ctx(e, login_tab=5, site_host="site.test")                                                        # tab 5 no longer exists
+            self.assertEqual([p.tab_id for p in ctx.pages], [7])                                                         # same site only, never the unrelated consented tab
+            ctx.close()
+            self.assertIn(7, e.tabs)                                                                                     # borrowed: detached, not closed
+            e.tabs.pop(7)                                                                                                # the owner closed that one too
+            ctx2 = self.ctx(e, login_tab=5, site_host="site.test")
+            self.assertEqual(ctx2.pages, [])                                                                             # nothing to adopt: only then a new tab is opened by new_page()
+            ctx2.close()
+
+        def test_the_account_remembers_its_tab_after_login_and_hands_it_to_every_browser_run(self) -> None:
+            tmp, _store, _cfg, app = mk_env({"cache_seconds": 0})
+            try:
+                a = add_acct(app, "t1", "Tab", "site.test", pc_client_id="c1")
+                self.assertIsNone(app.acc.browser("t1").login_tab)
+                a["pc_login_tab"] = 5
+                self.assertEqual(app.acc.browser("t1").login_tab, 5)
+                a["pc_home_tab"], a["pc_login_tab"] = 5, None
+                a.pop("pc_login_tab")
+                ab = app.acc.browser("t1")
+                self.assertEqual((ab.login_tab, ab.site_host), (5, "site.test"))                                         # kept, not consumed by the first run
+                a["pc_home_tab"] = 9
+                self.assertEqual(app.acc.browser("t1").login_tab, 9)                                                     # a new tab id is picked up at once
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        def test_a_verification_brings_the_tab_to_the_front_waits_for_the_owner_and_then_continues(self) -> None:
+            from unittest import mock
+
+            class Pg:
+                url = "https://site.test/"
+
+                def __init__(self) -> None:
+                    self.front, self.waits = 0, 0
+
+                def bring_to_front(self) -> None:
+                    self.front += 1
+
+                def wait_for_timeout(self, ms: int) -> None:
+                    self.waits += 1
+            pg, states, said = Pg(), [{"blocked_by": "widget", "challenge": True}] * 4 + [{"blocked_by": "", "challenge": False}] * 3, []
+            seq = iter(states)
+            with mock.patch.dict(globals(), {"ui_page_state": lambda page: next(seq)}):
+                ui_wait_ready(pg, timeout=5, say=said.append, poll_ms=1)                                                 # 5 s would be too short for a human: the wait is stretched
+            self.assertEqual(pg.front, 1)                                                                                # shown once, not on every poll
+            self.assertTrue(any("verification" in m for m in said))
+            seq2 = iter([{"blocked_by": "no_input", "challenge": False}] * 40)
+            pg2 = Pg()
+            with mock.patch.dict(globals(), {"ui_page_state": lambda page: next(seq2)}):
+                with self.assertRaises(BridgeError):
+                    ui_wait_ready(pg2, timeout=1, poll_ms=1)
+            self.assertEqual(pg2.front, 0)                                                                               # no challenge: the owner's tab is not pulled to the front
 
         def test_locator_click_fill_keys_use_trusted_input_events(self) -> None:
             e = self.fake()
@@ -28158,9 +31677,10 @@ setTimeout(() => process.exit(0), 60000);
                 setup = json.loads(b)
                 self.assertEqual(st, 200)
                 self.assertEqual(len(setup["code"]), 8)
-                self.assertTrue(setup["chrome_page_opened"] and setup["folder_opened"])
+                self.assertFalse(setup["chrome_page_opened"])                                      # setup must not choose a Chrome profile for the owner
+                self.assertTrue(setup["folder_opened"])
                 self.assertTrue(Path(setup["extension_dir"], "manifest.json").is_file())
-                open_page.assert_called_once_with("chrome://extensions")
+                open_page.assert_not_called()
                 open_folder.assert_called_once_with(setup["extension_dir"])
                 self.assertNotIn(setup["code"], json.dumps(pc_api_status()))
                 self.assertIn("pc_start", DASHBOARD_HTML)
@@ -28399,10 +31919,394 @@ setTimeout(() => process.exit(0), 60000);
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
 
+    class TestReliability771(unittest.TestCase):
+        """7.71/7.72: the nine reliability changes - end marker, network text, full schema check, session pre-check, fewer tools, native format, numbers, replay, daily probe."""
+        EDIT = {"name": "Edit", "description": "edit a file", "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}, "old_string": {"type": "string"}, "new_string": {"type": "string"},
+                                                                                 "replace_all": {"type": "boolean"}}, "required": ["file_path", "old_string", "new_string"], "additionalProperties": False}}
+        READ = {"name": "Read", "description": "read a file", "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}, "offset": {"type": "integer"}}, "required": ["file_path"]}}
+        BASH = {"name": "Bash", "description": "run a command", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}
+
+        def req(self, messages: List[Dict[str, Any]], tools: Optional[Dict[str, Dict[str, Any]]] = None, choice: Optional[Dict[str, Any]] = None) -> "NormReq":
+            return NormReq("", messages, tools if tools is not None else {"Edit": self.EDIT, "Read": self.READ, "Bash": self.BASH}, choice, False, 1000, "m", "anthropic")
+
+        @staticmethod
+        def read_turn(path: str, text: str, tid: str = "r1", **inp: Any) -> List[Dict[str, Any]]:
+            numbered = "\n".join(f"{i:>6}\u2192{ln}" for i, ln in enumerate(text.split("\n"), 1))
+            return [{"role": "assistant", "content": [{"type": "tool_use", "id": tid, "name": "Read", "input": {"file_path": path, **inp}}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid, "content": numbered}]}]
+
+        # 1 ---- end marker
+        def test_marker_filter_never_leaks_a_split_marker_and_keeps_lookalikes(self) -> None:
+            m = end_marker()
+            self.assertTrue(m)
+            f, out = MarkerFilter(m), ""
+            for piece in ("Hello ", m[:2], m[2:4], m[4:]):
+                out += f.feed(piece)
+            out += f.finish()
+            self.assertEqual(out, "Hello ")
+            self.assertTrue(f.seen)
+            f2 = MarkerFilter(m)
+            out2 = f2.feed("price " + m[:2]) + f2.feed("x done") + f2.finish()
+            self.assertEqual(out2, "price " + m[:2] + "x done")                      # a half marker that never completes is text, not lost
+            self.assertFalse(f2.seen)
+            self.assertEqual(strip_marker("text\n" + m, m), ("text", True))
+            self.assertEqual(strip_marker("plain", m), ("plain", False))
+
+        def test_end_decision_prefers_the_marker_then_the_network_then_silence(self) -> None:
+            m = end_marker()
+            self.assertEqual(ui_decide_end("a " + m, m, 1.0, True, True, 1.6, True, 6.0, False), "marker")        # still 'generating' but the model said it is done
+            self.assertEqual(ui_decide_end("abc", m, 3.0, False, True, 1.6, True, 6.0, False), "")               # silence alone waits longer where the marker rule is followed
+            self.assertEqual(ui_decide_end("abc", m, 7.0, False, True, 1.6, True, 6.0, False), "stop")
+            self.assertEqual(ui_decide_end("abc", m, 2.0, False, True, 1.6, False, 6.0, False), "stop")          # a site that ignores the rule is not made to wait
+            self.assertEqual(ui_decide_end("abc", m, 0.5, True, True, 1.6, True, 6.0, True), "network")
+            self.assertEqual(ui_decide_end("a " + m, m, 0.1, True, True, 1.6, True, 6.0, False), "")             # not before the text is stable
+
+        def test_tool_prompt_carries_the_marker_rule_and_fix_message_repeats_it(self) -> None:
+            m = end_marker()
+            for fmt in ("fenced", "tag", "dsml"):
+                self.assertIn(m, tools_text({"Read": self.READ}, {}, 200, True, fmt=fmt))
+            r = self.req([])
+            self.assertIn(m, fix_message(r, ["tool 'Read' is missing required argument(s): file_path"], False))
+
+        # 2 ---- network text
+        def test_network_text_is_extracted_without_reasoning_and_only_used_when_it_agrees(self) -> None:
+            pl = ['{"v":"The answer is "}', '{"type":"thinking","text":"SECRET REASONING"}', '{"p":"response/thinking","v":"more reasoning"}',
+                  '{"choices":[{"delta":{"content":"**forty two**"}}]}', "[DONE]"]
+            txt = extract_stream_text(pl)
+            self.assertEqual(txt, "The answer is **forty two**")
+            self.assertNotIn("REASONING", txt.upper())
+            self.assertEqual(extract_stream_text(['{"text":"Hel"}', '{"text":"Hello"}', '{"text":"Hello wor"}', '{"text":"Hello world"}']), "Hello world")      # cumulative stream
+            raw = 'event: m\ndata: {"v":"alpha "}\n\ndata: {"v":"beta"}\n\ndata: [DONE]\n\n'
+            self.assertEqual(extract_stream_text(sse_payloads(raw)), "alpha beta")
+            self.assertEqual(sse_payloads('{"a":1}\n{"b":2}\n'), ['{"a":1}', '{"b":2}'])
+            dom = "Here is the plan for the refactor of the parser module."
+            self.assertTrue(net_agrees(dom, "Here is the **plan** for the refactor of the parser module.\n"))
+            self.assertFalse(net_agrees(dom, "A completely different answer text about something else."))
+            self.assertFalse(net_agrees(dom, "Here is the plan"))                                                   # shorter than the page: never used
+
+        def test_nettap_returns_only_a_finished_agreeing_stream(self) -> None:
+            tap = NetTap()
+            tap._resp({"requestId": "1", "response": {"url": "https://x.test/c", "mimeType": "text/event-stream", "headers": {}}})
+            tap._resp({"requestId": "2", "response": {"url": "https://x.test/a.js", "mimeType": "application/javascript", "headers": {}}})
+            self.assertEqual(tap.seen(), 1)
+            tap._es({"requestId": "1", "data": '{"v":"Here is the plan for the refactor "}'})
+            tap._es({"requestId": "1", "data": '{"v":"of the parser module."}'})
+            dom = "Here is the plan for the refactor of the parser module."
+            self.assertIsNone(tap.final_text(dom))                                                                   # not finished yet
+            tap._fin({"requestId": "1"})
+            self.assertEqual(tap.final_text(dom), "Here is the plan for the refactor of the parser module.")
+            self.assertIsNone(tap.final_text("something else entirely that the page shows"))
+
+        # 3 ---- schema
+        def test_schema_reports_type_enum_extra_length_range_and_nesting(self) -> None:
+            sch = {"type": "object", "properties": {"file_path": {"type": "string", "minLength": 1}, "mode": {"enum": ["a", "b"]}, "n": {"type": "integer", "minimum": 1, "maximum": 5},
+                                                    "tags": {"type": "array", "items": {"type": "string"}, "maxItems": 2}, "o": {"type": "object", "required": ["k"], "properties": {"k": {"type": "boolean"}}}},
+                   "required": ["file_path"], "additionalProperties": False}
+            self.assertEqual(validate_args(sch, {"file_path": "x", "mode": "a", "n": 3, "tags": ["t"], "o": {"k": True}}), [])
+            self.assertIn("missing required", validate_args(sch, {})[0])
+            self.assertTrue(any("one of" in e and "'mode'" in e for e in validate_args(sch, {"file_path": "x", "mode": "z"})))
+            self.assertTrue(any("must be integer" in e for e in validate_args(sch, {"file_path": "x", "n": "3"})))
+            self.assertTrue(any("must be integer" in e for e in validate_args(sch, {"file_path": "x", "n": True})))     # a boolean is not a number
+            self.assertTrue(any("<= 5" in e for e in validate_args(sch, {"file_path": "x", "n": 9})))
+            self.assertTrue(any("too short" in e for e in validate_args(sch, {"file_path": ""})))
+            self.assertTrue(any("unexpected" in e and "zz" in e for e in validate_args(sch, {"file_path": "x", "zz": 1})))
+            self.assertTrue(any("tags[1]" in e for e in validate_args(sch, {"file_path": "x", "tags": ["a", 1]})))
+            self.assertTrue(any("'o'" in e and "k" in e for e in validate_args(sch, {"file_path": "x", "o": {}})))
+            self.assertEqual(validate_args(sch, {"file_path": "x", "mode": "z", "zz": 1}, "basic"), [])               # basic: required + types only
+            self.assertEqual(validate_args(sch, {"file_path": "x", "n": "3"}, "off"), [])
+            self.assertEqual(len(validate_args(sch, {"file_path": "x", "n": "3"}, "basic")), 1)
+            self.assertEqual(validate_args({}, {"anything": 1}), [])
+
+        def test_parser_sends_the_exact_schema_error_back(self) -> None:
+            tools = {"Edit": self.EDIT}
+            reply = '```tool_call\n{"name": "Edit", "arguments": {"file_path": "a.py", "old_string": "x", "new_string": "y", "dry_run": true}}\n```'
+            _clean, calls, problems = parse_tool_calls(reply, tools, "s")
+            self.assertEqual(calls, [])
+            self.assertTrue(problems and "Edit" in problems[0] and "dry_run" in problems[0], problems)
+            ok = '```tool_call\n{"name": "Edit", "arguments": {"file_path": "a.py", "old_string": "x", "new_string": "y"}}\n```'
+            _c, calls2, problems2 = parse_tool_calls(ok, tools, "s")
+            self.assertEqual((len(calls2), problems2), (1, []))
+
+        # 4 ---- pre-check
+        def test_precheck_refuses_only_what_provably_cannot_work(self) -> None:
+            body = "def a():\n    return 1\n\ndef b():\n    return 1\n"
+            hist = self.read_turn("/p/f.py", body)
+            ed = lambda old, new="z", **k: {"name": "Edit", "input": {"file_path": "/p/f.py", "old_string": old, "new_string": new, **k}}       # noqa: E731
+            run = lambda calls, msgs=hist: precheck_calls(self.req(msgs), calls, {})                                                              # noqa: E731
+            ok, pr = run([ed("def a():")])
+            self.assertEqual((len(ok), pr), (1, []))
+            ok, pr = run([ed("def zzz():")])
+            self.assertEqual(ok, [])
+            self.assertIn("not found", pr[0])
+            ok, pr = run([ed("return 1")])
+            self.assertIn("2 times", pr[0])
+            ok, pr = run([ed("return 1", replace_all=True)])
+            self.assertEqual((len(ok), pr), (1, []))
+            ok, pr = run([ed("def a():", "def a():")])
+            self.assertIn("identical", pr[0])
+            ok, pr = run([{"name": "Edit", "input": {"file_path": "/other.py", "old_string": "a", "new_string": "b"}}])
+            self.assertIn("has not been read", pr[0])
+            ok, pr = run([ed("12\u2192def a():")])
+            self.assertTrue(pr)
+            miss = [{"role": "assistant", "content": [{"type": "tool_use", "id": "m1", "name": "Read", "input": {"file_path": "/p/gone.py"}}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "m1", "is_error": True, "content": "File does not exist."}]}]
+            ok, pr = run([{"name": "Edit", "input": {"file_path": "/p/gone.py", "old_string": "a", "new_string": "b"}}], miss)
+            self.assertIn("does not exist", pr[0])
+
+        def test_precheck_stays_quiet_when_it_cannot_be_sure(self) -> None:
+            body = "line one\nline two\n"
+            ed = {"name": "Edit", "input": {"file_path": "/p/f.txt", "old_string": "line two", "new_string": "x"}}
+            part = self.read_turn("/p/f.txt", body, offset=10)                                                         # partial read: content unknown
+            self.assertEqual(precheck_calls(self.req(part), [ed], {})[1], [])
+            shell = part[:0] + self.read_turn("/p/f.txt", body) + [{"role": "assistant", "content": [{"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "sed -i s/one/uno/ /p/f.txt"}}]},
+                                                                  {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "b1", "content": ""}]}]
+            bad = {"name": "Edit", "input": {"file_path": "/p/f.txt", "old_string": "line one", "new_string": "x"}}
+            self.assertEqual(precheck_calls(self.req(shell), [bad], {})[1], [])                                         # a shell command may have changed it
+            same = [{"name": "Read", "input": {"file_path": "/p/new.txt"}}, {"name": "Edit", "input": {"file_path": "/p/new.txt", "old_string": "a", "new_string": "b"}}]
+            self.assertEqual(precheck_calls(self.req([]), same, {})[1], [])                                             # read earlier in the very same reply
+            two = [{"name": "Edit", "input": {"file_path": "/p/f.txt", "old_string": "line two", "new_string": "line 2"}}, {"name": "Edit", "input": {"file_path": "/p/f.txt", "old_string": "line two", "new_string": "x"}}]
+            ok, pr = precheck_calls(self.req(self.read_turn("/p/f.txt", body)), two, {})
+            self.assertEqual((len(ok), pr), (2, []))                                                                   # a file changed earlier in the same reply is not judged (its state is unknown)
+            off = RELCFG["precheck"]
+            try:
+                RELCFG["precheck"] = False
+                self.assertEqual(precheck_calls(self.req([]), [bad], {}), ([bad], []))
+            finally:
+                RELCFG["precheck"] = off
+
+        # 5 ---- fewer tools
+        def test_fewer_tools_keeps_core_forced_used_and_topical_tools(self) -> None:
+            tools = {n: {"name": n, "description": d, "input_schema": {"type": "object"}} for n, d in
+                     [("Bash", "shell"), ("Read", "read"), ("Edit", "edit"), ("Write", "write"), ("Glob", "glob"), ("Grep", "grep"), ("MultiEdit", "multi")]}
+            for i in range(30):
+                tools[f"mcp__svc__tool{i}"] = {"name": f"mcp__svc__tool{i}", "description": "unrelated helper number %d" % i, "input_schema": {"type": "object"}}
+            tools["mcp__jira__create_ticket"] = {"name": "mcp__jira__create_ticket", "description": "create a jira ticket", "input_schema": {"type": "object"}}
+            cfg = {"tools_per_turn_max": 12, "tools_core": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "MultiEdit"]}
+            msgs = [{"role": "user", "content": [{"type": "text", "text": "please create a jira ticket for this bug"}]}]
+            shown, hidden = select_tools(self.req(msgs, tools), cfg)
+            self.assertEqual(len(shown), 12)
+            self.assertEqual(len(shown) + len(hidden), len(tools))
+            self.assertIn("mcp__jira__create_ticket", shown)
+            for n in ("Bash", "Read", "Edit", "Write"):
+                self.assertIn(n, shown)
+            used = msgs + [{"role": "assistant", "content": [{"type": "tool_use", "id": "u", "name": "mcp__svc__tool7", "input": {}}]}]
+            self.assertIn("mcp__svc__tool7", select_tools(self.req(used, tools), cfg)[0])
+            sh2, _h2 = select_tools(self.req(msgs, tools, {"type": "tool", "name": "mcp__svc__tool29"}), cfg)
+            self.assertIn("mcp__svc__tool29", sh2)
+            all_, none = select_tools(self.req(msgs, tools), {"tools_per_turn_max": 0, "tools_core": []})
+            self.assertEqual((len(all_), none), (len(tools), {}))
+            text = tools_text(shown, {}, 120, True, hidden=hidden)
+            self.assertIn("More tools exist", text)
+            self.assertIn("mcp__svc__tool0", text)
+
+        # 6 ---- native format
+        def test_native_dsml_format_is_chosen_by_host_written_and_parsed(self) -> None:
+            cfg = {"tool_format_by_host": {"deepseek": "dsml"}, "tool_format": "auto"}
+            self.assertEqual(choose_tool_format(cfg, "chat.deepseek.com", None), "dsml")
+            self.assertEqual(choose_tool_format(cfg, "chatgpt.com", type("B", (), {"fenced_tools": True})()), "fenced")
+            self.assertEqual(choose_tool_format(cfg, "other.test", type("B", (), {"fenced_tools": False})()), "tag")
+            self.assertEqual(choose_tool_format({"tool_format_by_host": {}, "tool_format": "tag"}, "chat.deepseek.com", None), "tag")
+            text = tools_text({"Read": self.READ}, {}, 200, False, fmt="dsml")
+            self.assertIn("DSML", text)
+            self.assertNotIn("never XML", text)
+            rendered = render_call_dsml("Read", {"file_path": "/a/b.py", "offset": 5})
+            _c, calls, problems = parse_tool_calls("I will read it.\n" + rendered, {"Read": self.READ}, "s")
+            self.assertEqual(problems, [])
+            self.assertEqual(calls[0]["input"], {"file_path": "/a/b.py", "offset": 5})
+            self.assertEqual(detect_tool_format(rendered), "dsml")
+            self.assertEqual(detect_tool_format("```tool_call\n{}\n```"), "fenced")
+            self.assertEqual(detect_tool_format("hello"), "none")
+
+        # 7 ---- numbers
+        def test_reliability_numbers_are_counted_and_survive_a_restart(self) -> None:
+            tmp = Path(tempfile.mkdtemp(prefix="bridge_rel_"))
+            try:
+                st = Store(tmp)
+                r = Reliability()
+                r.bind(st)
+                for i in range(10):
+                    r.record("a.test", attempted=True, first_ok=i < 8, final_ok=True, cut_off=i == 9, retries=0 if i < 8 else 1, marker_expected=True, marker_seen=i < 4, end_via="marker" if i < 4 else "quiet", seconds=1.0 + i)
+                r.record("b.test", attempted=False, seconds=0.5)
+                row = {x["host"]: x for x in r.view()["hosts"]}["a.test"]
+                self.assertEqual((row["parse_ok_pct"], row["final_ok_pct"], row["cut_off_pct"], row["retries"], row["marker_pct"]), (80.0, 100.0, 10.0, 2, 40.0))
+                self.assertEqual(row["ended_by"], {"marker": 4, "quiet": 6})
+                self.assertEqual(row["p50_s"], 5.0)
+                self.assertFalse(r.marker_trusted("a.test"))                                                            # >= 8 samples, followed under half: stop waiting for it
+                self.assertTrue(r.marker_trusted("never.seen"))
+                r.alert("probe_failed", "a.test", "x" * 400)
+                r.flush()
+                r2 = Reliability()
+                r2.bind(Store(tmp))
+                self.assertEqual({x["host"] for x in r2.view()["hosts"]}, {"a.test", "b.test"})
+                self.assertEqual(len(r2.view()["alerts"]), 1)
+                self.assertLessEqual(len(r2.view()["alerts"][0]["message"]), 300)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        # 8 ---- replay
+        def test_replay_masks_secrets_and_flags_regressions_and_improvements(self) -> None:
+            tmp = Path(tempfile.mkdtemp(prefix="bridge_replay_"))
+            try:
+                rs = ReplayStore(tmp / "replay", 5)
+                tools = {"Read": self.READ}
+                good = 'Reading.\n```tool_call\n{"name": "Read", "arguments": {"file_path": "C:\\\\Users\\\\alice\\\\proj\\\\a.py"}}\n```\nmail bob@corp.com sk-ant-api03-ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+                cid = rs.record("x.test", tools, good)
+                self.assertTrue(cid)
+                self.assertIsNone(rs.record("x.test", tools, good))                                                    # same reply twice: stored once
+                blob = (tmp / "replay" / (cid + ".json")).read_text("utf-8")
+                for secret in ("alice", "bob@corp.com", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"):
+                    self.assertNotIn(secret, blob)
+                rep = rs.run()
+                self.assertEqual((rep["total"], rep["same"], rep["regressions"], rep["improved"]), (1, 1, [], []))
+                p = tmp / "replay" / (cid + ".json")
+                c = json.loads(p.read_text("utf-8"))
+                c["expect"]["calls"] = [["Read", "000000000000"]]                                                       # pretend an older version parsed it differently
+                p.write_text(json.dumps(c), "utf-8")
+                rep2 = rs.run()
+                self.assertEqual(len(rep2["regressions"]), 1)
+                rep3 = rs.run(accept=True)
+                self.assertEqual(len(rep3["regressions"]), 1)
+                self.assertEqual(rs.run()["same"], 1)                                                                   # accepted as the new expectation
+                c = json.loads(p.read_text("utf-8"))
+                c["expect"] = {"calls": [], "n_problems": 1, "clean_sha": c["expect"]["clean_sha"]}
+                p.write_text(json.dumps(c), "utf-8")
+                self.assertEqual(len(rs.run()["improved"]), 1)
+                for i in range(8):
+                    rs.record("x.test", tools, good + f" {i}")
+                self.assertLessEqual(rs.summary()["cases"], 5)                                                         # bounded
+                self.assertIsNone(ReplayStore(None).record("x", tools, good))
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        # ---- 7.72: the whole path through the router with a scripted site
+        def run_site(self, replies: List[str], messages: List[Dict[str, Any]], cfg_extra: Optional[Dict[str, Any]] = None) -> Tuple[Outcome, List[str]]:
+            tmp, _store, _cfg, app = mk_env({"cache_seconds": 0, "continuity": False, **(cfg_extra or {})})
+            self.addCleanup(shutil.rmtree, tmp, True)
+            add_acct(app, "s1", "Site", "site.test")
+
+            class BE:
+                tier, fenced_tools = "direct", True
+
+                def __init__(self) -> None:
+                    self.prompts: List[str] = []
+
+                def new_conv(self, model: Optional[str] = None) -> Dict[str, Any]:
+                    return {"n": 1}
+
+                def ask(self, conv: Any, prompt: str, cancel: Any = None, model: str = "") -> Iterator[str]:
+                    self.prompts.append(prompt)
+                    yield replies[min(len(self.prompts), len(replies)) - 1]
+            be = BE()
+            app.acc.backend = lambda acct: be                                                  # type: ignore[assignment]
+            rq = self.req(messages)
+            rq.model = "bridge-auto"
+            out = app.router.handle(rq, lambda t: None, "", threading.Event(), scope="k")
+            return out, be.prompts
+
+        @staticmethod
+        def fence(name: str, args: Dict[str, Any]) -> str:
+            return "```tool_call\n" + json.dumps({"name": name, "arguments": args}) + "\n```"
+
+        def test_a_refused_edit_is_sent_back_then_corrected_and_the_marker_never_reaches_the_client(self) -> None:
+            M = end_marker()
+            hist = [{"role": "user", "content": [{"type": "text", "text": "fix the bug"}]}] + self.read_turn("/p/f.py", "def a():\n    return 1\n")
+            bad = self.fence("Edit", {"file_path": "/p/f.py", "old_string": "def zzz():", "new_string": "x"})
+            good = self.fence("Edit", {"file_path": "/p/f.py", "old_string": "def a():", "new_string": "def b():"})
+            out, prompts = self.run_site(["Fixing now.\n" + bad + "\n" + M, good + "\n" + M], hist)
+            self.assertEqual(len(prompts), 2)                                                  # the model was asked again, with the exact reason
+            self.assertIn("not found in /p/f.py", prompts[1])
+            self.assertIn(M, prompts[0])                                                       # the marker rule was in the prompt
+            self.assertEqual([c["input"]["old_string"] for c in out.calls], ["def a():"])
+            self.assertNotIn(M, out.text)
+
+        def test_a_call_the_model_insists_on_is_released_after_the_retries_not_dropped(self) -> None:
+            hist = [{"role": "user", "content": [{"type": "text", "text": "fix the bug"}]}] + self.read_turn("/p/f.py", "def a():\n    return 1\n")
+            same = self.fence("Edit", {"file_path": "/p/f.py", "old_string": "def zzz():", "new_string": "x"})
+            out, prompts = self.run_site([same + "\n" + end_marker()], hist)
+            self.assertEqual(len(prompts), 3)                                                  # first answer + fix_retries (2) re-asks
+            self.assertEqual([c["name"] for c in out.calls], ["Edit"])                         # released: the real tool is the judge
+            out2, prompts2 = self.run_site([same], hist, {"fix_retries": 0})
+            self.assertEqual((len(prompts2), len(out2.calls)), (1, 1))                         # no retry budget: nothing to wait for, nothing lost
+
+        def test_a_schema_error_is_sent_back_and_an_unfixable_one_is_still_never_executed(self) -> None:
+            hist = [{"role": "user", "content": [{"type": "text", "text": "read it"}]}]
+            bad = self.fence("Read", {"file_path": "/p/f.py", "offset": "ten"})
+            good = self.fence("Read", {"file_path": "/p/f.py", "offset": 10})
+            out, prompts = self.run_site([bad, good], hist)
+            self.assertIn("offset", prompts[1])
+            self.assertEqual(out.calls[0]["input"]["offset"], 10)
+            out2, _p = self.run_site([bad], hist)
+            self.assertEqual(out2.calls, [])                                                   # a call that breaks the schema never reaches Claude Code
+
+        # 9 ---- daily probe
+        def test_daily_probe_alerts_on_failure_and_format_change_and_respects_busy_accounts(self) -> None:
+            tmp, _store, _cfg, app = mk_env({"cache_seconds": 0, "tool_probe_hours": 24})
+            RELIABILITY.alerts.clear()
+            try:
+                a = add_acct(app, "p1", "Probe", "probe.test")
+                mode = {"v": "ok", "raw": "```tool_call\n{}\n```"}
+
+                def fake(acct: Dict[str, Any], req: Any, emit: Any, cancel: Any) -> Any:
+                    if mode["v"] == "boom":
+                        raise BridgeError("upstream", "site returned 500")
+                    tok = re.search(r'value "([0-9a-f]+)"', req.messages[0]["content"][0]["text"]).group(1)    # type: ignore[union-attr]
+                    calls = [] if mode["v"] == "none" else [{"name": "bridge_ping", "input": {"value": "wrong" if mode["v"] == "wrong" else tok}, "id": "t"}]
+                    o = Outcome("", calls, "")
+                    o.raw = mode["raw"]                                                                           # type: ignore[attr-defined]
+                    return o
+                app.router._run = fake                                                                            # type: ignore[assignment]
+                r1 = app.probe.run_one(a)
+                self.assertTrue(r1["ok"], r1)
+                self.assertEqual(r1["format"], "fenced")
+                self.assertEqual(len(RELIABILITY.alerts), 0)
+                mode["raw"] = "<" + _DSML + "DSML" + _DSML + "function_calls>"
+                r2 = app.probe.run_one(a)
+                self.assertTrue(r2["ok"])
+                self.assertEqual([x["kind"] for x in RELIABILITY.alerts], ["format_changed"])
+                for m_, why in (("none", "no valid tool call"), ("wrong", "wrong value"), ("boom", "upstream")):
+                    mode["v"] = m_
+                    r = app.probe.run_one(a)
+                    self.assertFalse(r["ok"])
+                    self.assertIn(why, r["reason"])
+                self.assertEqual(sum(1 for x in RELIABILITY.alerts if x["kind"] == "probe_failed"), 3)
+                a["cooldown_until"] = now() + 100
+                self.assertFalse(app.probe.run_one(a)["ran"])
+                a["cooldown_until"] = 0
+                app.acc.inflight[a["id"]] = 1
+                self.assertFalse(app.probe.run_one(a)["ran"])
+                app.acc.inflight[a["id"]] = 0
+                self.assertFalse(app.probe.run_one(add_acct(app, "api1", "Api", "api.test", type="api"))["ran"])
+                self.assertEqual(app.probe.run_due(), 0)                                                          # probed just now: nothing is due
+                app.probe.state["p1"]["t"] = now() - 25 * 3600
+                mode["v"] = "ok"
+                self.assertEqual(app.probe.run_due(), 1)
+                self.assertTrue(reliability_report(app)["probe"]["accounts"]["p1"]["ok"])
+            finally:
+                RELIABILITY.alerts.clear()
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        def test_dashboard_api_and_settings_expose_the_numbers(self) -> None:
+            tmp, _store, cfg, app = mk_env({"cache_seconds": 0})
+            try:
+                srv = Server(app)
+                try:
+                    adm = {"x-admin-key": cfg["admin_key"]}
+                    st, _h, b = call(srv.port, "GET", "/api/reliability", None, adm)
+                    self.assertEqual(st, 200)
+                    j = json.loads(b)
+                    for k in ("hosts", "alerts", "settings", "probe", "replay"):
+                        self.assertIn(k, j)
+                    self.assertEqual(j["settings"]["end_marker_text"], end_marker())
+                    self.assertEqual(call(srv.port, "GET", "/api/reliability", None, {})[0], 401)
+                finally:
+                    srv.close()
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
     all_cases = (TestFixes725, TestResolver, TestHashing, TestStreamDecoder, TestRouterCore, TestHTTP, TestPersistence, TestSecurityHelpers, TestApiBackend, TestCatalog, TestRouting, TestResolutionCatalog,
-                 TestErrorsAndLimits, TestTaskStateAndFailover, TestContextEngine, TestSubmission, TestGroupO, TestGroupOSetup, TestGroupOCapture, TestGroupO5, TestGroupO17, TestGroupO18, TestGroupO19, TestGroupO8, TestGroupO9, TestGroupO9Supervisor, TestGroupO827, TestGroupO827b, TestGroupO21Link, TestGroupO14, TestGroupO13, TestGroupO15, TestGroupO25, TestGroupO26, TestGroupO27, TestGroupO28, TestServingModesAndEvidence, TestAutomaticDependencySetup, TestReportInSync, TestFixes732, TestGroupO12Dash, TestGroupO11, TestLogFile, TestAccessAndDashboardLog, TestPersonalChrome, TestQuickSmoke)
+                 TestErrorsAndLimits, TestTaskStateAndFailover, TestContextEngine, TestSubmission, TestGroupO, TestGroupOSetup, TestGroupOCapture, TestGroupO5, TestGroupO17, TestGroupO18, TestGroupO19, TestGroupO8, TestGroupO9, TestGroupO9Supervisor, TestGroupO827, TestGroupO827b, TestGroupO21Link, TestGroupO14, TestGroupO13, TestGroupO15, TestGroupO25, TestGroupO26, TestGroupO27, TestGroupO28, TestWorkspaceAndOptionalLearning, TestServingModesAndEvidence, TestAutomaticDependencySetup, TestReportInSync, TestFixes732, TestGroupO12Dash, TestGroupO11, TestLogFile, TestAccessAndDashboardLog, TestPersonalChrome, TestToolCallParser, TestUIWait, TestUIAnswerReader, TestReliability771, TestQuickSmoke)
     only = os.environ.get("BRIDGE_SELFTEST_ONLY", "")             # lean workflow (section 0A): BRIDGE_SELFTEST_ONLY=TestSubmission,TestContextEngine runs just those classes
-    for case in ((TestQuickSmoke,) if quick else tuple(c for c in all_cases if not only or c.__name__ in only.split(","))):
+    for case in ((TestQuickSmoke, TestToolCallParser, TestUIWait) if quick else tuple(c for c in all_cases if not only or c.__name__ in only.split(","))):
         suite.addTests(ld.loadTestsFromTestCase(case))
     print(f"AI Web Bridge {VERSION} self-test  (python {sys.version.split()[0]}; offline; temporary data folders)")
     res = unittest.TextTestRunner(verbosity=2, stream=sys.stdout).run(suite)
