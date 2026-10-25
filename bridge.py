@@ -28699,7 +28699,7 @@ setTimeout(() => process.exit(0), 60000);
             ctx = self.ctx(e, login_tab=5)
             self.assertEqual(len(ctx.pages), 1)
             pg = ctx.new_page()
-            self.assertEqual(len(ctx.pages), 1)
+            self.assertEqual(len(ctx.pages), 2)
             e.evals["document.title"] = "Hello"
             pg.goto("https://site.test/", wait_until="domcontentloaded", timeout=5000)
             self.assertEqual(pg.url, "https://site.test/")
