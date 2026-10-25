@@ -4,6 +4,6 @@ Single-file local bridge that presents web-model and compatible API accounts thr
 
 ## Current verification status
 
-The current base revision is 7.53. Its handoff record reports 440 offline tests passing with 5 environment skips. Version 7.54 is in progress: it adds optional per-account learning, native workspace selection and launch, merged account/advanced controls, recent routing decisions, and selectable themes. The 7.54 tests have not yet been run; no end-to-end run against a real site, the owner's Chrome, or a real model has been recorded.
+Version 7.55 keeps web login separate from optional learning. Accounts with an existing site recipe use the browser-backed web path by default; verified direct serving is an explicit owner choice. A fresh login for an unknown site is saved without probes, but Claude Code needs a site protocol recipe before it can send requests. The dashboard also includes native workspace selection and tool launch, account controls, route decisions, and selectable themes. No live-site, owner-Chrome, or model run is recorded.
 
 See `HANDOFF_REPORT.md` for the evidence ledger, known gaps, and verification status.

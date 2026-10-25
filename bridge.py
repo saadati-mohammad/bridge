@@ -166,7 +166,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.54"
+VERSION = "7.55"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -12907,7 +12907,9 @@ class Accounts:
         browser = bool(recipe) and (bool(recipe.get("unresolved")) and bool((recipe.get("ui") or {}).get("answer") or (recipe.get("ui") or {}).get("diff"))
                                     or not recipe.get("unresolved"))
         direct = lc_state(acct) == "stable_direct" or bool(recipe and recipe.get("tier") == "direct" and not recipe.get("unresolved"))
-        return {"mode": str(acct.get("serving_mode") or "auto"), "browser": browser, "direct": direct, "automatic": True}
+        # Web login sessions stay on the browser-backed path by default. Direct transport is
+        # an explicit owner choice after verification; it must never silently replace web use.
+        return {"mode": str(acct.get("serving_mode") or "browser"), "browser": browser, "direct": direct, "automatic": True}
 
     def set_serving_mode(self, aid: str, mode: str) -> Dict[str, Any]:
         """Persist the owner's transport preference; explicit direct is accepted only for a verified no-browser path."""
@@ -13381,11 +13383,11 @@ class Accounts:
             if job.ok and job.kind == "login-only":
                 recipe = self.recipe(acct.get("host", "")) or {}
                 if recipe:
-                    acct.update(state="ready", tier=str(recipe.get("tier") or "page"), last_error="", cooldown_until=0)
-                    reason = "login saved; reusing the existing site recipe without a learning probe"
+                    acct.update(state="ready", tier=str(recipe.get("tier") or "page"), serving_mode="browser", last_error="", cooldown_until=0)
+                    reason = "login saved; browser-backed web use is the default and the existing site recipe is reused without a learning probe"
                 else:
-                    acct.update(state="needs_learning", tier="", last_error="Login saved. Start learning when you want to use this site in Claude Code.")
-                    reason = "login saved; no site recipe exists yet, serving waits for owner-started learning"
+                    acct.update(state="needs_learning", tier="", last_error="Login saved. A site protocol recipe is still needed before Claude Code can send requests; Start learning is optional until you want to connect it.")
+                    reason = "login saved; no site protocol recipe exists yet, so the account is registered but cannot serve Claude Code requests until site setup is run"
                 for st_, why_ in (("capturing", "login detected; session saved"), ("degraded_fallback", reason)):
                     self.lc(acct["id"], st_, why_)
             elif job.ok and job.kind != "human":                    # only after the job released the browser profile
@@ -14146,7 +14148,7 @@ class Accounts:
         return {"ok": True, "tier": "direct", "changed": True, "reason": "direct works; the browser is no longer used for answers"}
 
     def backend(self, acct: Dict[str, Any]) -> Any:
-        mode = str(acct.get("serving_mode") or "auto")
+        mode = str(acct.get("serving_mode") or "browser")
         if acct.get("type") == "api":
             return self._classic_backend(acct)
         if mode == "browser":
@@ -27660,6 +27662,8 @@ setTimeout(() => process.exit(0), 60000);
                          "unresolved": ["ui only"], "ui": {"answer": "div.answer"}}
             self.store.write("recipes/mode.test.json", ui_recipe)
             acc.browser = lambda _aid: object()  # type: ignore[assignment]
+            self.assertEqual(acc.serving_mode_view(a)["mode"], "browser")
+            self.assertIsInstance(acc.backend(a), UIBackend)
             with self.assertRaises(BridgeError):
                 acc.set_serving_mode("mode1", "direct")
             self.assertEqual(acc.set_serving_mode("mode1", "browser")["mode"], "browser")
