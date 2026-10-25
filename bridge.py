@@ -166,7 +166,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.60"
+VERSION = "7.61"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -2060,7 +2060,7 @@ def build_evidence(probes: List[Dict[str, Any]], storage: Dict[str, Any], secret
 # The user's own Chrome is the browser. A Manifest-V3 extension (embedded below, extracted at run time) executes commands that the bridge sends over an
 # authenticated loopback channel; a small Playwright-shaped compatibility layer (PCContext / PCPage / PCLocator / PCCdpSession) keeps every existing call site working.
 # ============================================================================
-PC_VERSION = "1.2.1"
+PC_VERSION = "1.3.1"
 
 PC_BACKGROUND_JS = r"""'use strict';
 // AI Web Bridge - Personal Chrome extension (service worker). Talks ONLY to http://127.0.0.1:<port>/pc/* with a bearer token obtained by one-time pairing.
@@ -2126,7 +2126,7 @@ async function opAllowed(tabId) { const o = await owned(), c = await consented()
 
 const OPS = {
   async ping() { return {pong: true, version: chrome.runtime.getManifest().version, attached: [...attached.keys()]}; },
-  async 'tabs.list'() { const o = await owned(), c = await consented(); const all = await chrome.tabs.query({}); return all.filter(t => o.has(t.id) || c.has(t.id)).map(t => Object.assign(slim(t), {owned: o.has(t.id)})); },
+  async 'tabs.list'() { const o = await owned(), c = await consented(); const all = await chrome.tabs.query({}); return all.filter(t => o.has(t.id) || c.has(t.id)).map(t => Object.assign(slim(t), {owned: o.has(t.id), consented: c.has(t.id)})); },
   async 'tab.get'(a) { if (!(await opAllowed(a.tab))) throw new Error('tab not allowed'); return slim(await chrome.tabs.get(a.tab)); },
   async 'tab.create'(a) {
     const url = (a.url && /^(https?:|about:blank$)/.test(a.url)) ? a.url : 'about:blank';
@@ -2193,6 +2193,15 @@ chrome.runtime.onMessage.addListener((msg, sender, send) => {
       send({ok: true, profileName: i.profileName});
     } else if (msg.type === 'login_requests') {
       try { const r = await api('/pc/login-requests', {}); send({ok: true, requests: r.requests || []}); } catch (e) { send({ok: false, error: String(e.message || e), requests: []}); }
+    } else if (msg.type === 'register_active_tab') {
+      try {
+        const [active] = await chrome.tabs.query({active: true, currentWindow: true});
+        if (!active || active.id !== msg.tabId || !/^https?:\/\//i.test(active.url || '')) throw new Error('Open the AI site tab you want to add, then try again.');
+        const r = await api('/pc/register-tab', {tab: active.id, url: active.url, title: active.title || ''});
+        const c = await consented(); c.add(active.id); await setConsent(c);
+        await chrome.storage.local.set({loginAccountId: r.account_id, loginTabId: active.id});
+        send({ok: true, accountId: r.account_id, label: r.label});
+      } catch (e) { send({ok: false, error: String(e.message || e)}); }
     } else if (msg.type === 'claim_login') {
       try {
         const r = await api('/pc/login-claim', {account_id: String(msg.accountId || '')});
@@ -2235,7 +2244,7 @@ PC_POPUP_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><
 <label class="field"><span data-i="profile_label">Chrome profile name</span><input id="profile-name" maxlength="80" placeholder="Work, personal…"></label><label class="field"><span data-i="port_label">Port</span><input id="port" inputmode="numeric" value="18765" maxlength="5"></label><label class="field"><span data-i="code_label">One-time code</span><input id="code" autocomplete="one-time-code" maxlength="8" placeholder="8 characters"></label><button id="pair" class="primary" data-i="connect">Connect securely</button><p id="pair-error" class="error" hidden></p></section>
 <section id="tabbox" class="panel" hidden><div class="section-heading"><h2 data-i="this_tab">This tab</h2><span id="tab-badge" class="tag"></span></div><p id="tab-title" class="tab-title"></p><p id="tab-host" class="muted ltr"></p><p id="tab-note" class="muted note"></p>
 <button id="allow" class="primary" data-i="allow">Allow this tab</button><button id="revoke" class="secondary" data-i="revoke">Stop sharing</button></section>
-<section id="loginbox" class="panel" hidden><div class="section-heading"><h2 data-i="login_requests">Accounts waiting for login</h2><span id="profile-tag" class="tag"></span></div><label class="field"><span data-i="profile_label">Chrome profile name</span><input id="profile-name-active" maxlength="80"></label><button id="profile-save" class="secondary" data-i="save_profile">Save profile name</button><div id="login-list"></div><button id="login-confirm" class="primary" data-i="confirm_login" disabled>I'm signed in — confirm</button><p id="login-note" class="muted note"></p></section>
+<section id="loginbox" class="panel" hidden><div class="section-heading"><h2 data-i="login_requests">Accounts waiting for login</h2><span id="profile-tag" class="tag"></span></div><label class="field"><span data-i="profile_label">Chrome profile name</span><input id="profile-name-active" maxlength="80"></label><button id="profile-save" class="secondary" data-i="save_profile">Save profile name</button><button id="register-tab" class="primary">Add this site from current tab</button><p id="register-hint" class="muted note">Open the AI site in this Chrome profile. This tab is added to Bridge without opening another browser window.</p><div id="login-list"></div><button id="login-confirm" class="primary" data-i="confirm_login" disabled>I'm signed in — confirm</button><p id="login-note" class="muted note"></p></section>
 <details class="privacy"><summary data-i="privacy_title">A small privacy promise</summary><p data-i="privacy_body">Only tabs opened by Bridge or tabs you allow here can be inspected. The link stays on this computer. Chrome shows its own notice while a tab is being inspected.</p></details>
 <footer><span class="local-mark"><i></i><span data-i="local_only">Private · this computer only</span></span><button id="unpair" class="link-button" data-i="disconnect" hidden>Disconnect</button></footer><script src="popup.js"></script></body></html>"""
 
@@ -2255,9 +2264,11 @@ async function refresh(){if(busy)return;try{const [s]=await Promise.all([send({t
   $('tab-badge').textContent=internal?'':owned?t('tab_owned'):allowed?t('tab_allowed'):t('tab_not_shared');$('tab-badge').className='tag '+(owned||allowed?'tag-on':'');
   $('tab-note').textContent=internal?t('internal'):(owned||allowed?'':t('tab_hint'));
   $('allow').hidden=internal||owned||allowed;$('revoke').hidden=internal||(!allowed&&!attached);$('allow').disabled=!id;$('revoke').disabled=!id;
-  $('loginbox').hidden=!paired;$('profile-tag').textContent=s.profileName||('Chrome '+String(s.clientId||'').slice(0,8));
+   $('loginbox').hidden=!paired;$('profile-tag').textContent=s.profileName||('Chrome '+String(s.clientId||'').slice(0,8));
+   $('register-tab').textContent=lang==='fa'?'افزودن حساب از زبانه‌ی فعلی':'Add this site from current tab';$('register-hint').textContent=lang==='fa'?'سایت هوش مصنوعی را در همین پروفایل باز کن؛ بدون بازکردن پنجره‌ی دیگر به Bridge اضافه می‌شود.':'Open the AI site in this Chrome profile. This tab is added to Bridge without opening another browser window.';
+   $('register-tab').disabled=!currentTab||internal||!/^https?:\/\//i.test(url);
   const pn=$('profile-name-active');if(document.activeElement!==pn)pn.value=s.profileName||'';
-  $('login-confirm').disabled=!s.hasLogin;$('login-note').textContent=s.hasLogin?t('login_done'):'';
+  $('login-confirm').disabled=!s.hasLogin||!currentTab||currentTab.id!==s.loginTabId;$('login-note').textContent=s.hasLogin?(currentTab&&currentTab.id===s.loginTabId?t('login_done'):(lang==='fa'?'برای تأیید، به همان زبانه‌ی حساب برگرد.':'Return to this account’s site tab to confirm.')):'';
   try{const lr=await send({type:'login_requests'});renderLoginRequests(lr.requests||[])}catch(e){renderLoginRequests([])}
 }catch(e){$('state-title').textContent=t('not_paired');$('state-detail').textContent=t('error')} }
 $('pair').onclick=async()=>{const port=Number($('port').value),code=$('code').value.trim().toUpperCase(),err=$('pair-error');err.hidden=true;if(!Number.isInteger(port)||port<1||port>65535||!/^[A-HJ-NP-Z2-9]{8}$/.test(code)){err.textContent=t('pair_invalid');err.hidden=false;return}
@@ -2266,6 +2277,7 @@ $('code').addEventListener('input',()=>{$('code').value=$('code').value.toUpperC
 $('allow').onclick=async()=>{if(currentTab)await send({type:'allow_tab',tab:currentTab.id});await refresh()};$('revoke').onclick=async()=>{if(currentTab)await send({type:'revoke_tab',tab:currentTab.id});await refresh()};
 function renderLoginRequests(rows){const box=$('login-list');box.textContent='';if(!rows.length){const p=document.createElement('p');p.className='muted';p.textContent=t('login_none');box.appendChild(p);return}for(const row of rows){const card=document.createElement('div');card.className='request-row';const text=document.createElement('div'),name=document.createElement('strong'),host=document.createElement('p'),btn=document.createElement('button');name.textContent=row.label||row.host;host.className='muted ltr';host.textContent=row.host||'';btn.className='secondary';btn.textContent=row.claimed?t('login_claimed'):t('login_open');btn.disabled=!!row.claimed;if(!row.claimed)btn.onclick=async()=>{btn.disabled=true;try{const r=await send({type:'claim_login',accountId:row.id});if(!r.ok)throw new Error(r.error||t('error'));window.close()}catch(e){$('login-note').textContent=e.message;btn.disabled=false;await refresh()}};text.append(name,host);card.append(text,btn);box.appendChild(card)}}
 $('profile-save').onclick=async()=>{const r=await send({type:'profile_name',name:$('profile-name-active').value});if(r.ok){$('profile-tag').textContent=r.profileName||'Chrome';$('login-note').textContent=t('save_profile')}};
+ $('register-tab').onclick=async()=>{const b=$('register-tab');if(!currentTab)return;b.disabled=true;try{const r=await send({type:'register_active_tab',tabId:currentTab.id});if(!r.ok)throw new Error(r.error||t('error'));$('login-note').textContent=lang==='fa'?`حساب ${r.label||''} اضافه شد. اگر وارد نشده‌ای، در همین زبانه وارد شو؛ بعد تأیید ورود را بزن.`:`${r.label||'Account'} added. Sign in on this tab if needed, then confirm.`;await refresh()}catch(e){$('login-note').textContent=e.message;await refresh()}};
 $('login-confirm').onclick=async()=>{const b=$('login-confirm');b.disabled=true;try{const r=await send({type:'confirm_login'});if(!r.ok)throw new Error(r.error||t('error'));$('login-note').textContent=t('login_done');await refresh()}catch(e){$('login-note').textContent=e.message;await refresh()}};
 $('unpair').onclick=async()=>{if(!confirm(t('disconnect_confirm')))return;await send({type:'unpair'});$('state-detail').textContent=t('disconnected');await refresh()};
 refresh();setInterval(refresh,2500);"""
@@ -2455,6 +2467,7 @@ class PCHub:
         self.login_requests_provider: Optional[Callable[[str], List[Dict[str, Any]]]] = None
         self.login_claim_handler: Optional[Callable[[str, Dict[str, Any]], Tuple[int, Dict[str, Any]]]] = None
         self.login_confirm_handler: Optional[Callable[[str, Dict[str, Any]], Tuple[int, Dict[str, Any]]]] = None
+        self.register_tab_handler: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None
         self.state = self._load()
         self.stats = {"events": 0, "commands": 0, "rejected": 0, "dupe_results": 0}
 
@@ -2557,6 +2570,17 @@ class PCHub:
         except Exception as e:
             log(f"personal Chrome login confirmation failed: {type(e).__name__}", "warn")
             return 500, {"error": "login could not be confirmed"}
+
+    def register_tab(self, client_id: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        if not self.register_tab_handler:
+            return 503, {"error": "account registration is not available"}
+        try:
+            return 200, self.register_tab_handler(client_id, body)
+        except BridgeError as e:
+            return e.status, {"error": str(e)}
+        except Exception as e:
+            log(f"personal Chrome tab registration failed: {type(e).__name__}", "warn")
+            return 500, {"error": "this tab could not be registered"}
 
     def unpair(self, client_id: str) -> bool:
         with self.cv:
@@ -2666,6 +2690,8 @@ class PCHub:
                         return self._reply(200, hub._events(body, client_id))
                     if path == "/pc/login-requests":
                         return self._reply(200, {"requests": hub.login_requests(client_id)})
+                    if path == "/pc/register-tab":
+                        return self._reply(*hub.register_tab(client_id, body))
                     if path == "/pc/login-claim":
                         return self._reply(*hub.login_claim(client_id, body))
                     if path == "/pc/login-confirm":
@@ -3673,7 +3699,7 @@ class PCContext:
             return
         for t in live:
             host = (urllib.parse.urlsplit(t.get("url", "")).hostname or "")
-            if t.get("owned") and t["id"] in saved and (not saved[t["id"]] or host == saved[t["id"]]):
+            if (t.get("owned") or t.get("consented")) and t["id"] in saved and (not saved[t["id"]] or host == saved[t["id"]]):
                 self._pages[t["id"]] = PCPage(self, t["id"], t.get("url", ""), t.get("title", ""))
 
     @property
@@ -3697,10 +3723,12 @@ class PCContext:
             self.hub.call("cdp.detach", {"tab": pg.tab_id}, timeout=10)
         except PCError:
             pass
-        try:
-            self.hub.call("tab.close", {"tab": pg.tab_id}, timeout=10)
-        except PCError:
-            pass
+        # The owner-selected login tab is borrowed. Detach from Chrome but never close their tab.
+        if pg.tab_id != self.login_tab:
+            try:
+                self.hub.call("tab.close", {"tab": pg.tab_id}, timeout=10)
+            except PCError:
+                pass
         pg._mark_closed()
         self._write_state()
 
@@ -13383,6 +13411,29 @@ class Accounts:
                              "url": a.get("url", ""), "claimed": a.get("state") == "login_claimed", "created": a.get("login_requested_at", a.get("created", 0))})
             return rows[:100]
 
+    def register_browser_tab(self, client_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Register the owner's explicitly selected active Chrome tab as a browser account, without starting learning."""
+        tab = body.get("tab")
+        url = str(body.get("url") or "")[:2048]
+        title = re.sub(r"[\x00-\x1f\x7f]", "", str(body.get("title") or "")).strip()[:120]
+        parsed = urllib.parse.urlsplit(url)
+        if not isinstance(tab, int) or isinstance(tab, bool) or tab < 0:
+            raise BridgeError("the active Chrome tab id is invalid", "client", 400)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise BridgeError("open a normal AI site tab before adding its account", "client", 400)
+        if any(a.get("type") != "api" and a.get("pc_client_id") == client_id and a.get("host") == parsed.hostname.lower() for a in self.items):
+            raise BridgeError("an account for this site is already assigned to this Chrome profile; use Re-login or assign another profile", "client", 409)
+        label = title or parsed.hostname
+        account, _job = self.add(url, label, learn=False, defer_login=True, pc_client_id=client_id)
+        with self.lock:
+            account["state"] = "login_claimed"
+            account["login_client_id"] = client_id
+            account["login_claimed_at"] = now()
+            account["pc_login_tab"] = tab
+            self.save()
+        self.lc(account["id"], "needs_login", "this tab was assigned to the account; confirm after signing in")
+        return {"ok": True, "account_id": account["id"], "label": account["label"], "host": account["host"], "tab": tab}
+
     def claim_browser_login(self, client_id: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
         aid = str(body.get("account_id") or "")[:80]
         with self.lock:
@@ -13423,6 +13474,26 @@ class Accounts:
         self.lc(aid, "logging_in", "owner confirmed login from the assigned Chrome profile")
         job = self.start_job(a, "login" if learn else "login-only", owner_confirmed=True)
         return 200, {"ok": True, "account_id": aid, "job": job.id}
+
+    def test_connection(self, aid: str) -> Dict[str, Any]:
+        """Check a saved web session without sending a model prompt; preserve needs_learning when the site recipe is absent."""
+        a = self.get(aid)
+        if not a:
+            raise BridgeError("unknown account", "client", 404)
+        if a.get("type") == "api":
+            raise BridgeError("use the provider test for an API account", "client", 400)
+        if any(not j.done and j.account == aid for j in self.jobs.values()):
+            raise BridgeError("this account is still signing in or learning; wait for the current task to finish", "client", 409)
+        row = self.validate_one(a)
+        row["login_saved"] = bool(a.get("state") == "needs_learning" or row.get("status") == "valid")
+        if row["status"] in ("needs_login", "expired", "looks IP/device-bound"):
+            a["state"] = "login_required"
+            self.lc(aid, "needs_login", "manual connection test: " + str(row["reason"]))
+        elif row["status"] == "valid" and a.get("state") == "login_required":
+            a["state"] = "needs_learning" if not self.recipe(a.get("host", "")) else "ready"
+            self.lc(aid, "degraded_fallback", "session works; site protocol readiness is shown separately")
+        self.save()
+        return row
 
     def request_browser_login(self, aid: str, relearn: bool = False) -> Dict[str, Any]:
         with self.lock:
@@ -13710,7 +13781,7 @@ class Accounts:
     def _learn(self, ctx: Any, acct: Dict[str, Any], job: Job) -> None:
         holder: Dict[str, Any] = {}
         rec: Optional[CdpRecorder] = None
-        if self.cfg["analysis_enabled"]:
+        if job.kind != "login-only" and self.cfg["analysis_enabled"]:
             try:
                 rec = CdpRecorder(ctx, max_body=int(self.cfg["capture_max_body_kb"]) * 1024)
                 rec.start()
@@ -14111,7 +14182,10 @@ class Accounts:
         url = acct["url"]
         job.set_stage("open", f"opening {url}")
         job.say(f"opening {url} - log in if asked (up to {job.login_timeout // 60 or 1} min)")
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        current_host = urllib.parse.urlsplit(getattr(page, "url", "") or "").hostname or ""
+        target_host = urllib.parse.urlsplit(url).hostname or ""
+        if job.kind != "login-only" or current_host.lower() != target_host.lower():
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
         job.set_stage("login", "waiting for you to log in")
         job.need_owner("login", "log in inside the browser window")
         t_login, last_beat = time.time(), time.time()
@@ -18305,6 +18379,7 @@ class App:
         self.pc_hub.login_requests_provider = self.acc.browser_login_requests
         self.pc_hub.login_claim_handler = self.acc.claim_browser_login
         self.pc_hub.login_confirm_handler = self.acc.confirm_browser_login
+        self.pc_hub.register_tab_handler = self.acc.register_browser_tab
         self.started = now()
         want = str(cfg["tokenizer"])
         if set_tokenizer(want) != want:                          # E3: an unknown plugin name is not fatal; the conservative built-in is used and the choice is visible in /api/context
@@ -18343,7 +18418,7 @@ def pick_workspace_directory() -> str:
         raise BridgeError(f"Windows folder picker could not open: {type(e).__name__}: {e}", "client", 500)
 
 
-def open_workspace_tool(app_name: str, folder: str, port: int, api_key: str, model: str = "") -> Dict[str, Any]:
+def open_workspace_tool(app_name: str, folder: str, port: int, api_key: str, model: str = "", full_access: bool = False) -> Dict[str, Any]:
     """Launch one supported local tool in a user-selected folder without invoking a shell."""
     p = Path(folder).expanduser().resolve()
     if not p.is_dir():
@@ -18361,12 +18436,17 @@ def open_workspace_tool(app_name: str, folder: str, port: int, api_key: str, mod
         if not api_key:
             raise BridgeError("select an API key for Claude Code first", "client", 400)
         env.update(ANTHROPIC_BASE_URL=f"http://127.0.0.1:{int(port)}", ANTHROPIC_API_KEY=api_key,
-                   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
+                   ANTHROPIC_MODEL="sonnet", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
         if model:
             model = str(model)[:100]
             if not re.fullmatch(r"[A-Za-z0-9._:/-]+", model):
                 raise BridgeError("invalid Claude Code model or pool name", "client", 400)
-            env["ANTHROPIC_MODEL"] = model
+            # Keep Claude Code on its recognized `sonnet` alias while mapping that alias to the Bridge route.
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = model
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = model
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = model
+        if full_access:
+            args.append("--dangerously-skip-permissions")
     elif app_name in ("vscode", "cursor"):
         args.append(str(p))
     elif app_name == "powershell":
@@ -18753,7 +18833,8 @@ class Handler(BaseHTTPRequestHandler):
             selected_key = next((str(k.get("key") or "") for k in cfg["keys"] if k.get("id") == key_id), "")
             selected_model = str(body_.get("model") or "")[:100]
             try:
-                result_ = open_workspace_tool(str(body_.get("app") or ""), str(body_.get("folder") or ""), int(cfg["port"]), selected_key, selected_model)
+                result_ = open_workspace_tool(str(body_.get("app") or ""), str(body_.get("folder") or ""), int(cfg["port"]), selected_key, selected_model,
+                                              full_access=bool(body_.get("full_access", False)))
             except BridgeError as e_:
                 return self._json(e_.status, {"error": str(e_)})
             return self._json(200, result_)
@@ -18924,6 +19005,11 @@ class Handler(BaseHTTPRequestHandler):
                     acc.save()
                     browser_.pc_client_id = client_id_
                     return self._json(200, {"ok": True, "client_id": client_id_})
+                except BridgeError as e_:
+                    return self._json(e_.status, {"error": str(e_)})
+            if parts[2:] == ["test-connection"] and method == "POST":
+                try:
+                    return self._json(200, acc.test_connection(aid))
                 except BridgeError as e_:
                     return self._json(e_.status, {"error": str(e_)})
             if method == "DELETE" and len(parts) == 2:
@@ -19229,7 +19315,7 @@ h2{font-size:14px;margin:0 0 10px}h3{font-size:13px;margin:14px 0 6px;color:var(
 button,input,select{font:inherit;color:var(--tx);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 10px}
 button{cursor:pointer}button:hover{border-color:var(--acc)}button.p{background:var(--acc);color:#fff;border-color:var(--acc)}button.d:hover{border-color:var(--bad);color:var(--bad)}.sm{font-size:12px;padding:3px 9px}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}.row>input{flex:1;min-width:140px}
-.workspace-tools{display:grid;grid-template-columns:minmax(160px,1fr) minmax(210px,1.35fr) auto auto;gap:8px;align-items:end;margin-top:10px}
+.workspace-tools{display:grid;grid-template-columns:minmax(160px,1fr) minmax(210px,1.35fr) minmax(190px,1fr) auto auto;gap:8px;align-items:end;margin-top:10px}.auto-mode{display:flex;align-items:center;gap:7px;color:var(--mut);font-size:12px;min-height:38px}.auto-mode input{accent-color:var(--acc)}
 .workspace-key-wrap{display:grid;gap:3px;min-width:0;font-size:11px}.workspace-key-wrap select{min-width:0;width:100%;max-width:none}.workspace-tools>select{min-width:0;width:100%;max-width:none}.workspace-tools button{white-space:nowrap;min-height:38px}
 .mut{color:var(--mut)}.ltr{direction:ltr;unicode-bidi:plaintext;text-align:left}.k{font-family:ui-monospace,Consolas,monospace;font-size:12px;word-break:break-all;direction:ltr;text-align:left}
 code,pre{font-family:ui-monospace,Consolas,monospace;font-size:12px}pre{direction:ltr;text-align:left;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;max-height:280px;margin:8px 0 0;white-space:pre-wrap;word-break:break-all}
@@ -19253,14 +19339,15 @@ ol.steps li.bad i{background:var(--bad);border-color:var(--bad);color:#fff}ol.st
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:4px 18px}label.f{display:flex;align-items:center;gap:6px;margin:5px 0}input[type=number]{width:96px}
 .acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}
 .pool-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));gap:8px;margin:10px 0}.pool-item{display:flex;align-items:center;gap:9px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--surface-2,#fff)}.pool-item input{accent-color:var(--accent)}.pool-item .mut{margin-inline-start:auto}.profile-assign{min-width:min(100%,250px)}
-@media(max-width:760px){.workspace-tools{grid-template-columns:1fr 1fr}.workspace-tools>select,.workspace-key-wrap{grid-column:span 2}.workspace-tools button{width:100%}}
-@media(max-width:640px){header{padding:10px 12px}nav{padding:0 6px}nav button{padding:9px 11px}main{padding:10px}.row>*{max-width:100%}.row>input,.row>select{min-width:0;flex:1 1 100%}.workspace-tools{grid-template-columns:1fr}.workspace-tools>select,.workspace-key-wrap,.workspace-tools button{grid-column:auto;width:100%;min-height:42px}table{display:block;overflow-x:auto;white-space:nowrap}.steps li{font-size:10px!important}.card{border-radius:13px}}
+@media(max-width:760px){.workspace-tools{grid-template-columns:1fr 1fr}.workspace-tools>select,.workspace-key-wrap,.auto-mode{grid-column:span 2}.workspace-tools button{width:100%}}
+@media(max-width:640px){header{padding:10px 12px}nav{padding:0 6px}nav button{padding:9px 11px}main{padding:10px}.row>*{max-width:100%}.row>input,.row>select{min-width:0;flex:1 1 100%}.workspace-tools{grid-template-columns:1fr}.workspace-tools>select,.workspace-key-wrap,.workspace-tools button,.auto-mode{grid-column:auto;width:100%;min-height:42px}table{display:block;overflow-x:auto;white-space:nowrap}.steps li{font-size:10px!important}.card{border-radius:13px}}
 @media(min-width:1600px){main{max-width:1480px}}
 </style></head><body>
 <header><h1>AI Web Bridge <span class="mut ltr">v__VERSION__</span></h1><span class="pill ltr" id="st">…</span><span class="pill ltr" id="sts"></span><span class="sp"></span><select id="theme" aria-label="Theme" onchange="setTheme(this.value)"><option value="system">System</option><option value="light">Light</option><option value="mint">Mint</option><option value="berry">Berry</option></select><button class="sm" id="langbtn" onclick="setLang(lang=='fa'?'en':'fa')"></button></header>
 <nav id="nav"></nav>
 <main>
 <div class="view on" id="v_accounts">
+<div class="card" id="workflow-card"><h2 id="workflow-title"></h2><p id="workflow-steps" class="mut"></p><p id="workflow-note" class="mut"></p></div>
 <div class="card" id="pcsetup"><h2 data-i="pc_title"></h2><p class="mut" data-i="pc_intro"></p>
 <div class="row" style="margin-top:8px"><button class="p" id="pc_start" onclick="startPcSetup()" data-i="pc_start"></button><span id="pc_state" class="mut"></span></div>
 <p class="mut" id="pc_profile_status"></p>
@@ -19278,7 +19365,7 @@ ol.steps li.bad i{background:var(--bad);border-color:var(--bad);color:#fff}ol.st
 <div id="acc"></div>
 <div class="card" id="workspacecard"><h2 data-i="workspace_title"></h2><p class="mut" data-i="workspace_hint"></p>
 <div class="row"><input id="workspace_path" class="ltr" data-ph="workspace_ph" readonly><button class="sm" onclick="selectWorkspace()" data-i="workspace_select"></button></div>
-<div class="workspace-tools"><select id="workspace_app" aria-label="Application" onchange="updateWorkspaceCommand()"><option value="claude">Claude Code</option><option value="vscode">Visual Studio Code</option><option value="cursor">Cursor</option><option value="powershell">PowerShell</option><option value="cmd">Command Prompt</option></select><label class="workspace-key-wrap"><span class="mut" data-i="workspace_key_label"></span><select id="workspace_key" aria-label="API key" onchange="updateWorkspaceCommand()"></select></label><button class="p" onclick="openWorkspace()" data-i="workspace_open"></button><button class="sm" onclick="copyWorkspaceCommand()" data-i="workspace_copy"></button></div>
+<div class="workspace-tools"><select id="workspace_app" aria-label="Application" onchange="updateWorkspaceCommand()"><option value="claude">Claude Code</option><option value="vscode">Visual Studio Code</option><option value="cursor">Cursor</option><option value="powershell">PowerShell</option><option value="cmd">Command Prompt</option></select><label class="workspace-key-wrap"><span class="mut" data-i="workspace_key_label"></span><select id="workspace_key" aria-label="API key" onchange="updateWorkspaceCommand()"></select></label><label class="auto-mode"><input id="claude_full_access" type="checkbox"><span id="claude_full_access_label">Full access · skip permission prompts</span></label><button class="p" onclick="openWorkspace()" data-i="workspace_open"></button><button class="sm" onclick="copyWorkspaceCommand()" data-i="workspace_copy"></button></div>
 <pre id="workspace_command" class="mini"></pre><span id="workspace_status" class="mut"></span></div></div>
 
 <div class="view" id="v_connect">
@@ -19393,13 +19480,13 @@ const STAGES=['open','login','learn','analyse','verify','finish'];
 const VIEWS=[['accounts','accounts'],['connect','connect'],['sites','sites'],['settings','settings'],['log','log']];let view='accounts';
 let S=null,C=null,O=null,O12E='',RC=null,routePoolDraft=null,routeKindDraft='',tab='claude-ps',editing=false,openDet=new Set();
 function setLang(l){lang=l;localStorage.lang=l;document.documentElement.lang=l;document.documentElement.dir=l=='fa'?'rtl':'ltr';$('langbtn').textContent=l=='fa'?'English':'فارسی';
-document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));document.querySelectorAll('[data-ph]').forEach(e=>e.placeholder=t(e.dataset.ph));
+document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));document.querySelectorAll('[data-ph]').forEach(e=>e.placeholder=t(e.dataset.ph));$('workflow-title').textContent=l==='fa'?'از اینجا شروع کن':'Start here';$('workflow-steps').textContent=l==='fa'?'۱) پروفایل Chrome موردنظرت را باز کن و به سایت هوش مصنوعی برو. ۲) افزونه Bridge را باز کن و «افزودن حساب از زبانه‌ی فعلی» را بزن. ۳) اگر لازم بود وارد شو و در همان زبانه «وارد شدم — تأیید» را بزن. ۴) اتصال را آزمایش کن؛ برای استفاده در Claude Code، «شروع یادگیری» را اجرا کن.':'1) Open the Chrome profile you want and visit the AI site. 2) Open the Bridge extension and choose “Add this site from current tab.” 3) Sign in if needed, then confirm from that same tab. 4) Test the login; to route Claude Code requests through a new site, run “Start learning” once.';$('workflow-note').textContent=l==='fa'?'ورود ذخیره‌شده سبز می‌شود و وضعیت «نیازمند یادگیری» را نشان می‌دهد تا خودت انتخاب کنی. تا زمان ساخته‌شدن روش اتصال آن سایت، Claude Code نمی‌تواند از آن اکانت درخواست بفرستد.':'A saved login is shown in green as “learning needed.” Learning stays your choice. Claude Code cannot send requests through a site until its connection recipe exists.';
 if(S&&S.presets&&$('preset').options.length)$('preset').options[0].textContent=t('preset');navRender();render();renderCtx()}
 function navRender(){$('nav').innerHTML=VIEWS.map(v=>`<button class="${v[0]==view?'on':''}" onclick="go('${v[0]}')">${esc(t(v[1]))}</button>`).join('')}
 function go(v){view=v;document.querySelectorAll('.view').forEach(e=>e.classList.toggle('on',e.id=='v_'+v||(v=='accounts'&&e.id=='v_adv')));navRender()}
-function snippets(k,port){const u='http://127.0.0.1:'+port;return{'claude-ps':`$env:ANTHROPIC_BASE_URL="${u}"\n$env:ANTHROPIC_API_KEY="${k}"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nclaude`,
-'claude-sh':`export ANTHROPIC_BASE_URL=${u}\nexport ANTHROPIC_API_KEY=${k}\nexport CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
-'claude-cmd':`set ANTHROPIC_BASE_URL=${u}\nset ANTHROPIC_API_KEY=${k}\nset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
+function snippets(k,port,model){const u='http://127.0.0.1:'+port,m=model||'bridge-auto';return{'claude-ps':`$env:ANTHROPIC_BASE_URL="${u}"\n$env:ANTHROPIC_API_KEY="${k}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:ANTHROPIC_DEFAULT_SONNET_MODEL="${m}"\n$env:ANTHROPIC_DEFAULT_OPUS_MODEL="${m}"\n$env:ANTHROPIC_DEFAULT_HAIKU_MODEL="${m}"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nclaude`,
+'claude-sh':`export ANTHROPIC_BASE_URL=${u}\nexport ANTHROPIC_API_KEY=${k}\nexport ANTHROPIC_MODEL=sonnet\nexport ANTHROPIC_DEFAULT_SONNET_MODEL=${m}\nexport ANTHROPIC_DEFAULT_OPUS_MODEL=${m}\nexport ANTHROPIC_DEFAULT_HAIKU_MODEL=${m}\nexport CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
+'claude-cmd':`set ANTHROPIC_BASE_URL=${u}\nset ANTHROPIC_API_KEY=${k}\nset ANTHROPIC_MODEL=sonnet\nset ANTHROPIC_DEFAULT_SONNET_MODEL=${m}\nset ANTHROPIC_DEFAULT_OPUS_MODEL=${m}\nset ANTHROPIC_DEFAULT_HAIKU_MODEL=${m}\nset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
 'openai':`Base URL : ${u}/v1\nAPI key  : ${k}\nModel    : bridge-auto   (or acct:<id> / the exact account label to force one account)\n\nCursor / VS Code agents / Continue / Cline / any OpenAI-compatible client:\nuse the "OpenAI compatible" provider with the values above.`}}
 const names={'claude-ps':'Claude Code (PowerShell)','claude-sh':'Claude Code (bash)','claude-cmd':'Claude Code (cmd)','openai':'Cursor / VS Code / OpenAI-compatible'};
 const mmss=s=>{s=Math.max(0,Math.floor(s));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
@@ -19428,7 +19515,7 @@ if(a.learn_budget)det.push(`<div class="mut ltr">learning used ${esc(a.learn_bud
 if(a.native_learning){const n=a.native_learning;det.push(`<div class="mut ltr">native path: ${esc(n.status||'unknown')}${n.rounds!=null?` · rounds ${esc(n.rounds)}`:''}${n.requests!=null?` · Brain requests ${esc(n.requests)}/${esc(n.budget??'?')}`:''}${n.review?` · review ${esc(n.review.outcome||'unknown')} (${esc(n.review.confirmed_defects||0)} confirmed)`:''}${n.gates?.length?` · gates ${esc(n.gates.join(', '))}`:''}${n.reason?` · ${esc(n.reason)}`:''}</div>`)}
 det.push(`<div class="mut ltr">${a.requests||0}${a.inflight?' ('+a.inflight+' live)':''} ${esc(t('req'))} · ${a.fail||0} ${esc(t('fails'))}${a.ema_ms?' · '+(a.ema_ms/1000).toFixed(1)+'s avg':''}${a.health?(a.health.ok?' · '+esc(t('healthy')):' · '+esc(t('unhealthy'))):''}</div>`);
 h+=`<details data-id="${esc(a.id)}" ${openDet.has(a.id)?'open':''} ontoggle="togDet(this)"><summary>${esc(t('details'))}</summary>${det.join('')}</details>`;
-h+=`<div class="acts">`+(a.type=='api'?'':`<button class="sm" onclick="act(${escJ(a.id)},'relogin')">${esc(t('b_relogin'))}</button><button class="sm ${a.state==='needs_learning'?'p':''}" onclick="act(${escJ(a.id)},'relearn')">${esc(t(a.state==='needs_learning'?'b_start_learn':'b_relearn'))}</button>`+(a.tier=='direct'?'':`<button class="sm" onclick="recheckDirect(${escJ(a.id)})">${esc(t('b_recheck'))}</button>`))+
+h+=`<div class="acts">`+(a.type=='api'?'':`<button class="sm" onclick="testAccount(${escJ(a.id)})">${lang==='fa'?'آزمایش اتصال':'Test connection'}</button><button class="sm" onclick="act(${escJ(a.id)},'relogin')">${esc(t('b_relogin'))}</button><button class="sm ${a.state==='needs_learning'?'p':''}" onclick="act(${escJ(a.id)},'relearn')">${esc(t(a.state==='needs_learning'?'b_start_learn':'b_relearn'))}</button>`+(a.tier=='direct'?'':`<button class="sm" onclick="recheckDirect(${escJ(a.id)})">${esc(t('b_recheck'))}</button>`))+
 `<button class="sm" onclick="act(${escJ(a.id)},'default')">${esc(t('b_default'))}</button><button class="sm d" onclick="delAcc(${escJ(a.id)})">${esc(t('b_remove'))}</button></div></div>`;return h}
 function togDet(el){const id=el.dataset.id;if(el.open)openDet.add(id);else openDet.delete(id)}
 function render(){if(!S)return;$('st').textContent=t('running')+S.port;$('sts').textContent=S.stats.requests+' requests · '+S.stats.errors+' '+t('errors');
@@ -19445,7 +19532,7 @@ if(!$('workspace_key').value&&S.keys.length)$('workspace_key').value=S.keys[0].i
 $('workspace_app').value=localStorage.workspaceApp||'claude';$('workspace_path').value=localStorage.workspacePath||'';updateWorkspaceCommand();
 $('rec').innerHTML=S.recipes.map(r=>`<tr><td class="ltr">${esc(r.host)}</td><td><span class="b ${esc(r.tier)}">${esc(r.tier)}</span></td><td>${r.continuity?t('yes'):t('no')}</td><td style="text-align:end"><button class="sm" onclick="showDoc(${escJ(r.host)})">${esc(t('docs'))}</button> <button class="sm" onclick="getTool(${escJ(r.host)})">${esc(t('tool'))}</button> <button class="sm" onclick="expRec(${escJ(r.host)})">${esc(t('export'))}</button> <button class="sm d" onclick="delRec(${escJ(r.host)})">${esc(t('forget'))}</button></td></tr>`).join('')||`<tr><td class="mut" colspan="4">-</td></tr>`;
 $('tabs').innerHTML=Object.keys(names).map(x=>`<button class="sm ${x==tab?'p':''}" onclick="tab='${x}';render()">${names[x]}</button>`).join('');
-$('snip').textContent=snippets($('keysel').value||(S.keys[0]||{}).key||'',S.port)[tab];
+const selectedKey=S.keys.find(k=>k.key===$('keysel').value)||(S.keys[0]||{}),selectedModel=selectedKey.account?'acct:'+selectedKey.account:((RC&&RC.config&&RC.config.policies&&RC.config.policies['user-claude-pool'])?'bridge-pool/user-claude-pool':'bridge-auto');$('snip').textContent=snippets(selectedKey.key||'',S.port,selectedModel)[tab];
 const s=S.settings;if(document.activeElement.tagName!='INPUT'){$('s_cont').checked=s.continuity;$('s_tool').value=s.tool_desc_limit;$('s_sys').value=s.system_limit;$('s_res').value=s.result_limit;$('s_his').value=s.history_limit;$('s_idle').value=s.headless_idle_seconds;$('s_sum').checked=s.summarize_history;$('s_hc').value=s.health_interval_min;$('s_cache').value=s.cache_seconds}
 $('home').textContent='Data folder: '+S.home}
 async function setServingMode(id,mode){try{await api('accounts/'+encodeURIComponent(id)+'/serving-mode','POST',{mode});await tick()}catch(e){alert(errMsg(e));await tick()}}
@@ -19498,19 +19585,19 @@ const el=$('ctx_disc');el.style.display='block';el.textContent='Running 3 probe 
 try{const r=await api('accounts/'+encodeURIComponent(id)+'/paste-discover','POST');el.textContent='Requests used: '+r.requests_used+(r.ran?'':' (did not run)')+'\nApplied: '+(r.applied?'yes':'no')+(r.suggestion?'\nSuggested signal: '+JSON.stringify(r.suggestion):'')+(r.reason?'\n'+r.reason:'')}catch(e){el.textContent='Failed: '+e.message}
 tick()}
 let busy=false;
-async function tick(){if(busy)return;busy=true;try{S=await api('state');try{C=await api('context')}catch(e){}try{O=await api('o12');O12E=''}catch(e){O12E=errMsg(e)}try{RD=await api('decisions?n=30');RDE=''}catch(e){RD=null;RDE=errMsg(e)}try{RC=await api('routing')}catch(e){}
+async function tick(){if(busy)return;busy=true;try{if(!$('claude_full_access').dataset.ready){$('claude_full_access').checked=localStorage.claudeFullAccess==='1';$('claude_full_access').onchange=()=>{localStorage.claudeFullAccess=$('claude_full_access').checked?'1':'0';updateWorkspaceCommand()};$('claude_full_access_label').textContent=lang==='fa'?'دسترسی کامل · بدون درخواست اجازه':'Full access · skip permission prompts';$('claude_full_access').dataset.ready='1'}S=await api('state');try{C=await api('context')}catch(e){}try{O=await api('o12');O12E=''}catch(e){O12E=errMsg(e)}try{RD=await api('decisions?n=30');RDE=''}catch(e){RD=null;RDE=errMsg(e)}try{RC=await api('routing')}catch(e){}
 if(!$('preset').options.length){$('preset').innerHTML='<option value="">'+esc(t('preset'))+'</option>'+S.presets.map(p=>`<option value="${esc(p.url)}" data-n="${esc(p.name)}">${esc(p.name)}</option>`).join('');$('preset').onchange=()=>{$('url').value=$('preset').value;$('label').value=$('preset').selectedOptions[0].dataset.n||'';urlPrev()}}
 if(view=='log'||!$('log').textContent){const lg=await api('log');const hide=$('hidetech').checked;let ls=lg.lines;if(hide)ls=ls.filter(l=>!/ DEBUG /.test(l)).map(l=>String(l).split('\n')[0]);const el=$('log'),atEnd=el.scrollTop+el.clientHeight>=el.scrollHeight-20;el.textContent=(lg.file?'Log file: '+lg.file+'\n':'')+ls.join('\n');if(atEnd)el.scrollTop=el.scrollHeight}
 render();renderCtx();renderO12();renderDecisions()}catch(e){$('st').textContent='disconnected'}finally{busy=false}}
 async function addAcc(){const url=$('url').value.trim();if(!url)return alert(t('url_ph'));try{await api('accounts','POST',{url,label:$('label').value.trim(),learn:$('learn_on_add').checked,manual_login:true,pc_client_id:$('account_profile').value});$('url').value='';$('label').value='';$('urlprev').textContent='';tick()}catch(e){alert(errMsg(e))}}
 async function selectWorkspace(){try{const r=await api('workspace/select','POST',{});if(r.folder){$('workspace_path').value=r.folder;localStorage.workspacePath=r.folder;$('workspace_status').textContent=t('workspace_ready')}else $('workspace_status').textContent=t('workspace_cancel');updateWorkspaceCommand()}catch(e){$('workspace_status').textContent=t('workspace_error')+errMsg(e)}}
 function workspaceModel(){const key=(S&&S.keys.find(k=>k.id===$('workspace_key').value))||{},hasPool=!!(RC&&RC.config&&RC.config.policies&&RC.config.policies['user-claude-pool']);return key.account?'acct:'+key.account:(hasPool?'bridge-pool/user-claude-pool':'bridge-auto')}
-function updateWorkspaceCommand(){const app=$('workspace_app').value,folder=$('workspace_path').value,keyValue=(S&&S.keys.find(k=>k.id===$('workspace_key').value)||{}).key||'',base='http://127.0.0.1:'+(S?S.port:'8788'),policy=workspaceModel();localStorage.workspaceApp=app;let cmd='';const psPath="'"+folder.replace(/'/g,"''")+"'";
-if(!folder)cmd=t('workspace_ph');else if(app==='claude'&&!keyValue)cmd=t('workspace_key_required');else if(app==='claude')cmd=`$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_API_KEY="${keyValue}"\n$env:ANTHROPIC_MODEL="${policy}"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nSet-Location -LiteralPath ${psPath}\nclaude`;
+ function updateWorkspaceCommand(){const app=$('workspace_app').value,folder=$('workspace_path').value,keyValue=(S&&S.keys.find(k=>k.id===$('workspace_key').value)||{}).key||'',base='http://127.0.0.1:'+(S?S.port:'8788'),policy=workspaceModel();localStorage.workspaceApp=app;localStorage.claudeFullAccess=$('claude_full_access').checked?'1':'0';let cmd='';const psPath="'"+folder.replace(/'/g,"''")+"'";
+ if(!folder)cmd=t('workspace_ph');else if(app==='claude'&&!keyValue)cmd=t('workspace_key_required');else if(app==='claude'){const full=$('claude_full_access').checked,flag=full?' --dangerously-skip-permissions':'';cmd=`$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_API_KEY="${keyValue}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:ANTHROPIC_DEFAULT_SONNET_MODEL="${policy}"\n$env:ANTHROPIC_DEFAULT_OPUS_MODEL="${policy}"\n$env:ANTHROPIC_DEFAULT_HAIKU_MODEL="${policy}"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nSet-Location -LiteralPath ${psPath}\nclaude${flag}`}
 else if(app==='vscode')cmd=`code "${folder}"`;else if(app==='cursor')cmd=`cursor "${folder}"`;else if(app==='cmd')cmd=`cd /d "${folder}"`;else cmd=`Set-Location -LiteralPath ${psPath}`;
-$('workspace_command').textContent=cmd||'Select a workspace folder to prepare the command.'}
+ $('workspace_command').textContent=cmd||'Select a workspace folder to prepare the command.'}
 async function copyWorkspaceCommand(){updateWorkspaceCommand();const cmd=$('workspace_command').textContent;if(!cmd||cmd===t('workspace_ph')||cmd===t('workspace_key_required'))return;try{await navigator.clipboard.writeText(cmd);$('workspace_status').textContent=t('workspace_copied')}catch(e){$('workspace_status').textContent=cmd}}
-async function openWorkspace(){const folder=$('workspace_path').value;if(!folder)return alert(t('workspace_ph'));if($('workspace_app').value==='claude'&&!(S&&S.keys.some(k=>k.id===$('workspace_key').value)))return alert(t('workspace_key_required'));try{const r=await api('workspace/open','POST',{app:$('workspace_app').value,folder,key_id:$('workspace_key').value,model:workspaceModel()});$('workspace_status').textContent=t('workspace_opened')+' (PID '+r.pid+')'}catch(e){$('workspace_status').textContent=t('workspace_error')+errMsg(e)}}
+async function openWorkspace(){const folder=$('workspace_path').value;if(!folder)return alert(t('workspace_ph'));if($('workspace_app').value==='claude'&&!(S&&S.keys.some(k=>k.id===$('workspace_key').value)))return alert(t('workspace_key_required'));try{const r=await api('workspace/open','POST',{app:$('workspace_app').value,folder,key_id:$('workspace_key').value,model:workspaceModel(),full_access:$('claude_full_access').checked});$('workspace_status').textContent=t('workspace_opened')+' (PID '+r.pid+')'}catch(e){$('workspace_status').textContent=t('workspace_error')+errMsg(e)}}
 async function startPcSetup(){const b=$('pc_start'),s=$('pc_state');b.disabled=true;s.textContent=t('pc_opening');try{const r=await api('personal-chrome/setup','POST',{});$('pc_code').textContent=r.code;$('pc_port').textContent=r.port;$('pc_folder').textContent=r.extension_dir;$('pc_steps').hidden=false;s.textContent=t('pc_ready')}catch(e){s.textContent=t('pc_error')+errMsg(e)}finally{b.disabled=false}}
 async function copyPcCode(){try{await navigator.clipboard.writeText($('pc_code').textContent);$('pc_state').textContent=t('pc_copied')}catch(e){$('pc_state').textContent=$('pc_code').textContent}}
 let _up=0;async function urlPrev(){const v=$('url').value.trim(),el=$('urlprev'),my=++_up;if(!v){el.textContent='';return}try{const r=await api('sites/normalize','POST',{input:v});if(my===_up)el.textContent='→ '+r.open_url+'  ·  '+r.identity_host+(r.notes.length?'  ·  '+r.notes.join('; '):'')}catch(e){if(my===_up)el.textContent='✘ '+errMsg(e)}}
@@ -19518,6 +19605,7 @@ function errMsg(e){let m=e.message;try{const j=JSON.parse(m);const x=j.error;m=t
 async function jobDone(id){await api('jobs/'+id+'/done','POST');tick()}
 async function addApi(){const b={type:'api',kind:$('akind').value,base:$('abase').value,key:$('akey').value,model:$('amodel').value,label:$('alabel').value};try{await api('accounts','POST',b);['abase','akey','amodel','alabel'].forEach(i=>$(i).value='');tick()}catch(e){alert(errMsg(e))}}
 async function recheckDirect(id){try{const r=await api('accounts/'+id+'/recheck-direct','POST');alert((r.ok?'OK: ':'')+r.reason)}catch(e){alert(errMsg(e))}tick()}
+async function testAccount(id){try{const r=await api('accounts/'+encodeURIComponent(id)+'/test-connection','POST');alert((r.status==='valid'?(lang==='fa'?'اتصال موفق است؛ ورود ذخیره شده.':'Connection is valid; login is saved.'):(lang==='fa'?'وضعیت اتصال: ':'Connection status: ')+r.status+' · '+r.reason))}catch(e){alert(errMsg(e))}tick()}
 async function act(id,a){try{await api('accounts/'+id+'/'+a,'POST')}catch(e){alert(errMsg(e))}tick()}
 async function delAcc(id){if(confirm(t('cf_rm'))){await api('accounts/'+id,'DELETE');tick()}}
 async function newKey(){await api('keys','POST',{label:$('klabel').value||'client',account:$('kacc').value});$('klabel').value='';tick()}
@@ -27961,7 +28049,12 @@ setTimeout(() => process.exit(0), 60000);
                 self.assertEqual(kw["env"]["ANTHROPIC_API_KEY"], "bridge-key")
                 with mock.patch("shutil.which", return_value="C:/Tools/claude.exe"), mock.patch("subprocess.Popen", popen):
                     open_workspace_tool("claude", str(tmp), 8788, "bridge-key", "bridge-pool/user-claude-pool")
-                self.assertEqual(popen.call_args.kwargs["env"]["ANTHROPIC_MODEL"], "bridge-pool/user-claude-pool")
+                self.assertEqual(popen.call_args.kwargs["env"]["ANTHROPIC_MODEL"], "sonnet")
+                self.assertEqual(popen.call_args.kwargs["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "bridge-pool/user-claude-pool")
+                with mock.patch("shutil.which", return_value="C:/Tools/claude.exe"), mock.patch("subprocess.Popen", popen):
+                    open_workspace_tool("claude", str(tmp), 8788, "bridge-key", "bridge-auto", full_access=True)
+                self.assertIn("--dangerously-skip-permissions", popen.call_args.args[0])
+                self.assertEqual(popen.call_args.kwargs["env"]["ANTHROPIC_MODEL"], "sonnet")
                 with self.assertRaises(BridgeError):
                     open_workspace_tool("claude", str(tmp), 8788, "bridge-key", 'bad model; exit')
             finally:
@@ -28024,6 +28117,34 @@ setTimeout(() => process.exit(0), 60000);
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
 
+        def test_register_current_browser_tab_creates_profile_bound_login_without_learning(self) -> None:
+            from unittest import mock
+            tmp, store, cfg, app = mk_env()
+            try:
+                with mock.patch.object(app.acc, "site_guard", return_value=""):
+                    row = app.acc.register_browser_tab("profile-a", {"tab": 27, "url": "https://chatgpt.com/", "title": "ChatGPT"})
+                account = app.acc.get(row["account_id"])
+                self.assertEqual((row["tab"], account["pc_client_id"], account["pc_login_tab"]), (27, "profile-a", 27))
+                self.assertEqual(account["state"], "login_claimed")
+                self.assertFalse(account["login_learn"])
+                requests = app.acc.browser_login_requests("profile-a")
+                self.assertEqual(len(requests), 1)
+                self.assertTrue(requests[0]["claimed"])
+                self.assertEqual(app.acc.browser_login_requests("profile-b"), [])
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        def test_login_only_does_not_start_heavy_request_capture(self) -> None:
+            from unittest import mock
+            tmp, store, cfg, app = mk_env()
+            try:
+                job = types.SimpleNamespace(kind="login-only")
+                with mock.patch.object(app.acc, "_learn_inner"), mock.patch("__main__.CdpRecorder") as recorder:
+                    app.acc._learn(types.SimpleNamespace(), {"id": "a", "host": "example.com"}, job)
+                recorder.assert_not_called()
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
         def test_dashboard_integrates_advanced_panels_and_workspace_picker(self) -> None:
             self.assertIn("workspace/select", DASHBOARD_HTML)
             self.assertIn("workspace/open", DASHBOARD_HTML)
@@ -28045,6 +28166,11 @@ setTimeout(() => process.exit(0), 60000);
             self.assertIn(".acc.s-ready,.acc.s-needs_learning", DASHBOARD_HTML)
             self.assertIn(".s-ready .stt,.s-needs_learning .stt", DASHBOARD_HTML)
             self.assertIn("a.state==='needs_learning'?'ready'", DASHBOARD_HTML)
+            self.assertIn("register_active_tab", PC_BACKGROUND_JS)
+            self.assertIn("async function testAccount(id)", DASHBOARD_HTML)
+            self.assertIn("Start here", DASHBOARD_HTML)
+            self.assertIn("ANTHROPIC_DEFAULT_SONNET_MODEL", DASHBOARD_HTML)
+            self.assertIn("--dangerously-skip-permissions", DASHBOARD_HTML)
 
     class TestServingModesAndEvidence(unittest.TestCase):
         """Owner-selected serving path and credential-safe learning evidence exports; mock data only."""
@@ -28569,9 +28695,9 @@ setTimeout(() => process.exit(0), 60000);
 
         def test_context_pages_goto_evaluate_and_close_only_own_tabs(self) -> None:
             e = self.fake()
-            e.tabs[5] = {"id": 5, "url": "https://personal.example/", "title": "mine", "owned": False}                   # the user's own tab
-            ctx = self.ctx(e)
-            self.assertEqual(ctx.pages, [])
+            e.tabs[5] = {"id": 5, "url": "https://personal.example/", "title": "mine", "owned": False, "consented": True} # selected by the owner
+            ctx = self.ctx(e, login_tab=5)
+            self.assertEqual(len(ctx.pages), 1)
             pg = ctx.new_page()
             self.assertEqual(len(ctx.pages), 1)
             e.evals["document.title"] = "Hello"
@@ -28587,7 +28713,7 @@ setTimeout(() => process.exit(0), 60000);
             with self.assertRaises(PCError):
                 pg.goto("javascript:alert(1)")
             ctx.close()
-            self.assertIn(5, e.tabs)                                                                                     # the user's tab was never closed
+            self.assertIn(5, e.tabs)                                                                                     # the selected user tab is borrowed, never closed
             self.assertEqual([t for t in e.tabs if e.tabs[t].get("owned")], [])
 
         def test_locator_click_fill_keys_use_trusted_input_events(self) -> None:
