@@ -8,20 +8,21 @@ Claude Code (Anthropic /v1/messages) and for Cursor / VS Code agents / anything
 OpenAI-compatible (/v1/chat/completions), with a web dashboard for accounts and keys.
 
 HOW IT WORKS (no per-site hard-coding)
-  1. ADD ACCOUNT  - a real browser opens; you log in once (the old way).
-  2. LEARN        - the bridge chats with the site through its own UI while recording the
-                    network traffic, then reverse-engineers a "recipe": endpoint, body template,
-                    auth source, which fields are per-chat / per-turn state, and how the answer
-                    is streamed. Recipes are verified by replaying them.
-  3. RUN          - tier DIRECT: plain HTTPS straight to the site's server (no browser, no RAM).
-                    tier PAGE : one in-page fetch() (tiny headless page) when direct is refused.
-                    tier UI   : drives the page headlessly only when nothing else verifies.
+  1. ADD ACCOUNT  - you sign into your chosen site in your own Chrome profile; login is saved immediately.
+  2. RUN          - a login-only web account can serve Claude Code through that same Chrome profile's UI right away.
+                    This keeps Cloudflare on the real owner browser; no Playwright profile is used for this path.
+  3. OPTIONAL LEARN - when the owner asks, the bridge records that site's real traffic and may build a faster
+                    request recipe (endpoint, body template, auth, per-chat/per-turn state and streaming). It never
+                    invents a protocol, and keeps the Chrome UI path as fallback.
+  4. RUN          - tier DIRECT: plain HTTPS straight to the site's server (no browser, no RAM).
+                    tier PAGE : one in-page fetch() when direct is refused.
+                    tier UI   : drives the owner's Chrome profile when no verified request recipe exists.
                     The tier is chosen by verification and downgraded automatically on failure.
-  4. REMEMBER     - every learned site gets docs/<host>.md and tools/<host>_client.py, so the
+  5. REMEMBER     - every learned site gets docs/<host>.md and tools/<host>_client.py, so the
                     next login (any account on that site) skips the browser entirely.
 
 PERSONAL CHROME (7.24)
-  Browser-dependent steps (login, learning, token refresh, PAGE and UI tiers) now run in YOUR OWN Chrome through a small Manifest-V3 extension that this file carries inside itself
+  Browser-dependent steps (login, optional learning, token refresh, PAGE and UI tiers) now run in YOUR OWN Chrome through a small Manifest-V3 extension that this file carries inside itself
   (extracted to <data>/personal_chrome/extension, verified by SHA-256). Chrome never installs extensions silently, so there is ONE human step: chrome://extensions > Developer mode >
   Load unpacked > pick that folder, then pair with the one-time code from `python bridge.py --pc-pair`. The bridge opens its own task tabs (it never navigates or closes your other tabs),
   talks to the extension over an authenticated loopback channel (pinned extension origin + token), and Chrome shows its own "is debugging this browser" bar while a tab is inspected.
@@ -166,7 +167,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.62"
+VERSION = "7.63"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -4783,7 +4784,8 @@ class UIBackend:
             target = conv["url"] or self.recipe.get("entry") or base + "/"
             host_ = _ui_host(pg)
             ui_gate_check(host_ or (urllib.parse.urlsplit(base).hostname or ""))      # in a back-off: touch nothing
-            fresh_ok = (conv["url"] is None and not ui_select and self.sel and (pg.url or "").startswith(base) and not url_on_login_path(pg.url) and ui_new_chat(pg, self.sel))
+            answer_probe = self.sel or '[data-message-author-role="assistant"]'
+            fresh_ok = (conv["url"] is None and not ui_select and (self.sel or self.diff) and (pg.url or "").startswith(base) and not url_on_login_path(pg.url) and ui_new_chat(pg, answer_probe))
             if not fresh_ok and (conv["url"] is None or pg.url != target):
                 pg.goto(target, wait_until="domcontentloaded", timeout=45000)
                 pg.wait_for_timeout(900)
@@ -6094,7 +6096,7 @@ def lc_derive(a: Dict[str, Any], has_recipe: bool) -> Tuple[str, str]:
         return "disabled", "migrated: the owner had disabled this account"
     st = a.get("state")
     if st == "needs_learning":
-        return "degraded_fallback", "login saved; owner-started learning is required before serving this new site"
+        return "degraded_fallback", "login saved; personal-Chrome UI serving is available while optional learning can add a faster protocol"
     if st in ("login_required", "expired") or st == "learning":
         return "needs_login", f"migrated from state '{st}'"
     if st == "ready" and (has_recipe or a.get("tier")):
@@ -13744,8 +13746,8 @@ class Accounts:
                     acct.update(state="ready", tier=str(recipe.get("tier") or "page"), serving_mode="browser", last_error="", cooldown_until=0)
                     reason = "login saved; browser-backed web use is the default and the existing site recipe is reused without a learning probe"
                 else:
-                    acct.update(state="needs_learning", tier="", last_error="Login saved. A site protocol recipe is still needed before Claude Code can send requests; Start learning is optional until you want to connect it.")
-                    reason = "login saved; no site protocol recipe exists yet, so the account is registered but cannot serve Claude Code requests until site setup is run"
+                    acct.update(state="needs_learning", tier="ui", last_error="Login saved. Claude Code can use the assigned personal Chrome profile now; optional learning can add a faster site protocol.")
+                    reason = "login saved; ready for personal-Chrome UI serving; optional learning can add a faster protocol"
                 for st_, why_ in (("capturing", "login detected; session saved"), ("degraded_fallback", reason)):
                     self.lc(acct["id"], st_, why_)
             elif job.ok and job.kind != "human":                    # only after the job released the browser profile
@@ -14254,7 +14256,7 @@ class Accounts:
             if self.recipe(host):
                 job.say("login saved; the existing site recipe is available without a new probe")
             else:
-                job.say("login saved; no recipe exists yet. Choose Start learning when you want to make this account usable")
+                job.say("login saved; Claude Code can use this personal Chrome tab now. Choose Start learning later if you want the optimized protocol")
             return
 
         if recipe:
@@ -14515,7 +14517,7 @@ class Accounts:
         if mode == "browser":
             recipe = self.recipe(acct["host"])
             if not recipe:
-                raise BridgeError("browser mode needs a learned recipe", "setup", 503)
+                return self._unlearned_ui_backend(acct)
             ui = recipe.get("ui") or {}
             if recipe.get("tier") == "ui" or recipe.get("unresolved"):
                 if not (ui.get("answer") or ui.get("diff")):
@@ -14683,6 +14685,8 @@ class Accounts:
             return be
         recipe = self.recipe(acct["host"])
         if not recipe:
+            if acct.get("state") == "needs_learning":
+                return self._unlearned_ui_backend(acct)
             raise BridgeError("site not learned yet - add/re-learn the account", "setup", 503)
         br = self.blocked_reason(acct)
         if br:
@@ -14695,8 +14699,20 @@ class Accounts:
             return PageBackend(recipe, sess, self.browser(acct["id"]))
         return UIBackend(recipe, self.browser(acct["id"]))
 
+    def _unlearned_ui_backend(self, acct: Dict[str, Any]) -> UIBackend:
+        """Serve a login-only account through its assigned personal Chrome profile until optional learning."""
+        parsed = urllib.parse.urlsplit(str(acct.get("url") or ""))
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise BridgeError("the saved web account has no valid site URL", "setup", 503)
+        base = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+        backend = UIBackend({"base": base, "entry": base + "/", "continuity": False, "tier": "ui", "ui": {"diff": True}},
+                            self.browser(acct["id"]))
+        backend.unlearned_ui = True
+        return backend
+
     def usable(self, a: Dict[str, Any]) -> bool:
-        return a.get("state") == "ready" and not a.get("disabled") and a.get("cooldown_until", 0) <= now() and not self.blocked_reason(a)
+        web_login_only = a.get("type") != "api" and a.get("state") == "needs_learning"
+        return (a.get("state") == "ready" or web_login_only) and not a.get("disabled") and a.get("cooldown_until", 0) <= now() and not self.blocked_reason(a)
 
     AUTO_ALIASES = ("", "bridge-auto", "bridge-fast", "bridge-balanced", "bridge-quality")
 
@@ -14741,7 +14757,7 @@ class Accounts:
                     raise BridgeError("the requested account no longer exists", "model_not_found", 404)
                 if a["id"] in exclude:
                     raise BridgeError(f"account '{a['label']}' failed and a fixed route is never replaced by another account", "unavailable", 503)
-                if a.get("state") != "ready":
+                if a.get("state") != "ready" and not (a.get("state") == "needs_learning" and a.get("type") != "api"):
                     raise BridgeError(f"account '{a['label']}' is not ready (state: {a.get('state')})", "setup", 503)
                 br = self.blocked_reason(a)
                 if br:
@@ -16779,7 +16795,7 @@ class RoutingEngine:
             ex("session_expired", f"'{label}' needs a login (lifecycle: {lcw})")
         if st in ("login_required", "expired") or (aid and self.acc.catalog(aid).get("status") == "requires_auth" and vid):
             ex("session_expired", f"'{label}' needs a new login (state: {st})")
-        elif st != "ready":
+        elif st != "ready" and not (st == "needs_learning" and a.get("type") != "api"):
             ex("account_not_ready", f"'{label}' is not ready (state: {st or 'unknown'})")
         br = self.acc.blocked_reason(a)
         if br:
@@ -17095,7 +17111,7 @@ class RoutingEngine:
         why = "; ".join(f"{e['route']}: {e['code']} ({e['detail']})" for e in dec.excluded[:8]) or "no candidate routes exist - add an account in the dashboard"
         more = f" (+{len(dec.excluded) - 8} more)" if len(dec.excluded) > 8 else ""
         if any(e.get("code") == "account_not_ready" and "needs_learning" in e.get("detail", "") for e in dec.excluded):
-            why += "; login is saved, but this website has no learned request protocol yet. In Bridge, open the account card and choose 'Start learning'; login alone cannot make a website account usable through Claude Code"
+            why += "; the login is saved; a web account can use its assigned personal Chrome tab now, while 'Start learning' is optional and optimizes the request path"
         return f"no eligible route under policy '{dec.policy}' ({kind}). Excluded: {why}{more}"
 
 
@@ -18186,7 +18202,7 @@ class Router:
             return out
         recipe = self.acc.recipe(acct["host"]) or {}
         fenced = getattr(backend, "fenced_tools", False)
-        rc = recipe.get("continuity", True)
+        rc = recipe.get("continuity", not bool(getattr(backend, "unlearned_ui", False)))
         site_level = "verified" if rc is True else ("none" if rc in (False, "none", "no", "false", 0) else "observed")   # what the site proved at learn time
         use_cont = bool(self.cfg["continuity"] and site_level != "none")
         sigs = [msg_sig(m) for m in req.messages]
@@ -18482,17 +18498,17 @@ def open_workspace_tool(app_name: str, folder: str, port: int, api_key: str, mod
             raise BridgeError("select an API key for Claude Code first", "client", 400)
         env.update(ANTHROPIC_BASE_URL=f"http://127.0.0.1:{int(port)}", ANTHROPIC_API_KEY=api_key,
                    ANTHROPIC_MODEL="sonnet", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
+        # Do not set ANTHROPIC_DEFAULT_{SONNET,OPUS,HAIKU}_MODEL to the aliases
+        # themselves. Claude Code treats those as pinned model IDs for a gateway;
+        # self-pinning `sonnet` caused v2.1.304 to warn that the model was unknown.
+        for key in ("ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"):
+            env.pop(key, None)
         if model:
             model = str(model)[:100]
             if not re.fullmatch(r"[A-Za-z0-9._:/-]+", model):
                 raise BridgeError("invalid Claude Code model or pool name", "client", 400)
-            # Keep Claude Code on its recognized `sonnet` alias while mapping that alias to the Bridge route.
-            # These values are Claude Code's recognized UI aliases. The Bridge maps them to the
-            # owner's account pool in routing.json; exposing bridge-auto/pool ids here makes
-            # newer Claude Code releases warn that the model is unknown.
-            env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = "sonnet"
-            env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = "opus"
-            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = "haiku"
+            # Claude Code's built-in aliases remain recognized; the Bridge maps
+            # each incoming model name to the owner's configured pool.
         if full_access:
             args.append("--dangerously-skip-permissions")
     elif app_name in ("vscode", "cursor"):
@@ -19488,7 +19504,7 @@ th_site:'Site',th_tier:'Mode',th_mem:'Chat memory',import:'Import recipe',
 s_cont:"Reuse the site's own chat memory (send only new messages)",s_sum:'Summarize old history with the model instead of cutting it',s_tool:'Tool description limit (chars)',s_sys:'System prompt limit (chars)',s_res:'Tool result limit (chars)',s_his:'History limit (chars)',s_hc:'Health check every (min, 0 = off)',s_cache:'Cache identical requests (s, 0 = off)',s_idle:'Close idle browser after (s)',
 rep_show:'Show analysis report',req_show:'Show captured requests',evidence_download:'Download source + requests',req_prev:'Previous',req_next:'Next',
 disc_hint:'Spends exactly 3 real requests on the chosen account to find the response field in which the site reports turning long text into an attachment. Nothing is sent until you confirm.',disc_btn:'Discover signal (3 real requests)',hide_tech:'Hide technical lines (DEBUG / tracebacks)',log_cp:'Copy diagnostic report',log_dl:'Download full log file',log_hint:'The report holds the version, account states, Chrome-extension state and the latest log lines (no keys, no message text). Paste it into the chat instead of describing the page.',log_copied:'Copied. Paste it into the chat.',log_failed:'Could not copy automatically; the report was downloaded instead.',
-s_ready:'Ready',s_learning:'Working',s_needs_you:'Needs you',s_needs_login:'Login needed',s_needs_learning:'Login saved · learning needed',s_failed:'Failed',s_cooling:'Cooling down',
+s_ready:'Ready',s_learning:'Working',s_needs_you:'Needs you',s_needs_login:'Login needed',s_needs_learning:'Login saved · needs_learning (Chrome UI ready)',s_failed:'Failed',s_cooling:'Cooling down',
 m_direct:'direct (fast)',m_page:'via browser page',m_ui:'via browser typing (slow)',
 st_open:'Open site',st_login:'Log in',st_learn:'Learn',st_analyse:'Analyse',st_verify:'Verify',st_finish:'Save',
 d_open:'Opening the site in a browser window…',d_login:'Waiting for you to log in inside the browser window.',d_learn:'Sending 3 short test messages through the site while recording the traffic.',d_analyse:'Working out how to talk to the site.',d_verify:'Testing which mode works: direct, then page, then browser typing.',d_finish:'Saving the recording and analysing it offline (up to ~30 s).',
@@ -19514,7 +19530,7 @@ th_site:'سایت',th_tier:'حالت',th_mem:'حافظه‌ی چت',import:'وا
 s_cont:'استفاده از حافظه‌ی خود سایت (فقط پیام‌های جدید ارسال شود)',s_sum:'خلاصه‌کردن تاریخچه‌ی قدیمی با مدل به‌جای بریدن',s_tool:'حد توضیح ابزار (حرف)',s_sys:'حد پرامپت سیستم (حرف)',s_res:'حد نتیجه‌ی ابزار (حرف)',s_his:'حد تاریخچه (حرف)',s_hc:'بررسی سلامت هر (دقیقه، 0 = خاموش)',s_cache:'کش درخواست‌های یکسان (ثانیه، 0 = خاموش)',s_idle:'بستن مرورگر بی‌کار بعد از (ثانیه)',
 rep_show:'نمایش گزارش تحلیل',req_show:'نمایش درخواست‌های ثبت‌شده',evidence_download:'دانلود سورس و درخواست‌ها',req_prev:'قبلی',req_next:'بعدی',
 disc_hint:'دقیقا ۳ درخواست واقعی روی حساب انتخابی مصرف می‌کند. تا تایید نکنید چیزی ارسال نمی‌شود.',disc_btn:'کشف سیگنال (۳ درخواست واقعی)',hide_tech:'پنهان‌کردن خطوط فنی (DEBUG و traceback)',log_cp:'کپی گزارش تشخیصی',log_dl:'دانلود کامل فایل لاگ',log_hint:'گزارش شامل نسخه، وضعیت حساب‌ها، وضعیت افزونه‌ی کروم و آخرین خطوط لاگ است (بدون کلید و بدون متن پیام‌ها). به جای توضیح صفحه، همین را در چت بگذارید.',log_copied:'کپی شد. در چت بگذارید.',log_failed:'کپی خودکار نشد؛ گزارش دانلود شد.',
-s_ready:'آماده',s_learning:'در حال کار',s_needs_you:'نیاز به شما',s_needs_login:'نیاز به ورود',s_needs_learning:'ورود ذخیره شد · نیازمند یادگیری',s_failed:'ناموفق',s_cooling:'در حال استراحت',
+s_ready:'\u0622\u0645\u0627\u062f\u0647',s_learning:'\u062f\u0631 \u062d\u0627\u0644 \u06a9\u0627\u0631',s_needs_you:'\u0646\u06cc\u0627\u0632 \u0628\u0647 \u0634\u0645\u0627',s_needs_login:'\u0646\u06cc\u0627\u0632 \u0628\u0647 \u0648\u0631\u0648\u062f',s_needs_learning:'\u0648\u0631\u0648\u062f \u0630\u062e\u06cc\u0631\u0647 \u0634\u062f \u00b7 needs_learning (\u0645\u0633\u06cc\u0631 Chrome \u0641\u0639\u0627\u0644)',s_failed:'\u0646\u0627\u0645\u0648\u0641\u0642',s_cooling:'\u062f\u0631 \u062d\u0627\u0644 \u0627\u0633\u062a\u0631\u0627\u062d\u062a',
 m_direct:'مستقیم (سریع)',m_page:'از طریق صفحه‌ی مرورگر',m_ui:'تایپ در مرورگر (کند)',
 st_open:'باز کردن',st_login:'ورود',st_learn:'یادگیری',st_analyse:'تحلیل',st_verify:'آزمایش',st_finish:'ذخیره',
 d_open:'در حال باز کردن سایت در پنجره‌ی مرورگر…',d_login:'منتظر ورود شما داخل پنجره‌ی مرورگر…',d_learn:'ارسال ۳ پیام آزمایشی کوتاه به سایت و ضبط ترافیک.',d_analyse:'در حال کشف روش ارتباط با سایت.',d_verify:'آزمایش اینکه کدام حالت کار می‌کند: مستقیم، بعد صفحه، بعد تایپ در مرورگر.',d_finish:'ذخیره‌ی ضبط و تحلیل آفلاین (حداکثر حدود ۳۰ ثانیه).',
@@ -19530,25 +19546,25 @@ req:'درخواست',fails:'خطا',healthy:'سالم',unhealthy:'ناسالم',
 c_copy:'کپی',c_revoke:'ابطال',docs:'مستندات',tool:'ابزار',export:'خروجی',forget:'فراموش کن',yes:'بله',no:'خیر',any_acc:'هر حسابی',running:'اجرا روی پورت ',errors:'خطا',
 cf_rm:'این حساب و پروفایل مرورگرش حذف شود؟',cf_forget:'recipe یادگرفته‌شده‌ی این سایت فراموش شود؟ در ورود بعدی دوباره یاد گرفته می‌شود.'}};
 L.en.add_btn='Add web account';L.en.add_hint='The account is saved as soon as you confirm login in the selected Chrome profile. Learning is optional and can be started later.';L.en.account_profile='Chrome profile';L.en.profile_any='Any paired profile';L.en.profile_unpaired='No paired Chrome profiles yet';L.en.pc_profiles='Chrome profiles';L.en.profile_assign='Use in profile';L.en.login_queued='Login request queued. Open the AI Web Bridge extension in the selected Chrome profile.';L.en.strategy_title='Claude Code account pool';L.en.strategy_hint='Choose the accounts Claude Code may use and how it selects among them. Only enabled, eligible accounts in this list are considered.';L.en.strategy_save='Save routing strategy';L.en.strategy_fixed='Fixed account';L.en.strategy_auto='Automatic selection';L.en.strategy_rotation='Rotate conversations through selected accounts';L.en.strategy_failover='Primary, then retry-safe failover';L.en.strategy_latency='Lowest measured latency';L.en.strategy_best_fit='Best fit for the request';L.en.strategy_manual='Ask before changing account';L.en.strategy_policy='Selection strategy';L.en.strategy_saved='Routing strategy saved.';L.en.strategy_empty='Select at least one account.';L.en.strategy_choose_one='Fixed routing requires exactly one selected account.';L.en.strategy_needs_two='This strategy needs at least two selected accounts.';L.en.profile_disconnected='Disconnected';L.en.profile_connected='Connected';L.en.profile_none='No Chrome profiles paired. Set one up above.';L.en.profile_changed='Account profile saved.';
-L.fa.add_btn='افزودن حساب وب';L.fa.add_hint='پس از تأیید ورود در افزونه‌ی پروفایل انتخاب‌شده، حساب بلافاصله ذخیره و قابل استفاده است. یادگیری اختیاری است و بعداً جداگانه آغاز می‌شود.';L.fa.account_profile='پروفایل Chrome';L.fa.profile_any='هر پروفایل متصل';L.fa.profile_unpaired='هنوز پروفایل Chrome متصل نیست';L.fa.pc_profiles='پروفایل‌های Chrome';L.fa.profile_assign='پروفایل استفاده';L.fa.login_queued='درخواست ورود ثبت شد؛ افزونه‌ی AI Web Bridge را در پروفایل Chrome انتخاب‌شده باز کنید.';L.fa.strategy_title='حساب‌های قابل استفاده در Claude Code';L.fa.strategy_hint='حساب‌هایی را که Claude Code اجازه‌ی استفاده از آن‌ها را دارد و روش انتخاب را مشخص کنید. فقط حساب‌های فعال و واجدشرایط همین فهرست بررسی می‌شوند.';L.fa.strategy_save='ذخیره‌ی سیاست استفاده';L.fa.strategy_fixed='یک حساب ثابت';L.fa.strategy_auto='انتخاب خودکار';L.fa.strategy_rotation='چرخش گفت‌وگوها میان حساب‌های انتخاب‌شده';L.fa.strategy_failover='حساب اصلی، سپس جایگزینی امن در خطای قابل‌تکرار';L.fa.strategy_latency='کمترین زمان پاسخ اندازه‌گیری‌شده';L.fa.strategy_best_fit='انتخاب مناسب‌تر برای درخواست';L.fa.strategy_manual='پیش از تغییر حساب تأیید بگیر';L.fa.strategy_policy='روش انتخاب حساب';L.fa.strategy_saved='سیاست مسیریابی ذخیره شد.';L.fa.strategy_empty='حداقل یک حساب انتخاب کنید.';L.fa.strategy_choose_one='مسیریابی ثابت به دقیقاً یک حساب نیاز دارد.';L.fa.strategy_needs_two='این روش حداقل به دو حساب انتخاب‌شده نیاز دارد.';L.fa.profile_disconnected='قطع';L.fa.profile_connected='متصل';L.fa.profile_none='هنوز پروفایل Chrome جفت نشده است؛ ابتدا از بالا یکی را وصل کنید.';L.fa.profile_changed='پروفایل حساب ذخیره شد.';
+L.fa.add_btn='\u0627\u0641\u0632\u0648\u062f\u0646 \u062d\u0633\u0627\u0628 \u0648\u0628';L.fa.add_hint='\u067e\u0633 \u0627\u0632 \u062a\u0623\u06cc\u06cc\u062f \u0648\u0631\u0648\u062f\u060c Claude Code \u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u062f \u0647\u0645\u0627\u0646 \u062d\u0633\u0627\u0628 \u0631\u0627 \u0627\u0632 \u067e\u0631\u0648\u0641\u0627\u06cc\u0644 Chrome \u0634\u062e\u0635\u06cc\u0650 \u062a\u062e\u0635\u06cc\u0635\u200c\u06cc\u0627\u0641\u062a\u0647 \u0627\u0633\u062a\u0641\u0627\u062f\u0647 \u06a9\u0646\u062f. \u06cc\u0627\u062f\u06af\u06cc\u0631\u06cc \u0627\u062e\u062a\u06cc\u0627\u0631\u06cc \u0627\u0633\u062a \u0648 \u0628\u0639\u062f\u0627\u064b \u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u062f \u0645\u0633\u06cc\u0631 \u0633\u0631\u06cc\u0639\u200c\u062a\u0631 \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0631\u0627 \u0627\u0636\u0627\u0641\u0647 \u06a9\u0646\u062f.';L.fa.account_profile='\u067e\u0631\u0648\u0641\u0627\u06cc\u0644 Chrome';L.fa.profile_any='\u0647\u0631 \u067e\u0631\u0648\u0641\u0627\u06cc\u0644 \u0645\u062a\u0635\u0644';L.fa.profile_unpaired='\u0647\u0646\u0648\u0632 \u067e\u0631\u0648\u0641\u0627\u06cc\u0644 Chrome \u0645\u062a\u0635\u0644 \u0646\u06cc\u0633\u062a';L.fa.pc_profiles='\u067e\u0631\u0648\u0641\u0627\u06cc\u0644\u200c\u0647\u0627\u06cc Chrome';L.fa.profile_assign='\u067e\u0631\u0648\u0641\u0627\u06cc\u0644 \u0627\u0633\u062a\u0641\u0627\u062f\u0647';L.fa.login_queued='\u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0648\u0631\u0648\u062f \u062b\u0628\u062a \u0634\u062f\u061b \u0627\u0641\u0632\u0648\u0646\u0647\u200c\u06cc AI Web Bridge \u0631\u0627 \u062f\u0631 \u067e\u0631\u0648\u0641\u0627\u06cc\u0644 Chrome \u0627\u0646\u062a\u062e\u0627\u0628\u200c\u0634\u062f\u0647 \u0628\u0627\u0632 \u06a9\u0646\u06cc\u062f.';L.fa.strategy_title='\u062d\u0633\u0627\u0628\u200c\u0647\u0627\u06cc \u0642\u0627\u0628\u0644 \u0627\u0633\u062a\u0641\u0627\u062f\u0647 \u062f\u0631 Claude Code';L.fa.strategy_hint='\u062d\u0633\u0627\u0628\u200c\u0647\u0627\u06cc \u0645\u062c\u0627\u0632 Claude Code \u0648 \u0631\u0648\u0634 \u0627\u0646\u062a\u062e\u0627\u0628 \u0631\u0627 \u0645\u0634\u062e\u0635 \u06a9\u0646. \u062d\u0633\u0627\u0628 \u0648\u0627\u0631\u062f\u0634\u062f\u0647 \u0628\u0627 \u0648\u0636\u0639\u06cc\u062a needs_learning \u0647\u0645 \u0627\u0632 \u067e\u0631\u0648\u0641\u0627\u06cc\u0644 Chrome \u0634\u062e\u0635\u06cc\u0650 \u062a\u062e\u0635\u06cc\u0635\u200c\u06cc\u0627\u0641\u062a\u0647 \u0642\u0627\u0628\u0644 \u0627\u0633\u062a\u0641\u0627\u062f\u0647 \u0627\u0633\u062a. \u06cc\u0627\u062f\u06af\u06cc\u0631\u06cc \u0627\u062e\u062a\u06cc\u0627\u0631\u06cc \u0627\u0633\u062a \u0648 \u0645\u0633\u06cc\u0631 \u0633\u0631\u06cc\u0639\u200c\u062a\u0631 \u0633\u0627\u06cc\u062a \u0631\u0627 \u0627\u0636\u0627\u0641\u0647 \u0645\u06cc\u200c\u06a9\u0646\u062f\u061b \u0627\u06cc\u0646 \u062d\u0633\u0627\u0628 \u0628\u0647 Playwright \u0645\u0646\u062a\u0642\u0644 \u0646\u0645\u06cc\u200c\u0634\u0648\u062f.';L.fa.strategy_save='\u0630\u062e\u06cc\u0631\u0647\u200c\u06cc \u0633\u06cc\u0627\u0633\u062a \u0627\u0633\u062a\u0641\u0627\u062f\u0647';L.fa.strategy_fixed='\u06cc\u06a9 \u062d\u0633\u0627\u0628 \u062b\u0627\u0628\u062a';L.fa.strategy_auto='\u0627\u0646\u062a\u062e\u0627\u0628 \u062e\u0648\u062f\u06a9\u0627\u0631';L.fa.strategy_rotation='\u0686\u0631\u062e\u0634 \u06af\u0641\u062a\u200c\u0648\u06af\u0648\u0647\u0627 \u0645\u06cc\u0627\u0646 \u062d\u0633\u0627\u0628\u200c\u0647\u0627\u06cc \u0627\u0646\u062a\u062e\u0627\u0628\u200c\u0634\u062f\u0647';L.fa.strategy_failover='\u062d\u0633\u0627\u0628 \u0627\u0635\u0644\u06cc\u060c \u0633\u067e\u0633 \u062c\u0627\u06cc\u06af\u0632\u06cc\u0646\u06cc \u0627\u0645\u0646 \u062f\u0631 \u062e\u0637\u0627\u06cc \u0642\u0627\u0628\u0644\u200c\u062a\u06a9\u0631\u0627\u0631';L.fa.strategy_latency='\u06a9\u0645\u062a\u0631\u06cc\u0646 \u0632\u0645\u0627\u0646 \u067e\u0627\u0633\u062e \u0627\u0646\u062f\u0627\u0632\u0647\u200c\u06af\u06cc\u0631\u06cc\u200c\u0634\u062f\u0647';L.fa.strategy_best_fit='\u0627\u0646\u062a\u062e\u0627\u0628 \u0645\u0646\u0627\u0633\u0628\u200c\u062a\u0631 \u0628\u0631\u0627\u06cc \u062f\u0631\u062e\u0648\u0627\u0633\u062a';L.fa.strategy_manual='\u067e\u06cc\u0634 \u0627\u0632 \u062a\u063a\u06cc\u06cc\u0631 \u062d\u0633\u0627\u0628 \u062a\u0623\u06cc\u06cc\u062f \u0628\u06af\u06cc\u0631';L.fa.strategy_policy='\u0631\u0648\u0634 \u0627\u0646\u062a\u062e\u0627\u0628 \u062d\u0633\u0627\u0628';L.fa.strategy_saved='\u0633\u06cc\u0627\u0633\u062a \u0645\u0633\u06cc\u0631\u06cc\u0627\u0628\u06cc \u0630\u062e\u06cc\u0631\u0647 \u0634\u062f.';L.fa.strategy_empty='\u062d\u062f\u0627\u0642\u0644 \u06cc\u06a9 \u062d\u0633\u0627\u0628 \u0627\u0646\u062a\u062e\u0627\u0628 \u06a9\u0646\u06cc\u062f.';L.fa.strategy_choose_one='\u0645\u0633\u06cc\u0631\u06cc\u0627\u0628\u06cc \u062b\u0627\u0628\u062a \u0628\u0647 \u062f\u0642\u06cc\u0642\u0627\u064b \u06cc\u06a9 \u062d\u0633\u0627\u0628 \u0646\u06cc\u0627\u0632 \u062f\u0627\u0631\u062f.';L.fa.strategy_needs_two='\u0627\u06cc\u0646 \u0631\u0648\u0634 \u062d\u062f\u0627\u0642\u0644 \u0628\u0647 \u062f\u0648 \u062d\u0633\u0627\u0628 \u0627\u0646\u062a\u062e\u0627\u0628\u200c\u0634\u062f\u0647 \u0646\u06cc\u0627\u0632 \u062f\u0627\u0631\u062f.';L.fa.profile_disconnected='\u0642\u0637\u0639';L.fa.profile_connected='\u0645\u062a\u0635\u0644';L.fa.profile_none='\u0647\u0646\u0648\u0632 \u067e\u0631\u0648\u0641\u0627\u06cc\u0644 Chrome \u062c\u0641\u062a \u0646\u0634\u062f\u0647 \u0627\u0633\u062a\u061b \u0627\u0628\u062a\u062f\u0627 \u0627\u0632 \u0628\u0627\u0644\u0627 \u06cc\u06a9\u06cc \u0631\u0627 \u0648\u0635\u0644 \u06a9\u0646\u06cc\u062f.';L.fa.profile_changed='\u067e\u0631\u0648\u0641\u0627\u06cc\u0644 \u062d\u0633\u0627\u0628 \u0630\u062e\u06cc\u0631\u0647 \u0634\u062f.';
 L.en.workspace_key_label='Bridge API key';L.fa.workspace_key_label='کلید API در Bridge';
-L.en.add_hint='After confirming login, the account is saved. Sign-in lets Bridge verify the browser session; for a new website, start learning separately before Claude Code can send requests through it.';
-L.fa.add_hint='بعد از تأیید ورود، حساب ذخیره می‌شود. این یعنی نشست مرورگر ثبت شده؛ برای استفاده از سایت جدید در Claude Code باید جداگانه دکمه‌ی شروع یادگیری را بزنی.';
-L.en.strategy_hint='Choose accounts Claude Code may use and how it selects them. A green login status only confirms sign-in; a site marked needs_learning cannot serve Claude Code until you start learning. Start learning or remove an account here.';
-L.fa.strategy_hint='حساب‌های مجاز Claude Code و روش انتخاب را مشخص کن. سبز بودن ورود فقط تأیید می‌کند وارد شده‌ای؛ حساب needs_learning تا شروع یادگیری نمی‌تواند به Claude Code پاسخ بدهد. همین‌جا یادگیری را شروع یا حساب را حذف کن.';
+L.en.add_hint='After confirming login, Claude Code can use that account through the assigned personal Chrome profile. Learning is optional and can add a faster request protocol later.';
+L.fa.add_hint='\u0628\u0639\u062f \u0627\u0632 \u062a\u0623\u06cc\u06cc\u062f \u0648\u0631\u0648\u062f\u060c Claude Code \u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u062f \u0647\u0645\u0627\u0646 \u062d\u0633\u0627\u0628 \u0631\u0627 \u0627\u0632 \u067e\u0631\u0648\u0641\u0627\u06cc\u0644 Chrome \u0634\u062e\u0635\u06cc\u0650 \u062a\u062e\u0635\u06cc\u0635\u200c\u06cc\u0627\u0641\u062a\u0647 \u0627\u0633\u062a\u0641\u0627\u062f\u0647 \u06a9\u0646\u062f. \u06cc\u0627\u062f\u06af\u06cc\u0631\u06cc \u0627\u062e\u062a\u06cc\u0627\u0631\u06cc \u0627\u0633\u062a \u0648 \u0628\u0639\u062f\u0627\u064b \u0645\u06cc\u200c\u062a\u0648\u0627\u0646\u062f \u0645\u0633\u06cc\u0631 \u0633\u0631\u06cc\u0639\u200c\u062a\u0631 \u062f\u0631\u062e\u0648\u0627\u0633\u062a \u0631\u0627 \u0627\u0636\u0627\u0641\u0647 \u06a9\u0646\u062f.';
+L.en.strategy_hint='Choose accounts Claude Code may use and how it selects them. A saved login marked needs_learning is still usable through its assigned personal Chrome profile. Optional learning can add a faster site protocol; it never switches this account to Playwright.';
+L.fa.strategy_hint='\u062d\u0633\u0627\u0628\u200c\u0647\u0627\u06cc \u0645\u062c\u0627\u0632 Claude Code \u0648 \u0631\u0648\u0634 \u0627\u0646\u062a\u062e\u0627\u0628 \u0631\u0627 \u0645\u0634\u062e\u0635 \u06a9\u0646. \u062d\u0633\u0627\u0628 \u0648\u0627\u0631\u062f\u0634\u062f\u0647 \u0628\u0627 \u0648\u0636\u0639\u06cc\u062a needs_learning \u0647\u0645 \u0627\u0632 \u067e\u0631\u0648\u0641\u0627\u06cc\u0644 Chrome \u0634\u062e\u0635\u06cc\u0650 \u062a\u062e\u0635\u06cc\u0635\u200c\u06cc\u0627\u0641\u062a\u0647 \u0642\u0627\u0628\u0644 \u0627\u0633\u062a\u0641\u0627\u062f\u0647 \u0627\u0633\u062a. \u06cc\u0627\u062f\u06af\u06cc\u0631\u06cc \u0627\u062e\u062a\u06cc\u0627\u0631\u06cc \u0627\u0633\u062a \u0648 \u0645\u0633\u06cc\u0631 \u0633\u0631\u06cc\u0639\u200c\u062a\u0631 \u0633\u0627\u06cc\u062a \u0631\u0627 \u0627\u0636\u0627\u0641\u0647 \u0645\u06cc\u200c\u06a9\u0646\u062f\u061b \u0627\u06cc\u0646 \u062d\u0633\u0627\u0628 \u0628\u0647 Playwright \u0645\u0646\u062a\u0642\u0644 \u0646\u0645\u06cc\u200c\u0634\u0648\u062f.';
 let lang=localStorage.lang||'fa';const t=k=>(L[lang]&&L[lang][k])??L.en[k]??k;
 function setTheme(v){if(v==='system')document.documentElement.removeAttribute('data-theme');else document.documentElement.dataset.theme=v;localStorage.setItem('theme',v)}
 const STAGES=['open','login','learn','analyse','verify','finish'];
 const VIEWS=[['accounts','accounts'],['connect','connect'],['sites','sites'],['settings','settings'],['log','log']];let view='accounts';
 let S=null,C=null,O=null,O12E='',RC=null,routePoolDraft=null,routeKindDraft='',tab='claude-ps',editing=false,openDet=new Set();
 function setLang(l){lang=l;localStorage.lang=l;document.documentElement.lang=l;document.documentElement.dir=l=='fa'?'rtl':'ltr';$('langbtn').textContent=l=='fa'?'English':'فارسی';
-document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));document.querySelectorAll('[data-ph]').forEach(e=>e.placeholder=t(e.dataset.ph));$('workflow-title').textContent=l==='fa'?'از اینجا شروع کن':'Start here';$('workflow-steps').textContent=l==='fa'?'۱) پروفایل Chrome موردنظرت را باز کن و به سایت هوش مصنوعی برو. ۲) افزونه Bridge را باز کن و «افزودن حساب از زبانه‌ی فعلی» را بزن. ۳) اگر لازم بود وارد شو و در همان زبانه «وارد شدم — تأیید» را بزن. ۴) اتصال را آزمایش کن؛ برای استفاده در Claude Code، «شروع یادگیری» را اجرا کن.':'1) Open the Chrome profile you want and visit the AI site. 2) Open the Bridge extension and choose “Add this site from current tab.” 3) Sign in if needed, then confirm from that same tab. 4) Test the login; to route Claude Code requests through a new site, run “Start learning” once.';$('workflow-note').textContent=l==='fa'?'ورود ذخیره‌شده سبز می‌شود و وضعیت «نیازمند یادگیری» را نشان می‌دهد تا خودت انتخاب کنی. تا زمان ساخته‌شدن روش اتصال آن سایت، Claude Code نمی‌تواند از آن اکانت درخواست بفرستد.':'A saved login is shown in green as “learning needed.” Learning stays your choice. Claude Code cannot send requests through a site until its connection recipe exists.';
+document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));document.querySelectorAll('[data-ph]').forEach(e=>e.placeholder=t(e.dataset.ph));$('workflow-title').textContent=l==='fa'?'از اینجا شروع کن':'Start here';$('workflow-steps').textContent=l==='fa'?'۱) پروفایل Chrome موردنظرت را باز کن و به سایت هوش مصنوعی برو. ۲) افزونه Bridge را باز کن و «افزودن حساب از زبانه‌ی فعلی» را بزن. ۳) اگر لازم بود وارد شو و در همان زبانه «وارد شدم — تأیید» را بزن. ۴) حالا Claude Code می‌تواند از همان تب Chrome استفاده کند؛ «شروع یادگیری» فقط برای ساخت مسیر سریع‌تر و اختیاری است.':'1) Open the Chrome profile you want and visit the AI site. 2) Open the Bridge extension and choose “Add this site from current tab.” 3) Sign in if needed, then confirm from that same tab. 4) Claude Code can now use that Chrome tab; “Start learning” is optional and builds a faster protocol.';$('workflow-note').textContent=l==='fa'?'وضعیت needs_learning یعنی ورود ذخیره شده اما پروتکل سریع هنوز ساخته نشده؛ مسیر UI در همان Chrome شخصی آماده‌ی استفاده است. یادگیری را فقط اگر خواستی اجرا کن.':'needs_learning means the login is saved but the fast protocol is not built yet; the assigned personal Chrome UI is ready to use. Start learning only if you choose.';
 if(S&&S.presets&&$('preset').options.length)$('preset').options[0].textContent=t('preset');navRender();render();renderCtx()}
 function navRender(){$('nav').innerHTML=VIEWS.map(v=>`<button class="${v[0]==view?'on':''}" onclick="go('${v[0]}')">${esc(t(v[1]))}</button>`).join('')}
 function go(v){view=v;document.querySelectorAll('.view').forEach(e=>e.classList.toggle('on',e.id=='v_'+v||(v=='accounts'&&e.id=='v_adv')));navRender()}
-function snippets(k,port,model){const u='http://127.0.0.1:'+port;return{'claude-ps':`$env:ANTHROPIC_BASE_URL="${u}"\n$env:ANTHROPIC_API_KEY="${k}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:ANTHROPIC_DEFAULT_SONNET_MODEL="sonnet"\n$env:ANTHROPIC_DEFAULT_OPUS_MODEL="opus"\n$env:ANTHROPIC_DEFAULT_HAIKU_MODEL="haiku"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nclaude`,
-'claude-sh':`export ANTHROPIC_BASE_URL=${u}\nexport ANTHROPIC_API_KEY=${k}\nexport ANTHROPIC_MODEL=sonnet\nexport ANTHROPIC_DEFAULT_SONNET_MODEL=sonnet\nexport ANTHROPIC_DEFAULT_OPUS_MODEL=opus\nexport ANTHROPIC_DEFAULT_HAIKU_MODEL=haiku\nexport CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
-'claude-cmd':`set ANTHROPIC_BASE_URL=${u}\nset ANTHROPIC_API_KEY=${k}\nset ANTHROPIC_MODEL=sonnet\nset ANTHROPIC_DEFAULT_SONNET_MODEL=sonnet\nset ANTHROPIC_DEFAULT_OPUS_MODEL=opus\nset ANTHROPIC_DEFAULT_HAIKU_MODEL=haiku\nset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
+function snippets(k,port,model){const u='http://127.0.0.1:'+port;return{'claude-ps':`$env:ANTHROPIC_BASE_URL="${u}"\n$env:ANTHROPIC_API_KEY="${k}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nclaude`,
+'claude-sh':`export ANTHROPIC_BASE_URL=${u}\nexport ANTHROPIC_API_KEY=${k}\nexport ANTHROPIC_MODEL=sonnet\nexport CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
+'claude-cmd':`set ANTHROPIC_BASE_URL=${u}\nset ANTHROPIC_API_KEY=${k}\nset ANTHROPIC_MODEL=sonnet\nset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
 'openai':`Base URL : ${u}/v1\nAPI key  : ${k}\nModel    : bridge-auto   (or acct:<id> / the exact account label to force one account)\n\nCursor / VS Code agents / Continue / Cline / any OpenAI-compatible client:\nuse the "OpenAI compatible" provider with the values above.`}}
 const names={'claude-ps':'Claude Code (PowerShell)','claude-sh':'Claude Code (bash)','claude-cmd':'Claude Code (cmd)','openai':'Cursor / VS Code / OpenAI-compatible'};
 const mmss=s=>{s=Math.max(0,Math.floor(s));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
@@ -19655,7 +19671,7 @@ async function addAcc(){const url=$('url').value.trim();if(!url)return alert(t('
 async function selectWorkspace(){try{const r=await api('workspace/select','POST',{});if(r.folder){$('workspace_path').value=r.folder;localStorage.workspacePath=r.folder;$('workspace_status').textContent=t('workspace_ready')}else $('workspace_status').textContent=t('workspace_cancel');updateWorkspaceCommand()}catch(e){$('workspace_status').textContent=t('workspace_error')+errMsg(e)}}
 function workspaceModel(){return 'sonnet'}
  function updateWorkspaceCommand(){const app=$('workspace_app').value,folder=$('workspace_path').value,keyValue=(S&&S.keys.find(k=>k.id===$('workspace_key').value)||{}).key||'',base='http://127.0.0.1:'+(S?S.port:'8788'),policy=workspaceModel();localStorage.workspaceApp=app;localStorage.claudeFullAccess=$('claude_full_access').checked?'1':'0';let cmd='';const psPath="'"+folder.replace(/'/g,"''")+"'";
- if(!folder)cmd=t('workspace_ph');else if(app==='claude'&&!keyValue)cmd=t('workspace_key_required');else if(app==='claude'){const full=$('claude_full_access').checked,flag=full?' --dangerously-skip-permissions':'';cmd=`$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_API_KEY="${keyValue}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:ANTHROPIC_DEFAULT_SONNET_MODEL="sonnet"\n$env:ANTHROPIC_DEFAULT_OPUS_MODEL="opus"\n$env:ANTHROPIC_DEFAULT_HAIKU_MODEL="haiku"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nSet-Location -LiteralPath ${psPath}\nclaude${flag}`}
+ if(!folder)cmd=t('workspace_ph');else if(app==='claude'&&!keyValue)cmd=t('workspace_key_required');else if(app==='claude'){const full=$('claude_full_access').checked,flag=full?' --dangerously-skip-permissions':'';cmd=`$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_API_KEY="${keyValue}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nSet-Location -LiteralPath ${psPath}\nclaude${flag}`}
 else if(app==='vscode')cmd=`code "${folder}"`;else if(app==='cursor')cmd=`cursor "${folder}"`;else if(app==='cmd')cmd=`cd /d "${folder}"`;else cmd=`Set-Location -LiteralPath ${psPath}`;
  $('workspace_command').textContent=cmd||'Select a workspace folder to prepare the command.'}
 async function copyWorkspaceCommand(){updateWorkspaceCommand();const cmd=$('workspace_command').textContent;if(!cmd||cmd===t('workspace_ph')||cmd===t('workspace_key_required'))return;try{await navigator.clipboard.writeText(cmd);$('workspace_status').textContent=t('workspace_copied')}catch(e){$('workspace_status').textContent=cmd}}
@@ -21101,6 +21117,21 @@ def run_selftest(quick: bool = False) -> int:
             r = self.eng.assess(rid, {"name": "t", "kind": "auto", **(policy or {})}, needs or {"capabilities": [], "tokens": 0, "max_tokens": 0}, pinned, set(tried),
                                 {**default_routing(), **(cfgd or {})}, breaker)
             return [c for c, _d in r["codes"]]
+
+        def test_login_only_web_account_is_routable_through_personal_chrome(self) -> None:
+            from unittest import mock
+            a = self.acc.get("a1")
+            a.update(state="needs_learning", type="browser", serving_mode="browser", url="https://chatgpt.com/", tier="ui")
+            self.assertNotIn("account_not_ready", self.codes("acct:a1"))
+            selected, _decision = self.plan()
+            self.assertEqual(selected["acct"]["id"], "a1")
+            with mock.patch.object(self.acc, "browser", return_value=object()):
+                backend = self.acc.backend(a)
+            self.assertIsInstance(backend, UIBackend)
+            self.assertTrue(backend.fenced_tools)
+            self.assertTrue(backend.unlearned_ui)
+            self.assertTrue(backend.diff)
+            self.assertFalse(backend.recipe["continuity"])
 
         # -- C1: validator
         def test_validator_rejects_impossible_configs_with_precise_messages(self) -> None:
@@ -28112,9 +28143,9 @@ setTimeout(() => process.exit(0), 60000);
                 with mock.patch("shutil.which", return_value="C:/Tools/claude.exe"), mock.patch("subprocess.Popen", popen):
                     open_workspace_tool("claude", str(tmp), 8788, "bridge-key", "bridge-pool/user-claude-pool")
                 self.assertEqual(popen.call_args.kwargs["env"]["ANTHROPIC_MODEL"], "sonnet")
-                self.assertEqual(popen.call_args.kwargs["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"], "sonnet")
-                self.assertEqual(popen.call_args.kwargs["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "opus")
-                self.assertEqual(popen.call_args.kwargs["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "haiku")
+                self.assertNotIn("ANTHROPIC_DEFAULT_SONNET_MODEL", popen.call_args.kwargs["env"])
+                self.assertNotIn("ANTHROPIC_DEFAULT_OPUS_MODEL", popen.call_args.kwargs["env"])
+                self.assertNotIn("ANTHROPIC_DEFAULT_HAIKU_MODEL", popen.call_args.kwargs["env"])
                 with mock.patch("shutil.which", return_value="C:/Tools/claude.exe"), mock.patch("subprocess.Popen", popen):
                     open_workspace_tool("claude", str(tmp), 8788, "bridge-key", "bridge-auto", full_access=True)
                 self.assertIn("--dangerously-skip-permissions", popen.call_args.args[0])
@@ -28150,6 +28181,7 @@ setTimeout(() => process.exit(0), 60000);
                 self.assertEqual(start.call_args.args[1], "login-only")
                 account["state"] = "needs_learning"
                 self.assertEqual(lc_derive(account, False)[0], "degraded_fallback")
+                self.assertTrue(app.acc.usable(account))
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
 
@@ -28234,9 +28266,11 @@ setTimeout(() => process.exit(0), 60000);
             self.assertIn("register_active_tab", PC_BACKGROUND_JS)
             self.assertIn("async function testAccount(id)", DASHBOARD_HTML)
             self.assertIn("Start here", DASHBOARD_HTML)
-            self.assertIn("ANTHROPIC_DEFAULT_SONNET_MODEL", DASHBOARD_HTML)
+            self.assertNotIn("ANTHROPIC_DEFAULT_SONNET_MODEL", DASHBOARD_HTML)
+            self.assertIn("Playwright is not used", DASHBOARD_HTML)
+            self.assertIn("از Playwright استفاده نمی‌کند", DASHBOARD_HTML)
             self.assertIn("--dangerously-skip-permissions", DASHBOARD_HTML)
-            self.assertIn("needs_learning cannot serve Claude Code until you start learning", DASHBOARD_HTML)
+            self.assertIn("A saved login marked needs_learning is still usable through its assigned personal Chrome profile", DASHBOARD_HTML)
             self.assertIn("Start learning", DASHBOARD_HTML)
             self.assertIn("function workspaceModel(){return 'sonnet'}", DASHBOARD_HTML)
 
