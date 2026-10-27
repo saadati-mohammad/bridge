@@ -1,15 +1,7 @@
-# Python
+# Generated runtime state (everything bridge.py writes lives here)
+bridge_data/
+
+# Python bytecode hygiene
 __pycache__/
 *.pyc
 *.pyo
-
-# Generated runtime state (recreated locally by running bridge.py)
-bridge_data/
-
-# Local secrets / device state
-.deepseek_bridge*.json
-.deepseek_bridge.json.lock
-ds_profile/
-
-# Logs
-*.log
