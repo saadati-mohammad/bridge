@@ -4413,6 +4413,7 @@ class Capture:
 # until the check finishes. The bridge never types into a locked input, never forces text in with the keyboard, never solves the check: it WAITS like a
 # person would (most checks finish by themselves in a few seconds), keeps a minimum gap between sends, and after a check that did not finish it backs off
 # (growing waits) and hands the window to the owner instead of retrying in a loop.
+UI_WAKE_AFTER_S = float(os.environ.get("BRIDGE_UI_WAKE_AFTER", "4"))     # 7.80: seconds without a chat input before the tab is brought to the front (once per wait)
 UI_READY_TIMEOUT = float(os.environ.get("BRIDGE_UI_READY_TIMEOUT", "90"))        # seconds to wait for the page to become usable
 UI_MIN_GAP = float(os.environ.get("BRIDGE_UI_MIN_GAP", "1.5"))
 UI_NO_ANSWER_CHECK_S = float(os.environ.get("BRIDGE_UI_NO_ANSWER_CHECK", "12"))      # 7.74: no answer text yet after this long -> look at the page (was the message really sent? error banner?)
@@ -4547,6 +4548,7 @@ def ui_wait_ready(page: Any, timeout: float = UI_READY_TIMEOUT, say: Optional[Ca
     On timeout: a check that never finished -> BridgeError kind 'challenge' (the owner is asked, no retry loop); anything else -> kind 'ui'."""
     t0, last_say, ok, seen_challenge, told = time.time(), 0.0, 0, False, False
     last = ""
+    woke = False
     while True:
         try:
             st = ui_page_state(page)
@@ -4577,6 +4579,16 @@ def ui_wait_ready(page: Any, timeout: float = UI_READY_TIMEOUT, say: Optional[Ca
                     say("the site shows a verification: the tab was brought to the front - complete it once and the request continues by itself")
             seen_challenge = seen_challenge or bool(st["challenge"])
             el = time.time() - t0
+            if why == "no_input" and not woke and not st["challenge"] and el >= UI_WAKE_AFTER_S:
+                # 7.80: a tab that has never been shown (first request) may not draw the chat input until it is visible. That is exactly what looking at the tab fixes by hand,
+                # so do it once, automatically - only when the input has still not appeared after a few seconds, never when the page is already usable.
+                woke = True
+                try:
+                    page.bring_to_front()
+                    if say:
+                        say("the chat input has not appeared: the tab is probably in the background - it was brought to the front once")
+                except Exception:
+                    pass
             if say and (not told or el - last_say >= 15):
                 told, last_say = True, el
                 say(f"waiting: {_UI_WHY.get(why, why)} ({int(el)}s of {int(timeout)}s) - nothing is typed or sent until the page is usable")
@@ -4652,6 +4664,18 @@ def ui_ensure_sent(text_len: int, composer_len: Callable[[], int], generating: C
         if why:
             return "resent:" + why
     return "resent:unconfirmed"
+
+
+def ui_clear_composer(page: Any) -> None:
+    """7.79: empty the chat box the way a framework-controlled textarea notices (native setter + input event); the plain keyboard shortcut is not reliable over CDP."""
+    try:
+        page.evaluate("""() => { const el = document.querySelector('textarea') || document.querySelector('[contenteditable="true"]');
+            if (!el) return; el.focus();
+            if (el.tagName === 'TEXTAREA') { const set = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set; set.call(el, '');
+                el.dispatchEvent(new Event('input', {bubbles: true})); }
+            else { el.textContent = ''; el.dispatchEvent(new Event('input', {bubbles: true})); } }""")
+    except Exception:
+        pass
 
 
 def ui_type_and_send(page: Any, text: str, say: Optional[Callable[[str], None]] = None) -> None:
@@ -5343,7 +5367,7 @@ class UIBackend:
         mk = end_marker() if (end_marker() and end_marker() in prompt) else ""     # 7.71: the reply is expected to end with the marker only when THIS prompt asked for it
         tap = state.get("tap")
         conv["end_via"], conv["net_text"], conv["net_streams"] = "", None, 0
-        last_diag, resent, last_progress, body_sig, polls = t0, False, t0, "", 0
+        last_diag, stuck, last_progress, body_sig, polls = t0, 0, t0, "", 0
 
         def diag(ctx: Any) -> Dict[str, Any]:                          # 7.74: what does the page look like while no answer shows up?
             pg = _page(self.ab, ctx, base, self.recipe.get("entry"))
@@ -5380,6 +5404,26 @@ class UIBackend:
                     box.click(timeout=3000)
                     pg.keyboard.press("Enter")
 
+        def retype(ctx: Any) -> None:                                  # 7.79: rung 2: empty the box and put the text in again, then send
+            pg = _page(self.ab, ctx, base, self.recipe.get("entry"))
+            ui_clear_composer(pg)
+            pg.wait_for_timeout(300)
+            box = find_input(pg)
+            if box is None:
+                return
+            box.click(timeout=3000)
+            box.fill(prompt, timeout=8000)
+            pg.wait_for_timeout(600)
+            if not ui_click_send(pg):
+                pg.keyboard.press("Enter")
+
+        def reload_send(ctx: Any) -> None:                             # 7.79: rung 3: the page itself may be in a bad state: reload it and send the same text once
+            pg = _page(self.ab, ctx, base, self.recipe.get("entry"))
+            pg.reload()
+            pg.wait_for_timeout(1500)
+            ui_clear_composer(pg)
+            ui_type_and_send(pg, prompt, say=lambda m_: log(f"UI send: {m_}", "warn"))
+
         try:
             while time.monotonic() - t0 < 600:
                 if cancel is not None and cancel.is_set():
@@ -5405,15 +5449,21 @@ class UIBackend:
                         f"alerts={d.get('alerts')} page_tail={d.get('tail', '')!r}", "warn")
                     if bad and not d.get("gen"):
                         raise BridgeError(f"the chat site shows an error instead of an answer: {bad[0][:200]}", "upstream", 502)
-                    if d.get("composer", 0) > 20 and not d.get("gen") and not resent:
-                        resent = True
-                        log("UI: the message is still in the input box (it was not sent) - pressing send again", "warn")
+                    if d.get("composer", 0) > 20 and not d.get("gen"):
+                        # 7.79: the text is provably still in the box (nothing was sent). One extra Enter was not enough on this page: climb a ladder, one rung per look (12 s apart).
+                        stuck += 1
+                        if stuck > 4:
+                            raise BridgeError("the chat page did not take the message even after pressing send, re-typing it and reloading the page; "
+                                              "the next request starts a fresh chat", "upstream", 504)
+                        rung = {1: resend, 2: retype, 3: reload_send, 4: resend}[stuck]
+                        log(f"UI: the message is still in the input box (it was not sent) - repair step {stuck}/4: "
+                            f"{ {1: 'press send again', 2: 'clear and re-type the text', 3: 'reload the page and send again', 4: 'press send once more'}[stuck] }", "warn")
                         try:
-                            self.ab.run(resend, True, 40)
+                            self.ab.run(rung, True, 90)
                         except BridgeError:
                             raise
                         except Exception as e_:
-                            log(f"UI: re-send failed: {type(e_).__name__}: {e_}", "warn")
+                            log(f"UI: repair step {stuck} failed: {type(e_).__name__}: {e_}", "warn")
                         last_progress = time.monotonic()
                 if first_text_at is None and (time.monotonic() - last_progress) >= UI_NO_ANSWER_LIMIT_S:
                     raise BridgeError(f"no answer appeared on the chat page for {int(time.monotonic() - t0)}s and the page showed no activity; "
@@ -16171,7 +16221,7 @@ def tools_text(tools: Dict[str, Dict[str, Any]], choice: Dict[str, Any], desc_li
     return "\n".join(lines)
 
 
-def fix_message(req: Any, problems: List[str], need: bool) -> str:
+def fix_message(req: Any, problems: List[str], need: bool, attempt: int = 1) -> str:
     """What the model is told when a tool call was unusable: the exact problems, the exact schema of every tool named in them, and the end-marker rule again."""
     msg = ("Your previous reply contained an invalid tool call: " + "; ".join(problems or ["no tool call was made but one is required"]) +
            ". Reply again with ONLY the corrected tool call(s) in the exact format.")
@@ -16182,6 +16232,13 @@ def fix_message(req: Any, problems: List[str], need: bool) -> str:
                 seen.append(n)
     for n in seen[:3]:
         msg += f"\nThe exact input schema of '{neutralise(n)}': " + neutralise(jdump(minify_schema(req.tools[n].get("input_schema") or {}, 0, True)))
+    if getattr(_TL, "fmt", "") == "dsml":                                  # 7.77: a model that just broke the markup gets the exact markup again
+        _D = _DSML
+        msg += (f'\nExact format: <{_D}DSML{_D}function_calls>\n<{_D}DSML{_D}invoke name="TOOL_NAME">\n<{_D}DSML{_D}parameter name="ARG_NAME" string="true">VALUE</{_D}DSML{_D}parameter>\n'
+                f'</{_D}DSML{_D}invoke>\n</{_D}DSML{_D}function_calls>\nClose every tag you open (parameter, then invoke, then function_calls).')
+    if attempt >= 2:                                                       # 7.78: the markup failed twice: offer the format whose failure mode is different (plain JSON in a fence; the parser reads both)
+        msg += ('\nIf the markup keeps failing, use THIS format instead (valid JSON; escape newlines and quotes inside strings):\n'
+                '```tool_call\n{"name": "TOOL_NAME", "arguments": { ... }}\n```')
     m = end_marker()
     return msg + (f"\nEnd the reply with the line {m}." if m else "")
 
@@ -17810,8 +17867,13 @@ def build_prompt(req: NormReq, cfg: Config, fenced: bool, delta_from: Optional[i
             ctx.idx = i
             parts.append(render_message(req.messages[i], rl, names, ctx))
         _mk = end_marker()
+        _hint = ""
+        if fmt == "dsml" and req.tools:                                      # 7.77: do not rely on the model remembering message #1 after 100+ turns: restate the skeleton every time
+            _D = _DSML
+            _hint = (f' Skeleton: <{_D}DSML{_D}function_calls><{_D}DSML{_D}invoke name="TOOL"><{_D}DSML{_D}parameter name="ARG" string="true">VALUE</{_D}DSML{_D}parameter>'
+                     f'</{_D}DSML{_D}invoke></{_D}DSML{_D}function_calls> - every opened tag must be closed, in that order.')
         tail = (("\n\n(Continue as the assistant. To call a tool use ONLY the " + {"fenced": "```tool_call fenced JSON block", "dsml": "DSML function_calls format"}.get(fmt, "tag format") +
-                 " exactly as defined at the start of this chat" + ("" if fmt == "dsml" else " - never XML/DSML/<invoke>") + "." +
+                 " exactly as defined at the start of this chat" + ("" if fmt == "dsml" else " - never XML/DSML/<invoke>") + "." + _hint +
                  (f" End the reply with the line {_mk}." if _mk else "") + ")") if req.tools else "")
         upd, shown_now = "", None
         if req.tools and shown_tools is not None:                                  # 7.71 (5): tools that became relevant since the remote chat last saw the list
@@ -18144,6 +18206,42 @@ def _xml_params(body: str, rx: "re.Pattern[str]", typed: bool) -> Tuple[Dict[str
     return args, closed
 
 
+def _loose_params(body: str, props: Dict[str, Any]) -> Dict[str, Any]:
+    """7.78: last-resort recovery when the parameter OPEN tags are mangled but the values are intact. A value runs from the end of a tag that names a known property
+    up to the next closing tag; it is accepted only when that closing tag really exists (so a cut-off value is never executed)."""
+    out: Dict[str, Any] = {}
+    names = sorted((str(k) for k in props), key=len, reverse=True)
+    for nm in names:
+        mm = re.search(r"<[^<>/\n]{0,60}?(?<![A-Za-z0-9_])" + re.escape(nm) + r"[\"']?[^<>]{0,40}>(.*?)<\s*/[^<>\n]{0,60}>", body, re.S)
+        if not mm:
+            continue
+        v = mm.group(1)
+        if v.startswith("\n"):
+            v = v[1:]
+        if v.endswith("\n"):
+            v = v[:-1]
+        typ = (props.get(nm) or {}).get("type") if isinstance(props.get(nm), dict) else None
+        if typ in ("integer", "number", "boolean", "array", "object"):
+            try:
+                v = json.loads(v.strip())
+            except Exception:
+                continue
+        out[nm] = v
+    return out
+
+
+_LAST_PARAM_CLOSE_RE = re.compile(r"<\s*/\s*" + _DSML_PFX + r"parameter\s*>", re.I)
+_ONLY_CLOSERS_RE = re.compile(r"(?:\s*<\s*/[^<>\n]{0,60}>|\s*\u27e6[A-Z]+\u27e7)*\s*\Z")
+
+
+def _only_closing_tags_after_last_param(body: str) -> bool:
+    """7.77: True when, after the last closed parameter, the text holds nothing but closing tags (even garbled ones such as </||DSML|| calls>) or the end marker."""
+    last = None
+    for mm in _LAST_PARAM_CLOSE_RE.finditer(body):
+        last = mm
+    return bool(last) and _ONLY_CLOSERS_RE.match(body, last.end()) is not None
+
+
 def parse_tool_calls(text: str, tools: Dict[str, Dict[str, Any]], seed: str = "") -> Tuple[str, List[Dict[str, Any]], List[str]]:
     if not tools:
         return text, [], []
@@ -18277,8 +18375,14 @@ def parse_tool_calls(text: str, tools: Dict[str, Dict[str, Any]], seed: str = ""
             continue
         real = _resolve_tool(m.group(1), tools, lower, canon)
         args, pclosed = _xml_params(m.group(2), _PARAM_RE, True)
+        if not args and real:                                              # 7.78: mangled parameter tags (e.g. <|DSML|command" string="true">): recover by the tool's own property names
+            _la = _loose_params(m.group(2), ((tools[real].get("input_schema") or {}).get("properties")) or {})
+            if _la:
+                args, pclosed = _la, True
         spans.append((m.start(), m.end()))
-        if not m.group(3) or not pclosed:
+        # 7.77: DeepSeek often forgets </invoke> or garbles the closing tags although every parameter is complete: that is a finished call, not a cut-off one.
+        _lenient_ok = (not m.group(3)) and pclosed and bool(args) and _only_closing_tags_after_last_param(m.group(2))
+        if (not m.group(3) and not _lenient_ok) or not pclosed:
             problems.append(f"the tool call '{m.group(1)}' was cut off before it finished (not executed)")
         elif real is None:
             problems.append(f"unknown tool '{m.group(1)}' (available: {', '.join(list(tools)[:12])})")
@@ -19888,6 +19992,27 @@ class Router:
         m = msgs[n - 1]
         return m.get("role") == "assistant" and self._tool_names(m) == e.shape
 
+    def _tc_note(self, cid: str, retries: int, gave_up: bool, rescued: bool) -> None:
+        """7.78: remember how often this remote chat needed repair; a chat that keeps failing is replaced by a fresh one (see _tc_unhealthy)."""
+        with self.lock:
+            hist = self.__dict__.setdefault("_tc_hist", {})
+            if rescued:
+                hist[cid] = {"recent": [], "since": 0, "bad": False}               # the new chat starts clean
+                return
+            h = hist.setdefault(cid, {"recent": [], "since": 0, "bad": False})
+            h["recent"] = (h["recent"] + [1 if (retries or gave_up) else 0])[-6:]
+            h["since"] += 1
+            h["bad"] = bool(gave_up)
+
+    def _tc_unhealthy(self, cid: str) -> bool:
+        with self.lock:
+            h = self.__dict__.get("_tc_hist", {}).get(cid)
+            if not h:
+                return False
+            if h.get("bad"):
+                return True
+            return h["since"] >= 4 and sum(h["recent"][-6:]) >= 3                  # 3 of the last 6 turns needed a repair: the chat has drifted from the format
+
     def _take(self, aid: str, sigs: List[str], tsig: str, ssig: str, msgs: Optional[List[Dict[str, Any]]] = None) -> Tuple[Optional[ConvEntry], int]:
         k = self.SIGN
         want = [x[:k] for x in sigs]
@@ -20510,6 +20635,12 @@ class Router:
         vmodel = req.variant_native or ""
         cid = acct["id"] + ("|" + vmodel if vmodel else "")           # remote chat memory is per (account, selected model)
         entry, n = (self._take(cid, sigs, tsig, ssig, req.messages) if use_cont else (None, 0))
+        if entry is not None and getattr(backend, "tier", "") == "ui" and self._tc_unhealthy(cid):
+            log(f"{acct['label']}: this chat keeps breaking the tool-call format - moving to a fresh chat with the full instructions (history is rebuilt, nothing is lost)", "warn")
+            self.bump("chats_rotated_for_format")
+            with self.lock:
+                self.__dict__.setdefault("_tc_hist", {})[cid] = {"recent": [], "since": 0, "bad": False}
+            entry, n = None, 0
         if use_cont:                                                     # 7.76 (step A): say WHY the whole history is re-sent (indexes and sizes only, no text)
             try:
                 if entry is None:
@@ -20683,7 +20814,7 @@ class Router:
         while req.tools and (problems or need) and getattr(backend, "tier", "") != "" and retries < int(self.cfg["fix_retries"]):
             retries += 1
             try:
-                t2 = self._ask_text(backend, conv, fix_message(req, problems, need), None, cancel, vmodel)
+                t2 = self._ask_text(backend, conv, fix_message(req, problems, need, retries), None, cancel, vmodel)
             except BridgeError:
                 break
             c2, calls2, problems2 = parse_tool_calls(t2, req.tools, seed)
@@ -20704,8 +20835,31 @@ class Router:
             calls = calls + held
             problems = []
             log(f"pre-check released {len(held)} call(s) after {retries} retry(ies): the model insisted", "debug")
-        if problems and not calls and not clean:
-            clean = "(The model produced a tool call that could not be parsed: " + "; ".join(problems)[:300] + ")"
+        rescued = False
+        if problems and not calls and req.tools and getattr(backend, "tier", "") == "ui" and use_cont:
+            # 7.78: the chat has stopped following the format and the retries did not help. Re-ask ONCE in a fresh chat that gets the full instructions again,
+            # instead of handing Claude Code a reply without a tool call (which ends its turn). Nothing was executed yet, so asking again is safe.
+            try:
+                nl_, _ns = paste_limit(self.cfg, recipe, self.acc.profile(host).long_paste)
+                full_ = build_prompt(req, prompt_cfg, fenced, summary=self._summary(backend, req), handoff=req.handoff, vault=self.vault, trace={}, budget=0, fmt=tool_fmt)
+                if not nl_ or len(full_) <= nl_:
+                    log(f"{acct['label']}: tool calls kept failing ({'; '.join(problems)[:120]}) - re-asking in a fresh chat with the full instructions", "warn")
+                    conv_r = backend.new_conv(vmodel) if vmodel else backend.new_conv()
+                    t3 = self._ask_text(backend, conv_r, full_, None, cancel, vmodel)
+                    c3, calls3, problems3 = parse_tool_calls(t3, req.tools, seed)
+                    acc3, pre3 = precheck_calls(req, calls3, self.cfg) if calls3 else ([], [])
+                    if acc3 and not problems3 and not pre3:
+                        calls, problems, clean, text, conv, rescued = acc3, [], c3, t3, conv_r, True
+                        self.bump("tool_call_rescues")
+                        log(f"{acct['label']}: fresh chat produced a valid tool call - continuing there", "info")
+            except BridgeError as ex_r:
+                log(f"fresh-chat rescue failed: {str(ex_r)[:120]}", "warn")
+            except Exception as ex_r:
+                log(f"fresh-chat rescue failed: {type(ex_r).__name__}: {ex_r}", "warn")
+        self._tc_note(cid, retries, bool(problems and not calls), rescued)
+        if problems and not calls:
+            _note = f"(bridge: the model's tool call could not be parsed after {retries} retry(ies): " + "; ".join(problems)[:300] + " - send 'continue' and it will try again)"
+            clean = (clean.rstrip() + "\n\n" + _note) if clean else _note      # 7.77: Claude Code ends its turn on a reply without a tool call; at least say why
         RELIABILITY.record(host, attempted=bool(first_n or first_problems), first_ok=bool(first_n) and not first_problems, final_ok=bool(calls) and not problems,
                            cut_off=any("cut off" in p_ for p_ in first_problems), retries=retries,
                            schema_rejects=sum(1 for p_ in first_problems if " is missing required" in p_ or " must be " in p_ or "unexpected argument" in p_ or "is too " in p_),
@@ -32405,6 +32559,53 @@ setTimeout(() => process.exit(0), 60000);
             self.assertEqual([c["name"] for c in out.calls], ["Edit"])                         # released: the real tool is the judge
             out2, prompts2 = self.run_site([same], hist, {"fix_retries": 0})
             self.assertEqual((len(prompts2), len(out2.calls)), (1, 1))                         # no retry budget: nothing to wait for, nothing lost
+
+        def test_778_a_chat_that_keeps_breaking_the_format_is_rescued_in_a_fresh_chat(self) -> None:
+            tmp, _store, _cfg, app = mk_env({"cache_seconds": 0, "continuity": True})
+            self.addCleanup(shutil.rmtree, tmp, True)
+            add_acct(app, "s1", "Site", "site.test")
+            hist = [{"role": "user", "content": [{"type": "text", "text": "read it"}]}]
+            cut = '```tool_call\n{"name": "Read", "arguments": {"file_path": "/p/f'                  # a call that really is cut off
+            good = self.fence("Read", {"file_path": "/p/f.py"})
+
+            class BE:
+                tier, fenced_tools = "ui", True
+
+                def __init__(self) -> None:
+                    self.prompts: List[str] = []
+                    self.convs = 0
+
+                def new_conv(self, model: Optional[str] = None) -> Dict[str, Any]:
+                    self.convs += 1
+                    return {"n": self.convs}
+
+                def ask(self, conv: Any, prompt: str, cancel: Any = None, model: str = "") -> Iterator[str]:
+                    self.prompts.append(prompt)
+                    yield cut if len(self.prompts) <= 3 else good           # first answer + 2 repairs fail, the fresh chat answers correctly
+            be = BE()
+            app.acc.backend = lambda acct: be                                  # type: ignore[assignment]
+            rq = self.req(hist)
+            rq.model = "bridge-auto"
+            out = app.router.handle(rq, lambda t: None, "", threading.Event(), scope="k")
+            self.assertEqual([c["name"] for c in out.calls], ["Read"])         # Claude Code gets a real call, not a silent stop
+            self.assertEqual(be.convs, 2)                                      # the original chat + exactly one fresh chat
+            self.assertEqual(len(be.prompts), 4)
+            self.assertIn("Available tools", be.prompts[3])                    # the fresh chat got the full instructions
+
+        def test_778_a_drifting_chat_is_replaced_before_it_gives_up(self) -> None:
+            tmp, _store, _cfg, app = mk_env({"cache_seconds": 0, "continuity": True})
+            self.addCleanup(shutil.rmtree, tmp, True)
+            r = app.router
+            for _ in range(3):
+                self.assertFalse(r._tc_unhealthy("c1"))
+                r._tc_note("c1", 1, False, False)
+            self.assertFalse(r._tc_unhealthy("c1"))                           # fewer than 4 turns since the start: no churn
+            r._tc_note("c1", 0, False, False)
+            self.assertTrue(r._tc_unhealthy("c1"))                            # 3 of the last 4 turns needed a repair
+            r._tc_note("c2", 0, False, False)
+            self.assertFalse(r._tc_unhealthy("c2"))
+            r._tc_note("c2", 2, True, False)
+            self.assertTrue(r._tc_unhealthy("c2"))                            # a give-up replaces the chat immediately
 
         def test_a_schema_error_is_sent_back_and_an_unfixable_one_is_still_never_executed(self) -> None:
             hist = [{"role": "user", "content": [{"type": "text", "text": "read it"}]}]
