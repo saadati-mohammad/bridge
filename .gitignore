@@ -1,0 +1,29 @@
+# Secrets / local state
+.deepseek_bridge.json
+.deepseek_bridge.json.lock
+.deepseek_bridge*.json
+ds_profile/
+
+# Logs & audit artifacts
+_run*.log
+_audit_shots/
+
+# Probe/scratch scripts (not part of the app)
+_probe_*.py
+_audit_*.py
+_activate_account.py
+_do_login.py
+_full_sweep.py
+
+# Python
+__pycache__/
+*.pyc
+
+# Private, generated runtime state. It can contain sessions, browser pairing material,
+# captures, logs, and generated extension files; recreate it locally from bridge.py.
+bridge_data/
+
+# Docs & repo files (only bridge.py and .gitignore are tracked)
+AI_Web_Bridge_Master_Prompt_v4.md
+HANDOFF_REPORT.md
+README.md
