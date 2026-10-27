@@ -13,8 +13,3 @@ ds_profile/
 
 # Logs
 *.log
-
-# Old docs kept locally only (only bridge.py and .gitignore are tracked)
-AI_Web_Bridge_Master_Prompt_v4.md
-HANDOFF_REPORT.md
-README.md
