@@ -2374,7 +2374,7 @@ def build_evidence(probes: List[Dict[str, Any]], storage: Dict[str, Any], secret
 # The user's own Chrome is the browser. A Manifest-V3 extension (embedded below, extracted at run time) executes commands that the bridge sends over an
 # authenticated loopback channel; a small Playwright-shaped compatibility layer (PCContext / PCPage / PCLocator / PCCdpSession) keeps every existing call site working.
 # ============================================================================
-PC_VERSION = "1.5.0"
+PC_VERSION = "1.6.0"
 PC_DASH_PORT = [0]                      # 7.81: the dashboard port baked into the extension (auto-pair is accepted ONLY from this exact origin)
 
 PC_BACKGROUND_JS = r"""'use strict';
@@ -2384,6 +2384,7 @@ const BLOCKED_METHODS = new Set(['Network.getAllCookies', 'Network.clearBrowserC
 const SID = Date.now().toString(36) + Math.random().toString(36).slice(2);   // changes whenever the worker restarts: the bridge then re-validates its tabs
 const POLL_MS = 20000, FLUSH_MS = 120, MAX_BATCH = 400, RESULT_CACHE = 300;
 let cfg = null;                          // {port, token, clientId}
+let authFails = 0;                       // consecutive 'wrong token' answers: a single refusal must never make the extension ask for a code again
 let identity = null;                     // stable per Chrome profile, isolated by chrome.storage.local
 let cmdCache = new Map();                // command id -> result (duplicate-command protection: a re-delivered command is never executed twice)
 let attached = new Map();                // tabId -> {owned, sinceMs}
@@ -2424,7 +2425,15 @@ async function api(path, body, signal) {
   const c = await loadCfg(); if (!c) throw new Error('not paired');
   const payload = Object.assign({}, body || {}, {client_id: c.clientId});
   const r = await fetch('http://127.0.0.1:' + c.port + path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Bridge-PC-Token': c.token}, body: JSON.stringify(payload), signal});
-  if (r.status === 401 || r.status === 403) { cfg = null; await chrome.storage.local.remove('token'); throw new Error('rejected by the bridge (pair again)'); }
+  if (r.status === 401) {
+    let why = ''; try { why = String((await r.json()).reason || ''); } catch (e) {}
+    authFails++;
+    // Only a profile that was really removed in the dashboard, or a token that stays wrong several times in a row, makes the extension forget its pairing.
+    // 'not_paired' / 'origin' (bridge restarting, pairing file being rewritten) and any 403 are transient: keep the token and retry.
+    if (why === 'profile_removed' || (why === 'wrong_token' && authFails >= 4)) { authFails = 0; cfg = null; await chrome.storage.local.remove('token'); throw new Error('rejected by the bridge (pair again)'); }
+    throw new Error('bridge not ready (' + (why || 'unauthorized') + ')');
+  }
+  authFails = 0;
   if (!r.ok) throw new Error('bridge http ' + r.status);
   return r.json();
 }
@@ -2551,7 +2560,8 @@ async function tryAutoPair() {                       // the owner pressed "open 
   const r = await fetch('http://127.0.0.1:' + HUB_PORT + '/pc/pair', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({auto: true, client_id: ident.clientId, client_name: ident.profileName})});
   if (!r.ok) return;
   const j = await r.json(); if (!j.token) return;
-  await chrome.storage.local.set({port: HUB_PORT, token: j.token}); cfg = null; pollLoop();
+  const nm = j.name ? String(j.name).slice(0, 80) : ''; if (nm) identity = Object.assign(ident, {profileName: nm});
+  await chrome.storage.local.set(Object.assign({port: HUB_PORT, token: j.token}, nm ? {profileName: nm} : {})); cfg = null; pollLoop();
 }
 (function autoPairTick() { tryAutoPair().catch(() => {}).then(() => setTimeout(autoPairTick, 3000)); })();
 
@@ -2582,7 +2592,12 @@ chrome.runtime.onMessage.addListener((msg, sender, send) => {
         const r = await api('/pc/register-tab', {tab: active.id, url: active.url, title: active.title || ''});
         const c = await consented(); c.add(active.id); await setConsent(c);
         await chrome.storage.local.set({loginAccountId: r.account_id, loginTabId: active.id}); watchLogin(r.account_id, active.id, r.host);
-        send({ok: true, accountId: r.account_id, label: r.label});
+        let confirmed = false;                                       // 1.6: the owner is already on the AI site: confirm at once unless this page is a sign-in step (then the login watcher confirms after sign-in)
+        try {
+          const u = new URL(active.url);
+          if (!LOGINISH.test(u.pathname) && !LOGINISH.test(u.hostname.split('.')[0])) { await confirmFor(r.account_id, active.id); confirmed = true; if (loginWatch && loginWatch.timer) clearTimeout(loginWatch.timer); loginWatch = null; }
+        } catch (e) { lastError = String(e.message || e); }
+        send({ok: true, accountId: r.account_id, label: r.label, confirmed});
       } catch (e) { send({ok: false, error: String(e.message || e)}); }
     } else if (msg.type === 'claim_login') {
       try {
@@ -2629,15 +2644,14 @@ PC_POPUP_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><
 <div class="metrics"><div><b id="tab-count">0</b><span data-i="tabs_shared">tabs shared</span></div><div><b id="port-value">—</b><span data-i="local_port">local port</span></div></div></section>
 <section id="pairbox" class="panel" hidden><h2 data-i="pair_title">Connect to your bridge</h2><p class="muted" data-i="pair_hint">Enter the one-time code shown in the Bridge dashboard.</p>
 <label class="field"><span data-i="profile_label">Chrome profile name</span><input id="profile-name" maxlength="80" placeholder="Work, personal…"></label><label class="field"><span data-i="port_label">Port</span><input id="port" inputmode="numeric" value="18765" maxlength="5"></label><label class="field"><span data-i="code_label">One-time code</span><input id="code" autocomplete="one-time-code" maxlength="8" placeholder="8 characters"></label><button id="pair" class="primary" data-i="connect">Connect securely</button><p id="pair-error" class="error" hidden></p></section>
-<section id="tabbox" class="panel" hidden><div class="section-heading"><h2 data-i="this_tab">This tab</h2><span id="tab-badge" class="tag"></span></div><p id="tab-title" class="tab-title"></p><p id="tab-host" class="muted ltr"></p><p id="tab-note" class="muted note"></p>
+<section id="loginbox" class="panel" hidden><button id="register-tab" class="primary">Add this site to the dashboard</button><p id="register-hint" class="muted note"></p><p id="login-note" class="muted note"></p><details class="more"><summary data-i="more_opts">Profile name and login requests</summary><div class="section-heading"><h2 data-i="login_requests">Accounts waiting for login</h2><span id="profile-tag" class="tag"></span></div><label class="field"><span data-i="profile_label">Chrome profile name</span><input id="profile-name-active" maxlength="80"></label><button id="profile-save" class="secondary" data-i="save_profile">Save profile name</button><div id="login-list"></div><button id="login-confirm" class="primary" data-i="confirm_login" disabled>I'm signed in — confirm</button></details></section><section id="tabbox" class="panel" hidden><div class="section-heading"><h2 data-i="this_tab">This tab</h2><span id="tab-badge" class="tag"></span></div><p id="tab-title" class="tab-title"></p><p id="tab-host" class="muted ltr"></p><p id="tab-note" class="muted note"></p>
 <button id="allow" class="primary" data-i="allow">Allow this tab</button><button id="revoke" class="secondary" data-i="revoke">Stop sharing</button></section>
-<section id="loginbox" class="panel" hidden><div class="section-heading"><h2 data-i="login_requests">Accounts waiting for login</h2><span id="profile-tag" class="tag"></span></div><label class="field"><span data-i="profile_label">Chrome profile name</span><input id="profile-name-active" maxlength="80"></label><button id="profile-save" class="secondary" data-i="save_profile">Save profile name</button><button id="register-tab" class="primary">Add this site from current tab</button><p id="register-hint" class="muted note">Open the AI site in this Chrome profile. This tab is added to Bridge without opening another browser window.</p><div id="login-list"></div><button id="login-confirm" class="primary" data-i="confirm_login" disabled>I'm signed in — confirm</button><p id="login-note" class="muted note"></p></section>
 <details class="privacy"><summary data-i="privacy_title">A small privacy promise</summary><p data-i="privacy_body">Only tabs opened by Bridge or tabs you allow here can be inspected. The link stays on this computer. Chrome shows its own notice while a tab is being inspected.</p></details>
 <footer><span class="local-mark"><i></i><span data-i="local_only">Private · this computer only</span></span><button id="unpair" class="link-button" data-i="disconnect" hidden>Disconnect</button></footer><script src="popup.js"></script></body></html>"""
 
 PC_POPUP_JS = r"""const $ = id => document.getElementById(id);
 const send = m => new Promise((resolve, reject) => chrome.runtime.sendMessage(m, r => { if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message)); else resolve(r || {}); }));
-const words = {en:{tagline:'Your browser, with permission.',tabs_shared:'tabs shared',local_port:'local port',pair_title:'Connect to your bridge',pair_hint:'Enter the one-time code shown in the Bridge dashboard.',profile_label:'Chrome profile name',save_profile:'Save profile name',login_requests:'Accounts waiting for login',login_open:'Open login page',confirm_login:"I'm signed in — confirm",login_none:'No account is waiting for this profile.',login_done:'Login confirmed. Bridge is saving this account.',login_claimed:'Assigned to this Chrome profile',port_label:'Port',code_label:'One-time code',connect:'Connect securely',this_tab:'This tab',allow:'Allow this tab',revoke:'Stop sharing',privacy_title:'A small privacy promise',privacy_body:'Only tabs opened by Bridge or tabs you allow here can be inspected. The link stays on this computer. Chrome shows its own notice while a tab is being inspected.',local_only:'Private · this computer only',disconnect:'Disconnect',checking:'Checking connection…',not_paired:'Not connected yet',connect_hint:'Use the one-time code from the Bridge dashboard.',connected:'Connected',waiting:'Bridge is reconnecting',waiting_hint:'Keep the Bridge app running on this computer.',tab_owned:'Bridge opened this tab',tab_allowed:'You allowed this tab',tab_not_shared:'Only you can see this tab',internal:'Chrome does not allow extensions to inspect this page.',tab_hint:'Bridge can use this tab only after you allow it.',allow_done:'This tab is shared with Bridge.',revoke_done:'Bridge no longer has access to this tab.',bad_pair:'Could not connect: ',pair_ok:'Connected securely.',pair_invalid:'Enter a valid port and 8-character code.',disconnect_confirm:'Disconnect this browser from Bridge?',disconnected:'Disconnected.',error:'Something went wrong. Try again.'},fa:{tagline:'مرورگر خودت، با اجازه‌ی خودت.',tabs_shared:'زبانه‌ی در دسترس',local_port:'درگاه محلی',pair_title:'اتصال به Bridge',pair_hint:'کد یک‌بارمصرف را از داشبورد Bridge وارد کن.',profile_label:'نام این پروفایل Chrome',save_profile:'ذخیره‌ی نام پروفایل',login_requests:'حساب‌های منتظر ورود',login_open:'باز کردن صفحه‌ی ورود',confirm_login:'وارد شدم — تأیید',login_none:'حسابی برای این پروفایل منتظر ورود نیست.',login_done:'ورود تأیید شد؛ Bridge در حال ذخیره‌ی حساب است.',login_claimed:'به این پروفایل Chrome اختصاص دارد',port_label:'درگاه',code_label:'کد یک‌بارمصرف',connect:'اتصال امن',this_tab:'این زبانه',allow:'اجازه‌ی دسترسی',revoke:'قطع دسترسی',privacy_title:'قول کوچک حریم خصوصی',privacy_body:'فقط زبانه‌هایی که Bridge باز کرده یا خودت اجازه داده‌ای قابل بررسی‌اند. ارتباط فقط روی همین کامپیوتر است. هنگام بررسی زبانه، Chrome اعلان خودش را نشان می‌دهد.',local_only:'خصوصی · فقط همین کامپیوتر',disconnect:'قطع اتصال',checking:'در حال بررسی اتصال…',not_paired:'هنوز متصل نشده',connect_hint:'کد یک‌بارمصرف را از داشبورد Bridge بردار.',connected:'متصل است',waiting:'Bridge در حال اتصال دوباره است',waiting_hint:'برنامه‌ی Bridge را روی همین کامپیوتر باز نگه دار.',tab_owned:'Bridge این زبانه را باز کرده',tab_allowed:'خودت اجازه داده‌ای',tab_not_shared:'فقط خودت به این زبانه دسترسی داری',internal:'افزونه‌ها اجازه‌ی بررسی این صفحه‌ی داخلی Chrome را ندارند.',tab_hint:'Bridge فقط پس از اجازه‌ی تو می‌تواند از این زبانه استفاده کند.',allow_done:'این زبانه با Bridge به‌اشتراک گذاشته شد.',revoke_done:'دسترسی Bridge به این زبانه قطع شد.',bad_pair:'اتصال برقرار نشد: ',pair_ok:'اتصال امن برقرار شد.',pair_invalid:'درگاه معتبر و کد ۸ حرفی را وارد کن.',disconnect_confirm:'اتصال این مرورگر با Bridge قطع شود؟',disconnected:'اتصال قطع شد.',error:'مشکلی پیش آمد. دوباره تلاش کن.'}};
+const words = {en:{more_opts:'Profile name and login requests',tagline:'Your browser, with permission.',tabs_shared:'tabs shared',local_port:'local port',pair_title:'Connect to your bridge',pair_hint:'Enter the one-time code shown in the Bridge dashboard.',profile_label:'Chrome profile name',save_profile:'Save profile name',login_requests:'Accounts waiting for login',login_open:'Open login page',confirm_login:"I'm signed in — confirm",login_none:'No account is waiting for this profile.',login_done:'Login confirmed. Bridge is saving this account.',login_claimed:'Assigned to this Chrome profile',port_label:'Port',code_label:'One-time code',connect:'Connect securely',this_tab:'This tab',allow:'Allow this tab',revoke:'Stop sharing',privacy_title:'A small privacy promise',privacy_body:'Only tabs opened by Bridge or tabs you allow here can be inspected. The link stays on this computer. Chrome shows its own notice while a tab is being inspected.',local_only:'Private · this computer only',disconnect:'Disconnect',checking:'Checking connection…',not_paired:'Not connected yet',connect_hint:'Use the one-time code from the Bridge dashboard.',connected:'Connected',waiting:'Bridge is reconnecting',waiting_hint:'Keep the Bridge app running on this computer.',tab_owned:'Bridge opened this tab',tab_allowed:'You allowed this tab',tab_not_shared:'Only you can see this tab',internal:'Chrome does not allow extensions to inspect this page.',tab_hint:'Bridge can use this tab only after you allow it.',allow_done:'This tab is shared with Bridge.',revoke_done:'Bridge no longer has access to this tab.',bad_pair:'Could not connect: ',pair_ok:'Connected securely.',pair_invalid:'Enter a valid port and 8-character code.',disconnect_confirm:'Disconnect this browser from Bridge?',disconnected:'Disconnected.',error:'Something went wrong. Try again.'},fa:{more_opts:'نام پروفایل و ورودهای در انتظار',tagline:'مرورگر خودت، با اجازه‌ی خودت.',tabs_shared:'زبانه‌ی در دسترس',local_port:'درگاه محلی',pair_title:'اتصال به Bridge',pair_hint:'کد یک‌بارمصرف را از داشبورد Bridge وارد کن.',profile_label:'نام این پروفایل Chrome',save_profile:'ذخیره‌ی نام پروفایل',login_requests:'حساب‌های منتظر ورود',login_open:'باز کردن صفحه‌ی ورود',confirm_login:'وارد شدم — تأیید',login_none:'حسابی برای این پروفایل منتظر ورود نیست.',login_done:'ورود تأیید شد؛ Bridge در حال ذخیره‌ی حساب است.',login_claimed:'به این پروفایل Chrome اختصاص دارد',port_label:'درگاه',code_label:'کد یک‌بارمصرف',connect:'اتصال امن',this_tab:'این زبانه',allow:'اجازه‌ی دسترسی',revoke:'قطع دسترسی',privacy_title:'قول کوچک حریم خصوصی',privacy_body:'فقط زبانه‌هایی که Bridge باز کرده یا خودت اجازه داده‌ای قابل بررسی‌اند. ارتباط فقط روی همین کامپیوتر است. هنگام بررسی زبانه، Chrome اعلان خودش را نشان می‌دهد.',local_only:'خصوصی · فقط همین کامپیوتر',disconnect:'قطع اتصال',checking:'در حال بررسی اتصال…',not_paired:'هنوز متصل نشده',connect_hint:'کد یک‌بارمصرف را از داشبورد Bridge بردار.',connected:'متصل است',waiting:'Bridge در حال اتصال دوباره است',waiting_hint:'برنامه‌ی Bridge را روی همین کامپیوتر باز نگه دار.',tab_owned:'Bridge این زبانه را باز کرده',tab_allowed:'خودت اجازه داده‌ای',tab_not_shared:'فقط خودت به این زبانه دسترسی داری',internal:'افزونه‌ها اجازه‌ی بررسی این صفحه‌ی داخلی Chrome را ندارند.',tab_hint:'Bridge فقط پس از اجازه‌ی تو می‌تواند از این زبانه استفاده کند.',allow_done:'این زبانه با Bridge به‌اشتراک گذاشته شد.',revoke_done:'دسترسی Bridge به این زبانه قطع شد.',bad_pair:'اتصال برقرار نشد: ',pair_ok:'اتصال امن برقرار شد.',pair_invalid:'درگاه معتبر و کد ۸ حرفی را وارد کن.',disconnect_confirm:'اتصال این مرورگر با Bridge قطع شود؟',disconnected:'اتصال قطع شد.',error:'مشکلی پیش آمد. دوباره تلاش کن.'}};
 const lang=(navigator.language||'en').toLowerCase().startsWith('fa')?'fa':'en', t=k=>(words[lang]||words.en)[k]||words.en[k]||k;
 document.documentElement.lang=lang;document.documentElement.dir=lang==='fa'?'rtl':'ltr';document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));
 let currentTab=null, busy=false;const isInternal=url=>/^(chrome|edge|about|devtools|chrome-extension):/.test(url||'')||/chromewebstore\.google\.com/.test(url||'');
@@ -2652,7 +2666,7 @@ async function refresh(){if(busy)return;try{const [s]=await Promise.all([send({t
   $('tab-note').textContent=internal?t('internal'):(owned||allowed?'':t('tab_hint'));
   $('allow').hidden=internal||owned||allowed;$('revoke').hidden=internal||(!allowed&&!attached);$('allow').disabled=!id;$('revoke').disabled=!id;
    $('loginbox').hidden=!paired;$('profile-tag').textContent=s.profileName||('Chrome '+String(s.clientId||'').slice(0,8));
-   $('register-tab').textContent=lang==='fa'?'افزودن حساب از زبانه‌ی فعلی':'Add this site from current tab';$('register-hint').textContent=lang==='fa'?'سایت هوش مصنوعی را در همین پروفایل باز کن؛ بدون بازکردن پنجره‌ی دیگر به Bridge اضافه می‌شود.':'Open the AI site in this Chrome profile. This tab is added to Bridge without opening another browser window.';
+   $('register-tab').textContent=lang==='fa'?'افزودن این سایت به داشبورد':'Add this site to the dashboard';$('register-hint').textContent=lang==='fa'?'سایت هوش مصنوعی را در همین پروفایل باز کن و فقط همین دکمه را بزن؛ حساب خودکار اضافه و تأیید می‌شود.':'Open the AI site in this Chrome profile and press this one button; the account is added and confirmed for you.';
    $('register-tab').disabled=!currentTab||internal||!/^https?:\/\//i.test(url);
   const pn=$('profile-name-active');if(document.activeElement!==pn)pn.value=s.profileName||'';
   $('login-confirm').disabled=!s.hasLogin||!currentTab||currentTab.id!==s.loginTabId;$('login-note').textContent=s.hasLogin?(currentTab&&currentTab.id===s.loginTabId?t('login_done'):(lang==='fa'?'برای تأیید، به همان زبانه‌ی حساب برگرد.':'Return to this account’s site tab to confirm.')):'';
@@ -2664,10 +2678,10 @@ $('code').addEventListener('input',()=>{$('code').value=$('code').value.toUpperC
 $('allow').onclick=async()=>{if(currentTab)await send({type:'allow_tab',tab:currentTab.id});await refresh()};$('revoke').onclick=async()=>{if(currentTab)await send({type:'revoke_tab',tab:currentTab.id});await refresh()};
 function renderLoginRequests(rows){const box=$('login-list');box.textContent='';if(!rows.length){const p=document.createElement('p');p.className='muted';p.textContent=t('login_none');box.appendChild(p);return}for(const row of rows){const card=document.createElement('div');card.className='request-row';const text=document.createElement('div'),name=document.createElement('strong'),host=document.createElement('p'),btn=document.createElement('button');name.textContent=row.label||row.host;host.className='muted ltr';host.textContent=row.host||'';btn.className='secondary';btn.textContent=row.claimed?t('login_claimed'):t('login_open');btn.disabled=!!row.claimed;if(!row.claimed)btn.onclick=async()=>{btn.disabled=true;try{const r=await send({type:'claim_login',accountId:row.id});if(!r.ok)throw new Error(r.error||t('error'));window.close()}catch(e){$('login-note').textContent=e.message;btn.disabled=false;await refresh()}};text.append(name,host);card.append(text,btn);box.appendChild(card)}}
 $('profile-save').onclick=async()=>{const r=await send({type:'profile_name',name:$('profile-name-active').value});if(r.ok){$('profile-tag').textContent=r.profileName||'Chrome';$('login-note').textContent=t('save_profile')}};
- $('register-tab').onclick=async()=>{const b=$('register-tab');if(!currentTab)return;b.disabled=true;try{const r=await send({type:'register_active_tab',tabId:currentTab.id});if(!r.ok)throw new Error(r.error||t('error'));$('login-note').textContent=lang==='fa'?`حساب ${r.label||''} اضافه شد. اگر وارد نشده‌ای، در همین زبانه وارد شو؛ بعد تأیید ورود را بزن.`:`${r.label||'Account'} added. Sign in on this tab if needed, then confirm.`;await refresh()}catch(e){$('login-note').textContent=e.message;await refresh()}};
+$('register-tab').onclick=async()=>{const b=$('register-tab');if(!currentTab)return;b.disabled=true;try{const r=await send({type:'register_active_tab',tabId:currentTab.id});if(!r.ok)throw new Error(r.error||t('error'));$('login-note').textContent=r.confirmed?(lang==='fa'?`✓ ${r.label||''} به داشبورد اضافه شد.`:`✓ ${r.label||'Account'} added to the dashboard.`):(lang==='fa'?`${r.label||''} اضافه شد. در همین زبانه وارد شو؛ خودکار تأیید می‌شود.`:`${r.label||'Account'} added. Sign in on this tab; it confirms by itself.`);if(r.confirmed){b.textContent='✓';setTimeout(()=>window.close(),1200);return}await refresh()}catch(e){$('login-note').textContent=e.message;await refresh()}};
 $('login-confirm').onclick=async()=>{const b=$('login-confirm');b.disabled=true;try{const r=await send({type:'confirm_login'});if(!r.ok)throw new Error(r.error||t('error'));$('login-note').textContent=t('login_done');await refresh()}catch(e){$('login-note').textContent=e.message;await refresh()}};
 $('unpair').onclick=async()=>{if(!confirm(t('disconnect_confirm')))return;await send({type:'unpair'});$('state-detail').textContent=t('disconnected');await refresh()};
-refresh();setInterval(refresh,2500);"""
+refresh();setInterval(refresh,2500);setTimeout(()=>{try{$('register-tab').focus()}catch(e){}},150);"""
 
 PC_OPTIONS_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="ext.css"><title>AI Web Bridge</title></head><body class="options">
 <main><header class="brand large"><img src="icons/icon48.png" alt=""><div><h1>AI Web Bridge</h1><p data-i="settings_subtitle">A private connection between your browser and your bridge.</p></div></header>
@@ -2683,7 +2697,7 @@ const T={en:{settings_subtitle:'A private connection between your browser and yo
 async function refresh(){try{const s=await send({type:'status'}),ok=!!s.paired&&!!s.lastOk&&Date.now()-s.lastOk<45000;$('dot').className='dot '+(ok?'good':s.paired?'warm':'');$('status-title').textContent=s.paired?(ok?tr('connected'):tr('waiting')):tr('unpaired');$('status-detail').textContent=s.paired?(ok?'':tr('wait_note')):tr('unpaired_note');$('port').textContent=s.paired?s.port:'—';$('attached').textContent=(s.attached||[]).length;$('disconnect').hidden=!s.paired;$('connection-note').textContent=s.lastError||'';$('version').textContent=chrome.runtime.getManifest().version}catch(e){$('status-title').textContent=tr('unpaired')}}
 $('disconnect').onclick=async()=>{if(!confirm(tr('confirm')))return;await send({type:'unpair'});refresh()};refresh();setInterval(refresh,3000);"""
 
-PC_CSS = """*{box-sizing:border-box}body{--bg:#fbf9ff;--panel:#fff;--ink:#28253a;--muted:#77738a;--line:#eee9f5;--purple:#7867e8;--pink:#ed86b7;--green:#3aab7a;--amber:#e5a446;margin:0;background:var(--bg);color:var(--ink);font:13px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif}body.popup{width:360px;padding:15px}.brand{display:flex;align-items:center;gap:11px;position:relative;margin:0 0 13px}.brand img{width:42px;height:42px;border-radius:13px;box-shadow:0 4px 12px #8e74d62a}.brand h1{font-size:16px;line-height:1.1;margin:0;font-weight:750;letter-spacing:-.3px}.brand p{margin:4px 0 0;color:var(--muted);font-size:11px}.sparkle{margin-inline-start:auto;color:var(--pink);font-size:22px;transform:rotate(12deg)}.status-card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:13px;margin:10px 0;box-shadow:0 4px 14px #43387808}.status-line{display:flex;gap:10px;align-items:center}.status-line strong{font-size:13px}.status-line p{margin:2px 0 0}.dot{width:10px;height:10px;border-radius:50%;background:#c8c3d1;box-shadow:0 0 0 4px #f0edf4;flex:0 0 auto}.dot.good{background:var(--green);box-shadow:0 0 0 4px #e6f7ef}.dot.warm{background:var(--amber);box-shadow:0 0 0 4px #fff5e4}.muted{color:var(--muted);font-size:11px}.metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;border-top:1px solid var(--line);margin-top:12px;padding-top:10px}.metrics div{display:flex;align-items:baseline;gap:5px}.metrics b{font-size:16px;color:var(--purple);font-variant-numeric:tabular-nums}.metrics span{font-size:10px;color:var(--muted)}h2{font-size:12px;margin:0 0 7px;font-weight:700}.panel>p{margin:4px 0}.field{display:block;margin:10px 0 0}.field span{display:block;color:var(--muted);font-size:10px;margin-bottom:4px}.field input{width:100%;height:36px;border:1px solid var(--line);border-radius:10px;background:#fdfcff;color:var(--ink);padding:0 10px;font:inherit;outline:none}.field input:focus{border-color:var(--purple);box-shadow:0 0 0 3px #7867e81c}.ltr{direction:ltr;text-align:left;unicode-bidi:plaintext}.primary,.secondary,.link-button{font:inherit;border-radius:10px;cursor:pointer;transition:transform .12s,box-shadow .12s,background .12s}.primary{width:100%;border:0;background:linear-gradient(135deg,#796ae9,#9c7eea);color:#fff;font-weight:650;padding:9px 12px;margin-top:10px;box-shadow:0 5px 12px #806be62e}.primary:hover{box-shadow:0 7px 16px #806be645;transform:translateY(-1px)}.primary:disabled{opacity:.6;cursor:wait}.secondary{border:1px solid var(--line);background:#fff;color:var(--muted);padding:7px 10px}.secondary:hover{border-color:#f0bad3;color:#bd5788}.error{padding:8px 9px!important;border-radius:9px;background:#fff0f4;color:#a33b61!important}.section-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}.section-heading h2{margin:0}.tag{font-size:9px;color:var(--muted);background:#f4f1f8;padding:3px 7px;border-radius:99px;max-width:175px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tag.tag-on{color:#348763;background:#eaf8f0}.tab-title{font-size:12px;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:9px!important}.note{margin-top:8px!important}.privacy{padding:3px 2px;color:var(--muted);font-size:10px}.privacy summary{cursor:pointer;list-style:none}.privacy summary::-webkit-details-marker{display:none}.privacy summary:before{content:'✦';color:var(--pink);margin-inline-end:6px}.privacy p{padding:0 7px;margin:7px 0 3px}.popup footer{display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--line);padding-top:10px;margin-top:8px}.local-mark{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:10px}.local-mark i{width:7px;height:7px;border-radius:50%;background:var(--green)}.link-button{border:0;background:none;color:var(--muted);font-size:10px;padding:4px}.link-button:hover{color:#bd5788}.options{min-height:100vh;padding:32px 18px}.options main{max-width:560px;margin:auto}.brand.large{margin-bottom:20px}.brand.large img{width:54px;height:54px;border-radius:17px}.brand.large h1{font-size:20px}.options .status-card,.options .panel{padding:18px;margin:13px 0;border-radius:18px}.options .metrics{margin-top:16px;padding-top:13px}.promise{display:flex;gap:9px;align-items:flex-start;background:#fff7fb;border:1px solid #f7eaf1;border-radius:12px;padding:10px;margin-top:12px}.promise span{color:var(--pink)}.promise p{margin:0;font-size:11px}.options-footer{display:flex;align-items:center;gap:7px;padding:12px 4px;color:var(--muted);font-size:10px}.options-footer img{width:16px;height:16px}.spacer{flex:1}[hidden]{display:none!important}@media(prefers-color-scheme:dark){body{--bg:#171522;--panel:#211e2e;--ink:#f2effb;--muted:#aaa4bb;--line:#383347;--purple:#a99aff;--pink:#f09bc5;--green:#69d2a2;--amber:#f4c26d}.field input{background:#191724;color:var(--ink)}.secondary{background:#272334;color:var(--muted)}.tag{background:#302b3c}.tag.tag-on{background:#20372e;color:#8fe0b8}.error{background:#3a202d;color:#ffb3ca!important}.promise{background:#2b2230;border-color:#403044}}"""
+PC_CSS = """*{box-sizing:border-box}body{--bg:#fbf9ff;--panel:#fff;--ink:#28253a;--muted:#77738a;--line:#eee9f5;--purple:#7867e8;--pink:#ed86b7;--green:#3aab7a;--amber:#e5a446;margin:0;background:var(--bg);color:var(--ink);font:13px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif}body.popup{width:360px;padding:15px}.brand{display:flex;align-items:center;gap:11px;position:relative;margin:0 0 13px}.brand img{width:42px;height:42px;border-radius:13px;box-shadow:0 4px 12px #8e74d62a}.brand h1{font-size:16px;line-height:1.1;margin:0;font-weight:750;letter-spacing:-.3px}.brand p{margin:4px 0 0;color:var(--muted);font-size:11px}.sparkle{margin-inline-start:auto;color:var(--pink);font-size:22px;transform:rotate(12deg)}.status-card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:13px;margin:10px 0;box-shadow:0 4px 14px #43387808}.status-line{display:flex;gap:10px;align-items:center}.status-line strong{font-size:13px}.status-line p{margin:2px 0 0}.dot{width:10px;height:10px;border-radius:50%;background:#c8c3d1;box-shadow:0 0 0 4px #f0edf4;flex:0 0 auto}.dot.good{background:var(--green);box-shadow:0 0 0 4px #e6f7ef}.dot.warm{background:var(--amber);box-shadow:0 0 0 4px #fff5e4}.muted{color:var(--muted);font-size:11px}.metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;border-top:1px solid var(--line);margin-top:12px;padding-top:10px}.metrics div{display:flex;align-items:baseline;gap:5px}.metrics b{font-size:16px;color:var(--purple);font-variant-numeric:tabular-nums}.metrics span{font-size:10px;color:var(--muted)}h2{font-size:12px;margin:0 0 7px;font-weight:700}.panel>p{margin:4px 0}.field{display:block;margin:10px 0 0}.field span{display:block;color:var(--muted);font-size:10px;margin-bottom:4px}.field input{width:100%;height:36px;border:1px solid var(--line);border-radius:10px;background:#fdfcff;color:var(--ink);padding:0 10px;font:inherit;outline:none}.field input:focus{border-color:var(--purple);box-shadow:0 0 0 3px #7867e81c}.ltr{direction:ltr;text-align:left;unicode-bidi:plaintext}.primary,.secondary,.link-button{font:inherit;border-radius:10px;cursor:pointer;transition:transform .12s,box-shadow .12s,background .12s}.primary{width:100%;border:0;background:linear-gradient(135deg,#796ae9,#9c7eea);color:#fff;font-weight:650;padding:9px 12px;margin-top:10px;box-shadow:0 5px 12px #806be62e}.primary:hover{box-shadow:0 7px 16px #806be645;transform:translateY(-1px)}.primary:disabled{opacity:.6;cursor:wait}.secondary{border:1px solid var(--line);background:#fff;color:var(--muted);padding:7px 10px}.secondary:hover{border-color:#f0bad3;color:#bd5788}.error{padding:8px 9px!important;border-radius:9px;background:#fff0f4;color:#a33b61!important}.section-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}.section-heading h2{margin:0}.tag{font-size:9px;color:var(--muted);background:#f4f1f8;padding:3px 7px;border-radius:99px;max-width:175px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tag.tag-on{color:#348763;background:#eaf8f0}.tab-title{font-size:12px;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:9px!important}.note{margin-top:8px!important}.privacy{padding:3px 2px;color:var(--muted);font-size:10px}.privacy summary{cursor:pointer;list-style:none}.privacy summary::-webkit-details-marker{display:none}.more summary{cursor:pointer;color:var(--muted);font-size:11px;margin-top:10px}.more[open] summary{margin-bottom:8px}.privacy summary:before{content:'✦';color:var(--pink);margin-inline-end:6px}.privacy p{padding:0 7px;margin:7px 0 3px}.popup footer{display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--line);padding-top:10px;margin-top:8px}.local-mark{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:10px}.local-mark i{width:7px;height:7px;border-radius:50%;background:var(--green)}.link-button{border:0;background:none;color:var(--muted);font-size:10px;padding:4px}.link-button:hover{color:#bd5788}.options{min-height:100vh;padding:32px 18px}.options main{max-width:560px;margin:auto}.brand.large{margin-bottom:20px}.brand.large img{width:54px;height:54px;border-radius:17px}.brand.large h1{font-size:20px}.options .status-card,.options .panel{padding:18px;margin:13px 0;border-radius:18px}.options .metrics{margin-top:16px;padding-top:13px}.promise{display:flex;gap:9px;align-items:flex-start;background:#fff7fb;border:1px solid #f7eaf1;border-radius:12px;padding:10px;margin-top:12px}.promise span{color:var(--pink)}.promise p{margin:0;font-size:11px}.options-footer{display:flex;align-items:center;gap:7px;padding:12px 4px;color:var(--muted);font-size:10px}.options-footer img{width:16px;height:16px}.spacer{flex:1}[hidden]{display:none!important}@media(prefers-color-scheme:dark){body{--bg:#171522;--panel:#211e2e;--ink:#f2effb;--muted:#aaa4bb;--line:#383347;--purple:#a99aff;--pink:#f09bc5;--green:#69d2a2;--amber:#f4c26d}.field input{background:#191724;color:var(--ink)}.secondary{background:#272334;color:var(--muted)}.tag{background:#302b3c}.tag.tag-on{background:#20372e;color:#8fe0b8}.error{background:#3a202d;color:#ffb3ca!important}.promise{background:#2b2230;border-color:#403044}}"""
 
 
 def pc_manifest() -> Dict[str, Any]:
@@ -2880,6 +2894,7 @@ class PCHub:
         self.login_claim_handler: Optional[Callable[[str, Dict[str, Any]], Tuple[int, Dict[str, Any]]]] = None
         self.login_confirm_handler: Optional[Callable[[str, Dict[str, Any]], Tuple[int, Dict[str, Any]]]] = None
         self.register_tab_handler: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None
+        self._names_at = 0.0
         self.state = self._load()
         self.stats = {"events": 0, "commands": 0, "rejected": 0, "dupe_results": 0}
 
@@ -2959,19 +2974,63 @@ class PCHub:
             return "legacy"
         return next(iter(clients), "legacy")
 
+    def _ext_id(self) -> str:
+        o = str(self.state.get("origin") or "")
+        return o[len("chrome-extension://"):].strip("/") if o.startswith("chrome-extension://") else ""
+
+    def _sync_names(self, force: bool = False) -> None:
+        """A paired profile carries the name Chrome itself shows for it (Local State), unless the owner renamed it. Also finds the Chrome folder of a profile
+        from the extension's presence in that folder's preferences when the pairing did not know it."""
+        if not force and time.time() - self._names_at < 10:
+            return
+        self._names_at = time.time()
+        try:
+            info = {p["dir"]: p["name"] for p in pc_chrome_profiles()}
+        except Exception:
+            return
+        clients = self.state.get("clients") or {}
+        if not info or not clients:
+            return
+        changed = False
+        taken = {str(r.get("chrome_dir")) for r in clients.values() if r.get("chrome_dir")}
+        for cid, rec in clients.items():
+            d = str(rec.get("chrome_dir") or "")
+            if not d:
+                d = pc_profile_for_extension(self._ext_id(), taken) or (next(iter(info)) if len(info) == 1 else "")
+                if d:
+                    rec["chrome_dir"] = d
+                    taken.add(d)
+                    changed = True
+            if d in info and not rec.get("name_custom") and rec.get("name") != info[d]:
+                rec["name"] = info[d]
+                changed = True
+        if changed:
+            try:
+                self._save()
+            except Exception as e:
+                log(f"personal chrome: profile names could not be saved ({type(e).__name__})", "warn")
+
     def profiles(self) -> List[Dict[str, Any]]:
         with self.lock:
+            self._sync_names()
             return [{"id": cid, "name": str(rec.get("name") or "Chrome profile")[:80], "paired": True, "connected": self.connected(cid),
                      "last_seen": round(self._last_poll_by_client.get(cid, 0), 3) or None}
                     for cid, rec in (self.state.get("clients") or {}).items()]
 
     def rename_profile(self, client_id: str, name: str) -> Dict[str, Any]:
-        clean = re.sub(r"[\x00-\x1f\x7f]", "", str(name or "")).strip()[:80] or "Chrome profile"
+        clean = re.sub(r"[\x00-\x1f\x7f]", "", str(name or "")).strip()[:80]
         with self.lock:
             clients = dict(self.state.get("clients") or {})
             if client_id not in clients:
                 raise BridgeError("Chrome profile is not paired", "client", 404)
-            clients[client_id] = {**clients[client_id], "name": clean}
+            rec = dict(clients[client_id])
+            if clean:
+                rec["name_custom"] = True                                     # the owner chose this name: it no longer follows Chrome's own profile name
+            else:
+                rec["name_custom"] = False                                    # empty = back to the real Chrome profile name
+                real = next((p_["name"] for p_ in pc_chrome_profiles() if p_["dir"] == rec.get("chrome_dir")), "")
+                clean = real or str(rec.get("name") or "Chrome profile")
+            clients[client_id] = {**rec, "name": clean}
             self.state["clients"] = clients
             self._save()
         return {"ok": True, "client_id": client_id, "name": clean}
@@ -3016,7 +3075,7 @@ class PCHub:
             log(f"personal Chrome tab registration failed: {type(e).__name__}", "warn")
             return 500, {"error": "this tab could not be registered"}
 
-    def unpair(self, client_id: str) -> bool:
+    def unpair(self, client_id: str, source: str = "the extension (its Disconnect button or a reset)") -> bool:
         with self.cv:
             clients = dict(self.state.get("clients") or {})
             if client_id not in clients:
@@ -3032,10 +3091,22 @@ class PCHub:
                     c.ev.set()
             self.cv.notify_all()
         # 7.76: this is the ONLY code path that makes a paired bridge answer 'not paired yet' without a restart, so it must never be silent
-        log(f"personal Chrome: profile {client_id[:12]} was unpaired by the extension (its Disconnect button or a reset); "
+        log(f"personal Chrome: profile {client_id[:12]} was unpaired by {source}; "
             + ("no profile is paired any more - pair again" if not clients else f"{len(clients)} other profile(s) stay paired"), "warn")
         self._fire({"k": "profile_unpaired", "client_id": client_id})
         return True
+
+    def remove_profile(self, client_id: str) -> bool:
+        """The owner deleted this profile in the dashboard: forget the pairing and every trace of it (queued commands, poll state)."""
+        existed = self.unpair(client_id, "the owner (deleted in the dashboard)")
+        with self.cv:
+            self._sid_by_client.pop(client_id, None)
+            self._last_poll_by_client.pop(client_id, None)
+            for k_ in [k for k, c in self.cmds.items() if c.client_id == client_id]:
+                self.cmds.pop(k_, None)
+            self.queue = deque(c for c in self.queue if c.client_id != client_id)
+            self.cv.notify_all()
+        return existed
 
     def status(self) -> Dict[str, Any]:
         with self.lock:
@@ -3115,7 +3186,7 @@ class PCHub:
                         why_ = hub._auth_why(origin, tok)
                         log_every("pc:auth:" + why_, 60, f"personal chrome channel: extension request rejected - {why_} (the extension must be paired again: python bridge.py --pc-pair)", "warn")
                         time.sleep(0.2)
-                        return self._reply(401, {"error": "unauthorized"})
+                        return self._reply(401, {"error": "unauthorized", "reason": hub._auth_reason(origin, body)})
                     client_id = hub.client_for_token(origin, tok)
                     if not client_id:
                         return self._reply(401, {"error": "unauthorized"})
@@ -3193,6 +3264,17 @@ class PCHub:
     def _auth(self, origin: str, token: str) -> bool:
         return bool(self.client_for_token(origin, token))
 
+    def _auth_reason(self, origin: str, body: Dict[str, Any]) -> str:
+        """Machine-readable refusal reason for the extension (it only forgets its pairing for 'profile_removed' or a repeated 'wrong_token')."""
+        if not self.paired():
+            return "not_paired"
+        if not origin or origin != self.state.get("origin"):
+            return "origin"
+        cid = re.sub(r"[^a-zA-Z0-9_-]", "", str((body or {}).get("client_id") or ""))[:64]
+        if cid and cid not in (self.state.get("clients") or {}):
+            return "profile_removed"
+        return "wrong_token"
+
     def _auth_why(self, origin: str, token: str) -> str:
         """The reason a request was refused, for the log (never the token itself)."""
         st = self.state
@@ -3235,17 +3317,36 @@ class PCHub:
             clients = dict(self.state.get("clients") or {})
             if client_id not in clients and len(clients) >= 100:
                 return 429, {"error": "profile limit reached (100)"}
+            old_rec = clients.get(client_id) or {}
+            taken_ = {str(r_.get("chrome_dir")) for c_, r_ in clients.items() if c_ != client_id and r_.get("chrome_dir")}
+            pend_ = PC_PENDING_DIR[0][0] if PC_PENDING_DIR[0][0] and time.time() - PC_PENDING_DIR[0][1] < 1800 else ""
+            cdir_ = pend_ or pc_profile_for_extension(origin[len("chrome-extension://"):].strip("/"), taken_) or str(old_rec.get("chrome_dir") or "")
+            if not cdir_:
+                dirs_ = [p_["dir"] for p_ in pc_chrome_profiles()]
+                cdir_ = dirs_[0] if len(dirs_) == 1 else ""
+            real_ = next((p_["name"] for p_ in pc_chrome_profiles() if p_["dir"] == cdir_), "") if cdir_ else ""
+            generic_ = bool(re.fullmatch(r"Chrome( profile)?|Chrome [0-9a-fA-F-]{8}|Chrome \d+", name))
+            custom_ = bool(old_rec.get("name_custom"))
+            if custom_:
+                name = str(old_rec.get("name") or name)                                  # a name the owner chose is never overwritten by a re-pair
+            elif real_ and (generic_ or name == real_):
+                name = real_                                                             # the dashboard shows the real Chrome profile name
+            elif real_:
+                custom_ = True                                                           # the owner typed a different name in the extension popup
+            elif client_id not in clients and generic_:
+                name = f"Chrome {len(clients) + 1}"
             token = secrets.token_urlsafe(32)
             clients[client_id] = {"token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(), "name": name,
                                   "paired_at": (clients.get(client_id) or {}).get("paired_at") or time.time(), "last_repaired_at": time.time(),
-                                  "chrome_dir": (PC_PENDING_DIR[0][0] if PC_PENDING_DIR[0][0] and time.time() - PC_PENDING_DIR[0][1] < 900 else (clients.get(client_id) or {}).get("chrome_dir", ""))}
+                                  "chrome_dir": cdir_, "name_custom": custom_}
             self.state = {"clients": clients, "origin": origin, "paired_at": self.state.get("paired_at") or time.time(), "version": PC_VERSION}
             self.pair_code = ""
-            self.auto_until = 0.0
+            if not auto_:
+                self.auto_until = 0.0                                                  # 1.6: an auto-pair window stays open until it expires, so several Chrome profiles can join one after another
             PC_PENDING_DIR[0] = ("", 0.0)
             self._save()
         log("personal Chrome extension paired", "ok")
-        return 200, {"token": token}
+        return 200, {"token": token, "name": name}
 
     def _poll(self, wait: float, sid: str = "", client_id: str = "legacy") -> List[Dict[str, Any]]:
         end = time.time() + wait
@@ -26869,6 +26970,31 @@ def pc_chrome_profiles() -> List[Dict[str, str]]:
     return sorted(rows, key=lambda r: (r["dir"] != "Default", r["dir"]))
 
 
+def pc_profile_for_extension(ext_id: str, exclude: Any = ()) -> str:
+    """The Chrome profile folder whose preferences list this extension id (so the pairing knows WHICH profile it belongs to). '' when unknown or ambiguous."""
+    if not ext_id:
+        return ""
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data"
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+    else:
+        base = Path.home() / ".config" / "google-chrome"
+    hits: List[str] = []
+    for p in pc_chrome_profiles():
+        if p["dir"] in set(exclude or ()):
+            continue
+        for fn in ("Secure Preferences", "Preferences"):
+            try:
+                data = json.loads((base / p["dir"] / fn).read_text("utf-8"))
+                if ext_id in ((data.get("extensions") or {}).get("settings") or {}):
+                    hits.append(p["dir"])
+                    break
+            except Exception:
+                continue
+    return hits[0] if len(hits) == 1 else ""
+
+
 def pc_find_chrome() -> str:
     cands: List[str] = []
     if os.name == "nt":
@@ -27671,12 +27797,63 @@ class Handler(BaseHTTPRequestHandler):
                                     "profile_order": [g_["key"] for g_ in groups_.values() if g_["key"]], "account_order": list(prio_ids_),
                                     "current_count": int(app.engine.acct_rr.get("count", 0) or 0), "advisor": app.advisor.view()["enabled"],
                                     "order": [{"id": a["id"], "label": a.get("label"), "state": a.get("state")} for a in list(acc.items)]})
+        if path.startswith("/api/personal-chrome/profiles/") and method in ("DELETE", "POST"):
+            rest_ = path[len("/api/personal-chrome/profiles/"):].strip("/").split("/")
+            pid_ = urllib.parse.unquote(rest_[0])[:64]
+            hub_ = app.pc_hub
+            if method == "POST" and rest_[1:] == ["name"]:                                  # rename a Chrome profile (double-click on its name); empty = Chrome's own name
+                raw_ = (self._body() or {}).get("name")
+                try:
+                    return self._json(200, hub_.rename_profile(pid_, raw_ if isinstance(raw_, str) else ""))
+                except BridgeError as e_:
+                    return self._json(e_.status, {"error": str(e_)})
+            if method == "DELETE" and len(rest_) == 1:                                      # delete the profile AND everything that belongs to it
+                self._body()
+                owned_ = [a_ for a_ in list(acc.items) if pid_ and pid_ in (str(a_.get("pc_client_id") or ""), str(a_.get("login_client_id") or ""))]
+                if pid_ not in {str(p_["id"]) for p_ in hub_.profiles()} and not owned_:
+                    return self._json(404, {"error": "unknown profile"})
+                removed_ = []
+                for a_ in owned_:
+                    aid_ = a_["id"]
+                    try:
+                        errs_ = app.engine.save_config(forget_account_routes(app.engine.config(), aid_))
+                        if errs_:
+                            log(f"profile delete: routing policies of account {aid_} could not be cleaned: {errs_}", "warn")
+                    except Exception as e_:
+                        log(f"profile delete: routing cleanup failed for {aid_} ({type(e_).__name__})", "warn")
+                    for key_ in cfg.data.get("keys", []):
+                        if key_.get("account") == aid_:
+                            key_["account"] = ""
+                    if cfg.data.get("default_account") == aid_:
+                        cfg.data["default_account"] = ""
+                    try:
+                        acc.remove(aid_)                                                    # browser, session, model catalog and the account's own browser folder
+                    except Exception as e_:
+                        log(f"profile delete: account {aid_} could not be fully removed ({type(e_).__name__})", "warn")
+                    removed_.append(aid_)
+                cfg.save()
+                cfg.set("profile_order", [x_ for x_ in _clean_order(cfg.get("profile_order")) if x_ != pid_])
+                cfg.set("disabled_profiles", [x_ for x_ in _clean_order(cfg.get("disabled_profiles")) if x_ != pid_])
+                cfg.set("account_order", [x_ for x_ in _clean_order(cfg.get("account_order")) if x_ not in removed_])
+                q_ = dict(cfg.get("account_quota") or {})
+                for x_ in removed_:
+                    q_.pop(x_, None)
+                cfg.set("account_quota", q_)
+                DISABLED_PROFILES.discard(pid_)
+                hub_.remove_profile(pid_)
+                if PC_PENDING_DIR[0][0]:
+                    PC_PENDING_DIR[0] = ("", 0.0)
+                log(f"profile {pid_[:12]} deleted with {len(removed_)} account(s)", "info")
+                return self._json(200, {"ok": True, "profile": pid_, "removed_accounts": removed_})
         if path == "/api/personal-chrome/profiles" and method == "GET":
             return self._json(200, {"profiles": pc_chrome_profiles()})
         if path == "/api/personal-chrome/extension-path" and method == "POST":           # 7.86: make sure the extension folder exists and tell where it is (nothing is launched)
             self._body()                                                                  # always drain the request body (keep-alive)
             hub_ = pc_hub(app.store.home)
             PC_DASH_PORT[0] = int(cfg["port"])
+            hub_.open_auto_pair(120.0)                                                    # 1.6: while the settings are open the dashboard re-arms this every 30 s: any extension that gets loaded joins by itself
+            if time.time() - PC_PENDING_DIR[0][1] > 120:
+                PC_PENDING_DIR[0] = ("", 0.0)
             return self._json(200, {"extension_dir": str(pc_extract(hub_.root)["path"])})
         if path == "/api/claude-shells" and method == "GET":
             return self._json(200, claude_shells_view())
@@ -29118,7 +29295,7 @@ svg.i{width:1.15em;height:1.15em;flex:none;stroke:currentColor;fill:none;stroke-
 svg.i.fl{fill:currentColor;stroke:none}
 [dir=rtl] svg.i.fx{transform:scaleX(-1)}
 .top{position:sticky;top:0;z-index:5;display:flex;align-items:center;flex-wrap:wrap;gap:.5rem .6rem;padding:.6rem max(1rem,env(safe-area-inset-right)) .6rem max(1rem,env(safe-area-inset-left));padding-top:max(.6rem,env(safe-area-inset-top));background:var(--bg);border-bottom:1px solid var(--ln)}
-@supports(background:color-mix(in srgb,red,blue)){.top{background:color-mix(in srgb,var(--bg) 90%,transparent);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}}
+@supports(background:color-mix(in srgb,red,blue)){.top{background:color-mix(in srgb,var(--bg) 96%,transparent)}}
 .brand{display:flex;align-items:center;gap:.6rem;font-weight:700;font-size:1.15rem;min-width:0}
 .brand .bn{white-space:nowrap}
 .logo{width:2.4rem;height:2.4rem;border-radius:.75rem;background:linear-gradient(135deg,var(--a1),var(--a2));display:grid;place-items:center;color:#fff;flex:none}
@@ -29383,6 +29560,19 @@ dialog.help[open]{display:flex;flex-direction:column;overflow:hidden}
 .ddp .sr input[type=text]{background:none;border:0;padding:.15rem 0;border-radius:0;width:auto;flex:1;outline:0;box-shadow:none}
 .ddp .sr input[type=text]:focus{outline:0}
 .ddp .sr:focus-within{border-color:var(--a1)}
+.xs{display:flex;gap:.7rem;align-items:flex-start}
+.xn{flex:none;width:1.7rem;height:1.7rem;border-radius:50%;background:linear-gradient(135deg,var(--a1),var(--a2));color:#fff;display:grid;place-items:center;font-weight:700;font-size:.85rem;margin-top:.05rem}
+.xb{flex:1;min-width:0;display:grid;gap:.45rem}.xb b{font-size:.95rem}.xb small{color:var(--mu);font-size:.82rem;line-height:1.75}
+.xlive{display:flex;align-items:center;gap:.6rem;padding:.65rem .85rem;border-radius:.95rem;background:var(--s2);border:1px dashed var(--ln);font-size:.9rem;line-height:1.6}
+.xlive .dot{background:var(--wa);animation:advp 1.2s ease-in-out infinite}
+.xlive.ok{border-style:solid;border-color:var(--ok);background:color-mix(in srgb,var(--ok) 10%,transparent)}
+.xlive.ok .dot{background:var(--ok);box-shadow:0 0 6px var(--ok);animation:none}
+.xopt>summary{cursor:pointer;color:var(--mu);font-size:.85rem}
+#chromeDir{white-space:normal;word-break:break-all;line-height:1.5;padding:.4rem 0;overflow-x:visible}
+/* smooth scrolling on weak PCs: nothing below changes how the page looks */
+html.scr *,html.scr *::before,html.scr *::after{transition:none!important}
+dialog.dr,.hbd{overscroll-behavior:contain}
+body:has(dialog[open]) :is(main,.top) *,body:has(dialog[open]) :is(main,.top) *::before,body:has(dialog[open]) :is(main,.top) *::after{animation-play-state:paused}
 </style></head><body>
 <header class="top"><div class="brand"><span class="logo" data-ic="bolt"></span><span class="bn">AI Web Bridge</span></div>
 <span class="chip" id="cChrome"><i></i><span></span></span><span class="chip hm" id="cReady"><i></i><span></span></span><span class="chip" id="cAdv"><i></i><span></span></span>
@@ -29414,12 +29604,12 @@ dialog.help[open]{display:flex;flex-direction:column;overflow:hidden}
 <label class="autobox"><span class="sw"><input type="checkbox" id="autoOn"><i></i></span><span class="atx"><b data-t="auto_l"></b><small data-t="auto_h"></small></span></label>
 <div class="ctl runrow"><div id="ddEnv"></div><button class="btn p" id="runBtn" type="button"><span data-ic="play"></span><span data-t="run"></span></button></div>
 <p class="hint" id="envHint"></p></div></details>
-<details class="sec card" open><summary><span class="sico" data-ic="package"></span><span class="stx"><b data-t="chrome"></b><small data-t="chrome_sub"></small></span></summary><div class="fb">
-<div class="ctl"><span class="lbl" data-t="profile"></span><div id="ddChrome"></div></div>
-<div class="pathbox"><code id="chromeDir" tabindex="0"></code><button class="cp" id="pathCopy" type="button"></button></div>
-<button class="btn p wide" id="chromeGo" type="button"><span data-ic="package"></span><span data-t="ext_btn"></span></button>
-<ol class="xsteps"><li data-t="ext_s1"></li><li data-t="ext_s2"></li><li data-t="ext_s3"></li></ol>
-<button class="btn wide" id="chromePair" type="button"><span data-ic="plug"></span><span data-t="ext_pair"></span></button></div></details>
+<details class="sec card" id="chromeCard" open><summary><span class="sico" data-ic="package"></span><span class="stx"><b data-t="chrome"></b><small data-t="chrome_sub"></small></span></summary><div class="fb">
+<div class="xs"><span class="xn">1</span><div class="xb"><b data-t="x1_t"></b><div class="pathbox"><code id="extUrl">chrome://extensions</code><button class="cp" id="urlCopy" type="button"></button></div><small data-t="x1_h"></small></div></div>
+<div class="xs"><span class="xn">2</span><div class="xb"><b data-t="x2_t"></b><div class="pathbox"><code id="chromeDir" tabindex="0"></code><button class="cp" id="pathCopy" type="button"></button></div><small data-t="x2_h"></small></div></div>
+<div class="xlive" id="xLive" role="status"><i class="dot"></i><span id="xLiveT"></span></div>
+<p class="hint" data-t="x_more"></p>
+<details class="xopt"><summary data-t="x_auto"></summary><div class="ctl" style="margin-top:.6rem"><span class="lbl" data-t="profile"></span><div id="ddChrome"></div></div><button class="btn wide" id="chromeGo" type="button" style="margin-top:.6rem"><span data-ic="package"></span><span data-t="ext_btn"></span></button></details></div></details>
 <details class="sec card"><summary><span class="sico" data-ic="grid"></span><span class="stx"><b data-t="layout"></b><small data-t="layout_sub"></small></span></summary><div class="fb"><div class="lbl" data-t="cols_l"></div><div class="chips" id="colChips"></div><p class="hint" data-t="cols_hint"></p></div></details>
 <details class="sec card"><summary><span class="sico" data-ic="key"></span><span class="stx"><b data-t="keys"></b><small data-t="keys_sub"></small></span></summary><div class="fb"><div id="keys"></div><div class="ctl"><input type="text" id="keyLbl" style="flex:1 1 8rem" data-ph="key_name"><button class="btn sm" id="keyNew" data-t="create"></button></div></div></details>
 <details class="sec card"><summary><span class="sico" data-ic="sparkle"></span><span class="stx"><b data-t="advisor"></b><small data-t="advisor_sub"></small></span></summary><div class="fb"><div class="lbl" data-t="adv_engine_l"></div><div class="chips" id="advChips"></div><p class="hint" id="advEngineHint"></p>
@@ -29463,16 +29653,16 @@ function icons(root){for(const el of (root||document).querySelectorAll('[data-ic
 /* ---------- text ---------- */
 const HELP={fa:[
 {h:'این برنامه چه کار می‌کند؟',b:'<p><b>AI Web Bridge</b> سایت‌های چت هوش مصنوعی را که در Chrome واردشان شده‌ای به یک آدرس محلی تبدیل می‌کند تا <b>Claude Code</b> (و برنامه‌هایی مثل Cursor) بتوانند از آن‌ها استفاده کنند. همه‌چیز روی همین کامپیوتر می‌ماند.</p>'},
-{h:'اتصال Chrome (فقط یک‌بار)',b:'<ul><li>روی ⚙ (تنظیمات) بزن و به بخش «افزونه Chrome» برو.</li><li>پروفایل Chrome مورد نظرت را انتخاب کن و دکمهٔ «کپی آدرس و باز کردن افزونه‌ها» را بزن.</li><li>در صفحهٔ افزونه‌ها «Developer mode» را روشن کن، «Load unpacked» را بزن، آدرس کپی‌شده را Paste و تأیید کن.</li><li>چند ثانیه بعد نقطهٔ کنار نام پروفایل سبز می‌شود؛ یعنی وصل است.</li></ul>'},
-{h:'افزودن اکانت',b:'<ul><li>روی دکمهٔ + در کارت پروفایل بزن و سایت مورد نظر را انتخاب کن.</li><li>Chrome خودش صفحهٔ ورود را باز می‌کند؛ وارد حسابت شو.</li><li>بعد از ورود معمولاً برنامه خودش ادامه می‌دهد. اگر دکمه‌ای مثل «وارد شدم» دیدی، فقط همان را یک‌بار بزن.</li></ul>'},
+{h:'اتصال Chrome (فقط یک‌بار)',b:'<ul><li>روی ⚙ (تنظیمات) بزن؛ بخش «افزونه Chrome» باز است.</li><li>آدرس <code>chrome://extensions</code> را با دکمهٔ کپی بردار و در یک تب جدید Chrome بچسبان.</li><li>«Developer mode» را روشن کن، «Load unpacked» را بزن، آدرس پوشه را (کپی دوم) Paste کن و OK بزن.</li><li>چند ثانیه بعد خودکار وصل می‌شود و پروفایل در داشبورد ظاهر می‌شود. برای هر پروفایل دیگر هم تکرار کن.</li></ul>'},
+{h:'افزودن اکانت',b:'<ul><li><b>سریع‌ترین راه:</b> سایت هوش مصنوعی را در Chrome باز کن و وارد حسابت باش، روی آیکون افزونه بزن و «افزودن این سایت به داشبورد» را بزن. همین تب در همان پروفایل ثبت و تأیید می‌شود.</li><li>یا روی دکمهٔ + در کارت پروفایل بزن و سایت را انتخاب کن؛ Chrome خودش صفحهٔ ورود را باز می‌کند.</li></ul>'},
 {h:'استفاده در Claude Code',b:'<ul><li>در ⚙ بخش «اتصال Claude Code» یک کلید و محیط ترمینال خودت (مثلاً cmd) را انتخاب کن.</li><li>دکمهٔ «اجرا» یک پنجرهٔ ترمینال تازه با Claude Code باز می‌کند؛ هر چندبار بزنی یک نشست جدا و هم‌زمان خواهی داشت.</li><li>یا آیکون کپی گوشهٔ کادر را بزن و دستور را خودت در ترمینال Paste کن.</li></ul>'},
 {h:'چرخش بین اکانت‌ها',b:'<ul><li><b>روش</b> مشخص می‌کند پیام بعدی به کدام اکانت برود؛ <b>پیام در هر نوبت</b> یعنی هر اکانت پشت‌سرهم چند پیام بگیرد؛ <b>فاصله</b> مکث بین دو پیام یک اکانت است.</li><li>هر اکانت یا از قانون کلی پیروی می‌کند (آیکون زنجیر)، یا با زدن روی آن عدد مخصوص خودش را می‌گیرد. دکمهٔ ↺ دوباره به قانون کلی برمی‌گرداند.</li></ul>'},
 {h:'کنترل‌های روزمره',b:'<ul><li><b>سوییچ کنار اکانت:</b> فقط همان اکانت را خاموش/روشن می‌کند.</li><li><b>سوییچ بالای کارت:</b> کل پروفایل را خاموش/روشن می‌کند. با روشن‌کردن دوباره، همهٔ تنظیمات اکانت‌ها همان‌طور که بود برمی‌گردد.</li><li><b>تغییر نام:</b> روی نام اکانت دابل‌کلیک کن؛ Enter یا کلیک بیرون = ثبت، Esc = لغو. (در گوشی: منوی ⋯ ← تغییر نام)</li><li><b>ترتیب:</b> نقطه‌های کنار اکانت یا آیکون چهارجهتهٔ پروفایل را بکش.</li><li><b>چیدمان:</b> تعداد کارت در هر ردیف را از ⚙ ← چیدمان انتخاب کن.</li></ul>'},
 {h:'وضعیت‌ها و رفع مشکل',b:'<ul><li><b>آماده:</b> همه‌چیز درست است. <b>استراحت:</b> سایت موقتاً محدود کرده و خودش برمی‌گردد.</li><li><b>نیاز به ورود:</b> از منوی ⋯ «ورود دوباره» را بزن. <b>نیاز به تأیید:</b> تأیید انسانی (کپچا) را در خود سایت انجام بده.</li><li>اگر چیزی درست نشد: ⚙ ← بیشتر ← «کپی گزارش خطا».</li></ul>'}],
 en:[
 {h:'What does this app do?',b:'<p><b>AI Web Bridge</b> turns the AI chat websites you are signed in to (in Chrome) into one local address, so <b>Claude Code</b> (and tools like Cursor) can use them. Everything stays on this computer.</p>'},
-{h:'Connect Chrome (once)',b:'<ul><li>Press ⚙ (Settings) and find the “Chrome extension” section.</li><li>Pick your Chrome profile and press “Copy path &amp; open extensions”.</li><li>On the extensions page turn on “Developer mode”, press “Load unpacked”, paste the copied path and confirm.</li><li>A few seconds later the dot next to the profile name turns green: you are connected.</li></ul>'},
-{h:'Add an account',b:'<ul><li>Press the + button on a profile card and pick a site.</li><li>Chrome opens the login page by itself; sign in.</li><li>After signing in the app usually continues by itself. If you see a button like “I’m logged in”, press it once.</li></ul>'},
+{h:'Connect Chrome (once)',b:'<ul><li>Press ⚙ (Settings); the “Chrome extension” section is open.</li><li>Copy <code>chrome://extensions</code> with its copy button and paste it into a new Chrome tab.</li><li>Turn on “Developer mode”, press “Load unpacked”, paste the folder path (second copy button) and press OK.</li><li>A few seconds later it connects by itself and the profile appears in the dashboard. Repeat for every other profile.</li></ul>'},
+{h:'Add an account',b:'<ul><li><b>Fastest:</b> open the AI site in Chrome and sign in, click the extension icon and press “Add this site to the dashboard”. That tab is registered and confirmed in that profile.</li><li>Or press + on a profile card and pick a site; Chrome opens the login page by itself.</li></ul>'},
 {h:'Use it in Claude Code',b:'<ul><li>In ⚙ “Connect Claude Code” pick a key and your terminal (for example cmd).</li><li>“Run” opens a fresh terminal window with Claude Code; press it again for another, separate, parallel session.</li><li>Or press the copy icon in the code box and paste the command into a terminal yourself.</li></ul>'},
 {h:'Rotating between accounts',b:'<ul><li><b>Method</b> decides which account gets the next message; <b>Messages per turn</b> is how many in a row one account takes; <b>Gap</b> is the pause between two messages of one account.</li><li>Each account either follows the global rule (chain icon) or, when you press it, gets its own number. The ↺ button returns it to the global rule.</li></ul>'},
 {h:'Everyday controls',b:'<ul><li><b>Switch next to an account:</b> turns only that account on/off.</li><li><b>Switch on top of a card:</b> turns the whole profile on/off. Turn it back on and every account setting is exactly as it was.</li><li><b>Rename:</b> double-click an account name; Enter or clicking elsewhere saves, Esc cancels. (On a phone: ⋯ menu → Rename)</li><li><b>Order:</b> drag the dots next to an account or the four-arrow icon of a profile.</li><li><b>Layout:</b> choose cards per row in ⚙ → Layout.</li></ul>'},
@@ -29486,7 +29676,7 @@ hint_run:'«اجرا» یک پنجرهٔ ترمینال تازه با Claude Cod
 g_win:'ویندوز',g_unix:'یونیکس / مک',g_other:'سایر شل‌ها',g_file:'فایل / تنظیمات',ext_btn:'باز کردن صفحهٔ افزونه‌ها (chrome://extensions)',ext_s1:'مسیر پوشه کپی می‌شود و فقط صفحهٔ افزونه‌ها باز می‌شود. «Developer mode» را روشن کن.',ext_s2:'روی «Load unpacked» بزن، مسیر کپی‌شده را Paste کن و OK بزن.',ext_s3:'بعد از نصب، دکمهٔ زیر را بزن تا اتصال خودکار انجام شود.',ext_pair:'افزونه نصب شد؛ اتصال خودکار',ext_paired:'داشبورد در Chrome باز شد؛ اتصال خودکار انجام می‌شود',wd_l:'پوشهٔ کار Claude Code',wd_ph:'مثلاً C:\\Projects\\my-app  (خالی = پوشهٔ خانه)',wd_pick:'انتخاب پوشه',wd_hint:'«اجرا» ترمینال را در همین پوشه باز می‌کند و دستور کپی‌شده هم با cd به آن شروع می‌شود.',wd_nopick:'پنجرهٔ انتخاب پوشه باز نشد؛ مسیر را دستی بنویس',ext_copied:'آدرس کپی شد و Chrome باز شد',ext_noprof:'اول یک پروفایل Chrome انتخاب کن',settings_sub:'اتصال، افزونه و ظاهر برنامه',auto_l:'حالت کاملاً خودکار',auto_h:'Claude Code هیچ تأییدی نمی‌خواهد (--dangerously-skip-permissions)؛ فقط روی پوشهٔ پروژه‌ات استفاده کن',connect_sub:'کلید، دستور و پوشهٔ پروژه',chrome_sub:'نصب افزونه و اتصال به پروفایل',layout_sub:'تعداد کارت در هر ردیف',keys_sub:'ساخت و مدیریت کلیدهای API',advisor_sub:'تعمیر خودکار و یادگیری سایت‌ها',more_sub:'گزارش خطا و سازگاری',compat_l:'سازگاری Claude Code',wd_save:'ثبت',wd_saved:'پوشه ثبت شد',wd_saved_l:'✓ ثبت‌شده:',wd_unsaved:'هنوز ثبت نشده',
 layout:'چیدمان کارت‌ها',cols_l:'تعداد کارت در هر ردیف',cols_auto:'خودکار',cols_hint:'روی صفحه‌های کوچک‌تر خودکار کمتر می‌شود تا چیزی به هم نریزد.',search:'جستجو…',no_results:'نتیجه‌ای نیست',
 poff:'پروفایل خاموش',prof_on:'پروفایل روشن شد',prof_off:'پروفایل خاموش شد',poff_note:'این پروفایل خاموش است؛ اکانت‌هایش از چرخش بیرون‌اند و تنظیماتشان سر جایش مانده.',prof_sw:'روشن / خاموش کردن کل پروفایل',
-rename:'تغییر نام',dbl_rename:'دابل‌کلیک برای تغییر نام',global_s:'کلی',follow_tip:'از قانون کلی پیروی می‌کند؛ بزن تا عدد مخصوص خودش را داشته باشد',back_global:'برگشت به قانون کلی',acc_sw:'روشن / خاموش',theme:'تم',lang:'زبان'},
+rename:'تغییر نام',prof_del:'حذف پروفایل',prof_del_q:'پروفایل «{n}» و تمام اکانت‌ها و اطلاعات مربوط به آن ({c} اکانت) برای همیشه حذف شود؟',prof_deleted:'پروفایل و متعلقاتش حذف شد',dbl_rename:'دابل‌کلیک برای تغییر نام',global_s:'کلی',follow_tip:'از قانون کلی پیروی می‌کند؛ بزن تا عدد مخصوص خودش را داشته باشد',back_global:'برگشت به قانون کلی',acc_sw:'روشن / خاموش',theme:'تم',lang:'زبان',x1_t:'آدرس صفحهٔ افزونه‌ها را کپی کن',x1_h:'وب‌سایت‌ها اجازهٔ باز کردن این صفحه را ندارند. یک تب جدید در Chrome باز کن، آدرس را در نوار آدرس بچسبان (Ctrl+V) و Enter بزن.',x2_t:'آدرس پوشهٔ افزونه را کپی کن',x2_h:'در همان صفحه «Developer mode» را روشن کن، «Load unpacked» را بزن، آدرس را Paste کن (Ctrl+V) و OK بزن. بقیهٔ کارها خودکار است.',x_wait:'منتظر نصب افزونه… بعد از Load unpacked خودکار وصل می‌شود',x_live_ok:'✓ متصل شد:',x_more:'برای هر پروفایل Chrome دیگر هم همین دو مرحله را تکرار کن؛ هر کدام خودکار در داشبورد اضافه می‌شود.',x_auto:'یا خودم برایت باز کنم (اختیاری)',ext_url_copied:'کپی شد؛ در تب جدید Chrome بچسبان',ext_path_copied:'آدرس پوشه کپی شد؛ در Load unpacked بچسبان',prof_new:'پروفایل جدید وصل شد:',},
 en:{method:'Method',adv_engine_l:'Repair brain',adv_eng_auto:'Auto',adv_eng_agent:'Claude Code only',adv_eng_model:'Other account only',adv_eng_manual:'Manual',adv_hint_auto:'Your own Claude Code looks at the page and fixes it first; if it is missing another account is asked; the simple built-in rules come last. Repairs start by themselves.',adv_hint_agent:'Claude Code only, independent of every bridge account. Repairs start by themselves.',adv_hint_model:'Only the model of another healthy account (the old way). Repairs start by themselves.',adv_hint_manual:'No repair starts by itself, only the per-account buttons. The brain is the same as in Auto.',agent_check:'Check Claude Code',agent_ok:'Claude Code found',agent_none:'Claude Code not found (install it or give its path)',agent_login_ok:'answers',agent_login_failed:'does not answer',agent_login_unknown:'not tested yet',agent_key:'API key of its own',agent_signin:'Sign in the advisor',bk_l:'Agent brain (which model it thinks with)',bk_auto:'Auto',bk_bridge:'Bridge accounts',bk_own:'Own sign-in',bk_hint_auto:'Its own sign-in / key when it has one, otherwise the accounts connected to this bridge.',bk_hint_bridge:'The agent thinks through the accounts connected to this bridge: no separate sign-in, and nothing to do with your own Claude Code.',bk_hint_own:'The agent thinks only with its own sign-in / key (separate from your Claude Code).',inv_l:'Investigate a problem (any part of the program)',inv_ph:'Describe the problem, e.g. why does account X not answer? what is error Y in the log?',inv_go:'Start investigation',inv_list:'Saved findings',inv_started:'Investigation started:',inv_running:'Investigating',inv_done:'Finished:',inv_none:'No findings saved yet',agent_opened:'Sign in there with /login, then press Check',agent_own:'The advisor uses its OWN Claude Code folder and sign-in. Your own Claude Code (login, settings, history, projects) is never read or changed and works as before.',gs_agent:'Claude Code is working on the page',gs_gate:'Real test messages',g_paused:'Paused · press to continue',g_cancelled:'Cancelled · red until repaired',ga_start:'Start repair with the advisor',ga_pause:'Pause',ga_resume:'Resume',ga_cancel:'Cancel repair',g_t_pause:'Paused',g_t_resume:'Resumed',g_t_cancel:'Cancelled',g_t_wait:'Cancelling, one moment',g_sending:'Sending message...',g_ok:'Answer received',g_failed:'No answer',g_repairing:'Advisor is checking...',g_quar:'Held until the 2-message test',fix_tip:'Repair with the smart advisor',fix_started:'Advisor started',m_deep:'Full site check (advisor)',deep_started:'Full check started',gs_know:'Saved knowledge',gs_scan:'Scan page',gs_diag:'Diagnose',gs_fix:'Fix',gs_test1:'Test 1 of 2',gs_test2:'Test 2 of 2',gs_save:'Save',pcauto_on:'Open the Chrome profile by itself',g_prompt:'Copy patch prompt',g_applied:'Applied',g_pending:'waiting',m_profile:'Profile by profile',m_spread:'Spread across profiles',turn:'Messages per turn',gap:'Gap (seconds)',add:'Add account',profile:'Profile',settings:'Settings',connect:'Connect Claude Code',chrome:'Chrome extension',keys:'Keys',create:'Create',key_name:'Key name',advisor:'Smart advisor',more:'More',copy:'Copy',copied:'Copied',copy_log:'Copy error report',classic:'Advanced tools',empty:'Connect your first Chrome profile',setup_chrome:'Connect Chrome',
 ok:'Ready',rest:'Resting',login:'Needs login',check:'Needs check',off:'Off',bad:'Problem',learning:'Setting up',none:'No profile',accounts:'accounts',ready:'ready',chrome_n:'Chrome',adv_idle:'Advisor: idle',adv_work:'Advisor working',adv_off:'Advisor: off',adv_k_ask:'analysing',adv_k_repair:'repairing account',adv_k_investigate:'investigating',
 test:'Test connection',relogin:'Log in again',def:'Main account',del:'Remove',done_login:"I'm logged in",done_first:'I sent it',done_check:'Done',a_login:'Log in inside Chrome',a_first:'Send a test message in the chat',a_check:'Complete the human check on the site',a_wait:'Chrome opens the login page by itself; if it does not, click the extension icon',
@@ -29496,8 +29686,8 @@ hint_run:'“Run” opens a fresh terminal window with Claude Code; every press 
 g_win:'Windows',g_unix:'Unix / Mac',g_other:'Other shells',g_file:'Files / settings',ext_btn:'Open extensions page (chrome://extensions)',ext_s1:'The folder path is copied and only the extensions page opens. Turn on “Developer mode”.',ext_s2:'Press “Load unpacked”, paste the copied path and press OK.',ext_s3:'After it is installed, press the button below to connect automatically.',ext_pair:'Extension installed - connect automatically',ext_paired:'The dashboard opened in Chrome; connecting automatically',wd_l:'Claude Code working folder',wd_ph:'e.g. C:\\Projects\\my-app  (empty = home folder)',wd_pick:'Choose folder',wd_hint:'“Run” opens the terminal in this folder, and the copied command starts with a cd to it.',wd_nopick:'The folder picker could not open; type the path',ext_copied:'Path copied and Chrome opened',ext_noprof:'Pick a Chrome profile first',settings_sub:'Connection, extension and appearance',auto_l:'Fully automatic mode',auto_h:'Claude Code never asks for approval (--dangerously-skip-permissions); use it only on your own project folder',connect_sub:'Key, command and project folder',chrome_sub:'Install the extension and link a profile',layout_sub:'Cards per row',keys_sub:'Create and manage API keys',advisor_sub:'Auto-repair and site learning',more_sub:'Error report and compatibility',compat_l:'Claude Code compatibility',wd_save:'Save',wd_saved:'Folder saved',wd_saved_l:'✓ Saved:',wd_unsaved:'Not saved yet',
 layout:'Card layout',cols_l:'Cards per row',cols_auto:'Auto',cols_hint:'On smaller screens it automatically uses fewer so nothing breaks.',search:'Search…',no_results:'No results',
 poff:'Profile off',prof_on:'Profile turned on',prof_off:'Profile turned off',poff_note:'This profile is off; its accounts are out of rotation and all their settings are kept.',prof_sw:'Turn the whole profile on / off',
-rename:'Rename',dbl_rename:'Double-click to rename',global_s:'Global',follow_tip:'Follows the global rule; press to give it its own number',back_global:'Back to the global rule',acc_sw:'On / off',theme:'Theme',lang:'Language'}};
-let lang=localStorage.lang||'fa';const t=k=>(L[lang]||L.fa)[k]||L.fa[k]||k;
+rename:'Rename',prof_del:'Delete profile',prof_del_q:'Delete profile "{n}" and all of its accounts and data ({c} accounts) permanently?',prof_deleted:'Profile and everything belonging to it was deleted',dbl_rename:'Double-click to rename',global_s:'Global',follow_tip:'Follows the global rule; press to give it its own number',back_global:'Back to the global rule',acc_sw:'On / off',theme:'Theme',lang:'Language',x1_t:'Copy the extensions page address',x1_h:'Websites are not allowed to open this page. Open a new Chrome tab, paste the address into the address bar (Ctrl+V) and press Enter.',x2_t:'Copy the extension folder path',x2_h:'On that page turn on “Developer mode”, press “Load unpacked”, paste the path (Ctrl+V) and press OK. Everything else is automatic.',x_wait:'Waiting for the extension… it connects by itself after Load unpacked',x_live_ok:'✓ Connected:',x_more:'Repeat the same two steps in every other Chrome profile; each one is added to the dashboard automatically.',x_auto:'Or open it for me (optional)',ext_url_copied:'Copied; paste it in a new Chrome tab',ext_path_copied:'Folder path copied; paste it in Load unpacked',prof_new:'New profile connected:',}};
+L.fa.ext_btn='باز کردن صفحهٔ افزونه‌ها برای من';L.en.ext_btn='Open the extensions page for me';let lang=localStorage.lang||'fa';const t=k=>(L[lang]||L.fa)[k]||L.fa[k]||k;
 const STRATS=['round_robin','priority_order','least_loaded','least_recently_used','random','primary_first','health_weighted'],SK={round_robin:'rr',priority_order:'po',least_loaded:'ll',least_recently_used:'lru',random:'rnd',primary_first:'pf',health_weighted:'hw'};
 let S={accounts:[],pc_profiles:[],keys:[],jobs:[],presets:[],settings:{}},R={groups:[],sequence:[],current:'',strategy:'round_robin',rotate_every:1,account_min_gap_seconds:3,rotation_mode:'profile',disabled_profiles:[]};
 const Q={};let G={},GP=0;const accOf=id=>S.accounts.find(a=>a.id===id);
@@ -29540,7 +29730,7 @@ let boardSig='',rowSig={},first=true;
 function rowHTML(a,q,ix){const s=status(a),g=G[a.id]||{},gst=g.state||'',gc=(gst&&gst!=='idle'?' g-'+((g.quar&&gst==='repairing')?'failed':gst):'')+(gst==='repairing'?' g-work':'')+(g.quar?' g-quar':'');
 const qc=q.custom?`<span class="stp"><button data-q="-" aria-label="−">−</button><b>${q.quota}</b><button data-q="+" aria-label="+">+</button></span><button class="ib sm" data-qreset title="${E(t('back_global'))}" aria-label="${E(t('back_global'))}">${ic('undo')}</button>`:`<button class="qf" data-qfollow title="${E(t('follow_tip'))}" aria-label="${E(t('follow_tip'))}">${ic('link')}<span>${E(t('global_s'))}</span><small>×${q.quota}</small></button>`;
 return`<div class="row s-${s}${gc}" data-id="${E(a.id)}"><button class="grip" data-grip="row" aria-label="${E(t('drag'))}" title="${E(t('drag'))}"></button><span class="pri">${ix+1}</span>${av(a)}<div class="meta"><b class="nm" title="${E(t('dbl_rename'))}">${E(a.label)}</b><span class="st">${E(gtxt(g,s))}${s==='rest'?' '+a.cooling+'s':''}${R.current===a.id?`<span class="cur">${ic('play','fl')}</span>`:''}</span>${gsteps(g)}</div><div class="rc">${gctl(a,g)}<span class="qc">${qc}</span><label class="sw"><input type="checkbox" data-en aria-label="${E(t('acc_sw'))}" ${a.disabled?'':'checked'}><i></i></label><button class="ib sm" data-menu aria-label="menu">${ic('dots','fl')}</button></div></div>`}
-function cardHTML(g,i){return`<div class="pc" data-p="${E(g.key)}"><div class="ph">${g.key?`<div class="pl"><button class="grip mv" data-grip="card" aria-label="${E(t('drag_p'))}" title="${E(t('drag_p'))}">${ic('move')}</button><span class="pri">${i+1}</span><span class="dot"></span></div>`:''}<div class="pn"><b></b><span class="n"></span></div><div class="pa">${g.key?`<label class="sw" title="${E(t('prof_sw'))}"><input type="checkbox" data-pen aria-label="${E(t('prof_sw'))}"><i></i></label>`:''}<button class="ib sm" data-add="${E(g.key)}" aria-label="${E(t('add'))}">${ic('plus')}</button></div></div><div class="poffnote">${E(t('poff_note'))}</div><div class="rows">${g.accounts.map(q=>`<div data-slot="${E(q.id)}"></div>`).join('')}</div></div>`}
+function cardHTML(g,i){return`<div class="pc" data-p="${E(g.key)}"><div class="ph">${g.key?`<div class="pl"><button class="grip mv" data-grip="card" aria-label="${E(t('drag_p'))}" title="${E(t('drag_p'))}">${ic('move')}</button><span class="pri">${i+1}</span><span class="dot"></span></div>`:''}<div class="pn"><b title="${E(t('dbl_rename'))}"></b><span class="n"></span></div><div class="pa">${g.key?`<label class="sw" title="${E(t('prof_sw'))}"><input type="checkbox" data-pen aria-label="${E(t('prof_sw'))}"><i></i></label>`:''}<button class="ib sm" data-add="${E(g.key)}" aria-label="${E(t('add'))}">${ic('plus')}</button>${g.key?`<button class="ib sm" data-pdel="${E(g.key)}" aria-label="${E(t('prof_del'))}" title="${E(t('prof_del'))}">${ic('trash')}</button>`:''}</div></div><div class="poffnote">${E(t('poff_note'))}</div><div class="rows">${g.accounts.map(q=>`<div data-slot="${E(q.id)}"></div>`).join('')}</div></div>`}
 function renderBoard(){const groups=R.groups.map(g=>({...g,accounts:g.accounts.filter(q=>accOf(q.id))})),off=offSet();
 for(const p of S.pc_profiles)if(!groups.some(g=>g.key===p.id))groups.push({key:p.id,name:p.name,accounts:[]});
 for(const g of groups){g.disabled=!!g.key&&off.has(g.key);const p=S.pc_profiles.find(x=>x.id===g.key);g.connected=p?!!p.connected:!!g.connected}
@@ -29548,7 +29738,7 @@ const sig=groups.map(g=>g.key+':'+g.accounts.map(q=>q.id).join(',')).join('|')+'
 if(sig!==boardSig){boardSig=sig;rowSig={};$('board').innerHTML=groups.map((g,i)=>cardHTML(g,i)).join('')}
 $('board').querySelectorAll('.pc').forEach(card=>{const g=groups.find(x=>x.key===card.dataset.p);if(!g)return;const i=groups.indexOf(g);card.classList.toggle('poff',g.disabled);const sw=card.querySelector('[data-pen]');if(sw&&sw.checked===g.disabled)sw.checked=!g.disabled;
 const dot=card.querySelector('.dot');if(dot)dot.classList.toggle('on',!!g.connected);const pri=card.querySelector('.ph .pri');if(pri&&pri.textContent!==String(i+1))pri.textContent=i+1;
-const nm=card.querySelector('.pn b'),n=card.querySelector('.pn .n'),name=profName(g,i),cnt=g.accounts.length+' '+t('accounts');if(nm.textContent!==name)nm.textContent=name;if(n.textContent!==cnt)n.textContent=cnt});
+const nm=card.querySelector('.pn b'),n=card.querySelector('.pn .n'),name=profName(g,i),cnt=g.accounts.length+' '+t('accounts');if(nm&&nm.textContent!==name)nm.textContent=name;if(n&&n.textContent!==cnt)n.textContent=cnt});
 for(const g of groups)for(const [ix,q0] of g.accounts.entries()){const a=accOf(q0.id),st=Q[a.id]||{custom:!!q0.custom,v:q0.quota},h=rowHTML(a,{quota:st.v,custom:st.custom},ix);if(rowSig[a.id]===h)continue;rowSig[a.id]=h;
 const slot=$('board').querySelector(`[data-slot="${CSS.escape(a.id)}"],.row[data-id="${CSS.escape(a.id)}"]`);if(slot){const tmp=document.createElement('div');tmp.innerHTML=h;slot.replaceWith(tmp.firstElementChild)}}}
 function renderTrack(){const seq=R.sequence.filter(id=>{const a=accOf(id);return a&&!a.disabled&&!profOff(a)}),out=[];let prev=null;for(const id of seq){const a=accOf(id),k=a.pc_client_id||'';if(prev!==null&&k!==prev&&R.rotation_mode==='profile')out.push('<span class="sepr"></span>');prev=k;const g=R.groups.flatMap(x=>x.accounts).find(x=>x.id===id),n=Q[id]?Q[id].v:(g?g.quota:1),c=R.current===id;out.push(`<span class="tk ${c?'cur':''}" title="${E(a.label)}">${av(a)}<small>${c?(R.current_count||0)+'/':'×'}${n}</small></span>`)}
@@ -29573,7 +29763,7 @@ const gtxt=(g,s)=>{const st=g&&g.state;if(st==='sending')return t('g_sending');i
 const gctl=(a,g)=>{if(a.type==='api')return'';g=g||{};const pz=g.state==='paused',run=!!g.running,tip=t(pz?'ga_resume':run?'ga_pause':'ga_start'),cls=pz?' pz':run?' rn':(g.can_fix?' fx':''),ico=pz?ic('play','fl'):run?ic('pause','fl'):ic('wrench','fl');return`<span class="gctl"><button class="ib sm${cls}" data-gact aria-label="${E(tip)}" title="${E(tip)}">${ico}</button><button class="ib sm" data-gcancel aria-label="${E(t('ga_cancel'))}" title="${E(t('ga_cancel'))}"${run?'':' disabled'}>${ic('x')}</button></span>`};
 const gsteps=g=>{if(!g||!g.running||!g.steps||!g.steps.length)return'';const cur=g.steps.find(x=>x.s==='run')||g.steps[g.steps.length-1];return`<span class="gs">${g.steps.map(x=>`<i class="${x.s}"></i>`).join('')}<span>${E(t('gs_'+cur.k))}</span></span>`};
 let gBusy=false;
-async function guardTick(){if(gBusy||document.hidden)return false;gBusy=true;let any=false;try{const r=await api('guard'),n=r.rows||{};let ch=false;for(const id in n){if(['sending','ok','repairing'].includes(n[id].state))any=true;if(!G[id]||G[id].sig!==n[id].sig)ch=true}for(const id in G)if(!n[id])ch=true;G=n;GP=r.prompt_pending||0;if(ch&&!DND&&!dragBusy&&!EDIT){renderBoard();renderTrack()}}catch(e){}gBusy=false;return any}
+async function guardTick(){if(gBusy||document.hidden||Date.now()-LASTSCR<300)return false;gBusy=true;let any=false;try{const r=await api('guard'),n=r.rows||{};let ch=false;for(const id in n){if(['sending','ok','repairing'].includes(n[id].state))any=true;if(!G[id]||G[id].sig!==n[id].sig)ch=true}for(const id in G)if(!n[id])ch=true;G=n;GP=r.prompt_pending||0;if(ch&&!DND&&!dragBusy&&!EDIT){renderBoard();renderTrack()}}catch(e){}gBusy=false;return any}
 async function gloop(){let any=false;try{any=await guardTick()}catch(e){}setTimeout(gloop,any?700:1600)}
 setTimeout(gloop,1200);
 function gPromptInfo(){$('gPromptN').textContent=GP+' '+t('g_pending')}
@@ -29585,7 +29775,10 @@ function agentLine(s){if(!s||!s.checked_at)return'';if(!s.found)return t('agent_
 async function agentInfo(login){const el=$('agentInfo');try{el.textContent='…';const s=await api('advisor/agent','POST',{login:!!login});el.textContent=agentLine(s)+(s.reason&&s.login==='failed'?' ('+String(s.reason).slice(0,80)+')':'')}catch(x){el.textContent=String(x.message).slice(0,100)}}
 document.addEventListener('click',async e=>{const b=e.target.closest('[data-eng],#agentChk,#agentLogin');if(!b)return;if(b.id==='agentLogin'){try{const r=await api('advisor/agent/login','POST',{});if(r.opened)toast(t('agent_opened'));else{$('agentInfo').textContent=r.command;toast(String(r.reason||'').slice(0,100))}}catch(x){toast(String(x.message).slice(0,100))}return}if(b.id==='agentChk'){b.disabled=true;await agentInfo(true);b.disabled=false;return}const r=await post('settings',{advisor_engine:b.dataset.eng});if(r)advRender()});
 document.addEventListener('click',async e=>{const b=e.target.closest('#gPrompt,#gApplied');if(!b)return;try{if(b.id==='gPrompt'){const r=await api('guard/prompt');try{await navigator.clipboard.writeText(r.text)}catch(x){const ta=document.createElement('textarea');ta.value=r.text;document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove()}toast(t('copied')+' ('+r.count+')')}else{if(!confirm(t('sure')))return;const r=await api('guard/prompt/applied','POST',{});toast(t('ok_t')+' ('+(r.marked||0)+')')}await guardTick();gPromptInfo()}catch(x){toast(x.message.slice(0,100))}});
-let busy=false,DND=null,dragBusy=false,EDIT=null;async function tick(){if(busy||document.hidden||DND||dragBusy||EDIT)return;busy=true;try{await Promise.all([loadS(),loadR()]);first=false;renderAll()}catch(e){}busy=false}
+let busy=false,DND=null,dragBusy=false,EDIT=null,LASTSCR=0,SCRT=0;
+/* while the page is being scrolled: no background polling/re-rendering and no hover transitions (they are what makes weak PCs stutter); everything catches up 0.3 s after the scroll stops */
+addEventListener('scroll',()=>{LASTSCR=Date.now();if(!SCRT)document.documentElement.classList.add('scr');clearTimeout(SCRT);SCRT=setTimeout(()=>{SCRT=0;document.documentElement.classList.remove('scr')},160)},{capture:true,passive:true});
+async function tick(){if(busy||document.hidden||DND||dragBusy||EDIT||Date.now()-LASTSCR<300)return;busy=true;try{await Promise.all([loadS(),loadR()]);first=false;renderAll();chromeLive()}catch(e){}busy=false}
 function toast(m){const x=$('toast');x.textContent=m;x.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>x.classList.remove('on'),2400)}
 const post=async(p,b,m)=>{try{const r=await api(p,m||'POST',b);await tick();return r}catch(e){toast(e.message.slice(0,120))}};
 /* per-account turn size: follows the global rule, or its own number (explicit, kept even when equal to the global one) */
@@ -29622,13 +29815,24 @@ function startRename(row){if(EDIT||!row)return;const id=row.dataset.id,a=accOf(i
 const inp=document.createElement('input');inp.type='text';inp.className='nmi';inp.value=a.label||'';inp.maxLength=60;inp.setAttribute('aria-label',t('rename'));let done=false;EDIT={id};b.replaceWith(inp);inp.focus();inp.select();
 const end=async save=>{if(done)return;done=true;EDIT=null;const v=inp.value.trim();if(save&&v&&v!==a.label){const old=a.label;a.label=v;rowSig[id]='';renderBoard();renderTrack();try{await api('accounts/'+id+'/label','POST',{label:v})}catch(e){a.label=old;toast(e.message.slice(0,120))}}else{rowSig[id]='';renderBoard()}tick()};
 inp.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();end(true)}else if(e.key==='Escape'){e.preventDefault();e.stopPropagation();end(false)}};inp.onblur=()=>end(true)}
-document.addEventListener('dblclick',e=>{const b=e.target.closest('.nm');if(b)startRename(b.closest('.row'))});
+document.addEventListener('dblclick',e=>{const pb=e.target.closest('.pn b,.pn input');if(pb&&!pb.matches('input'))return startProfRename(pb.closest('.pc'));const b=e.target.closest('.nm');if(b)startRename(b.closest('.row'))});
+/* ---------- Chrome profile: rename (double-click) and delete (with every account that belongs to it) ---------- */
+function startProfRename(card){if(EDIT||!card)return;const key=card.dataset.p,p=S.pc_profiles.find(x=>x.id===key),b=card.querySelector('.pn b');if(!key||!p||!b)return;
+const inp=document.createElement('input');inp.type='text';inp.className='nmi';inp.value=p.name||'';inp.maxLength=80;inp.setAttribute('aria-label',t('rename'));let done=false;EDIT={id:key};b.replaceWith(inp);inp.focus();inp.select();
+const end=async save=>{if(done)return;done=true;EDIT=null;const v=inp.value.trim(),nb=document.createElement('b');nb.textContent=p.name||'';inp.replaceWith(nb);
+if(save&&v!==(p.name||'')){try{const r=await api('personal-chrome/profiles/'+encodeURIComponent(key)+'/name','POST',{name:v});p.name=r.name||v;nb.textContent=p.name}catch(e){toast(e.message.slice(0,120))}}
+renderBoard();tick()};
+inp.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();end(true)}else if(e.key==='Escape'){e.preventDefault();e.stopPropagation();end(false)}};inp.onblur=()=>end(true)}
+async function delProfile(key){const p=S.pc_profiles.find(x=>x.id===key),n=S.accounts.filter(a=>a.pc_client_id===key).length;
+if(!confirm(t('prof_del_q').replace('{n}',p?p.name:key).replace('{c}',n)))return;
+try{await api('personal-chrome/profiles/'+encodeURIComponent(key),'DELETE');S.pc_profiles=S.pc_profiles.filter(x=>x.id!==key);S.accounts=S.accounts.filter(a=>a.pc_client_id!==key);toast(t('prof_deleted'));renderBoard();tick()}catch(e){toast(e.message.slice(0,120))}}
 /* ---------- clipboard ---------- */
 async function copyText(s){try{await navigator.clipboard.writeText(s);return true}catch(e){try{const ta=document.createElement('textarea');ta.value=s;ta.style.cssText='position:fixed;opacity:0;top:0;left:0';(document.querySelector('dialog[open]')||document.body).appendChild(ta);ta.select();const ok=document.execCommand('copy');ta.remove();return ok}catch(x){return false}}}
 function flash(btn){btn.classList.add('ok');btn.innerHTML=ic('check');clearTimeout(btn._t);btn._t=setTimeout(()=>{btn.classList.remove('ok');btn.innerHTML=ic('copy')},1600)}
 /* ---------- events ---------- */
 document.addEventListener('click',async e=>{const b=e.target.closest('button,a');const menu=$('menu');if(!e.target.closest('.menu,[data-menu]'))menu.classList.remove('on');if(!b)return;
 if(b.dataset.close!==undefined)return b.closest('dialog').close();
+if(b.dataset.pdel)return delProfile(b.dataset.pdel);
 if(b.dataset.q){const id=b.closest('.row').dataset.id;return setQuota(id,true,qNow(id).v+(b.dataset.q==='+'?1:-1),`[data-q="${b.dataset.q}"]`)}
 if(b.dataset.qfollow!==undefined){const id=b.closest('.row').dataset.id;return setQuota(id,true,R.rotate_every,'[data-q="+"]')}
 if(b.dataset.qreset!==undefined){const id=b.closest('.row').dataset.id;return setQuota(id,false,R.rotate_every,'[data-qfollow]')}
@@ -29698,16 +29902,21 @@ $('autoOn').onchange=()=>{try{localStorage.autoRun=$('autoOn').checked?'1':''}ca
 $('wdPath').oninput=()=>{wdState();renderCode()};$('wdPath').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();$('wdSave').click()}};
 $('wdSave').onclick=()=>{const v=$('wdPath').value.trim();try{localStorage.workDir=v}catch(e){}wdState();renderCode();toast(t('wd_saved'))};
 $('wdPick').onclick=async()=>{try{const r=await api('workspace/select','POST',{});if(r&&r.folder){$('wdPath').value=r.folder;try{localStorage.workDir=r.folder}catch(e){}wdState();renderCode()}}catch(x){toast(t('wd_nopick'))}};
-$('pathCopy').onclick=async()=>{if(EXTDIR&&await copyText(EXTDIR)){flash($('pathCopy'));toast(t('copied'))}};
+$('pathCopy').onclick=async()=>{if(EXTDIR&&await copyText(EXTDIR)){flash($('pathCopy'));toast(t('ext_path_copied'))}else toast(t('fail_t'))};
+$('urlCopy').onclick=async()=>{if(await copyText('chrome://extensions')){flash($('urlCopy'));toast(t('ext_url_copied'))}else toast(t('fail_t'))};
 $('chromeGo').onclick=async()=>{const prof=ddChrome.get()||'';if(prof)localStorage.chromeProf=prof;if(EXTDIR){await copyText(EXTDIR);flash($('pathCopy'))}
 const r=await post('personal-chrome/open-extensions',{profile:prof});if(r){if(r.extension_dir){EXTDIR=r.extension_dir;$('chromeDir').textContent=EXTDIR}toast(t('ext_copied'))}};
-$('chromePair').onclick=async()=>{const prof=ddChrome.get()||'';const r=await post('personal-chrome/open-extensions',{profile:prof,pair:true});if(r){toast(t('ext_paired'));let n=0;const iv=setInterval(async()=>{await tick();if(++n>60||S.pc_profiles.some(p=>p.connected))clearInterval(iv)},3000)}};
 $('logCopy').onclick=async()=>{try{const r=await api('logfile?level=info&tail=300&report=1');await copyText(typeof r==='string'?r:JSON.stringify(r));toast(t('copied'))}catch(x){toast(x.message.slice(0,80))}};
 $('bSet').onclick=async()=>{try{$('wdPath').value=localStorage.workDir||'';$('autoOn').checked=localStorage.autoRun==='1'}catch(e){}wdState();renderKeys();loadUiSites();advRender();bkRender();agentInfo(false);$('pcAutoOn').checked=!(S.settings&&S.settings.pc_autostart_profiles===false);gPromptInfo();api('compat').then(c=>{$('compatLine').textContent=c.line}).catch(()=>{});$('dSet').showModal();
 try{const r=await api('personal-chrome/profiles'),ps=r.profiles||[];ddChrome.set(ps.map(p=>({v:p.dir,label:p.name,sub:p.email||'',k:p.dir})),ps.some(p=>p.dir===localStorage.chromeProf)?localStorage.chromeProf:undefined)}catch(e){}
-try{const r=await api('personal-chrome/extension-path','POST',{});EXTDIR=r.extension_dir||'';$('chromeDir').textContent=EXTDIR}catch(e){}
+armExt();clearInterval(ARM);ARM=setInterval(armExt,30000);
 try{SH=await api('claude-shells');ddEnv.set(envItems(),defEnv());renderCode()}catch(e){}};
 $('bEmpty').onclick=()=>$('bSet').onclick();
+/* extension setup: while the settings are open the bridge keeps a short auto-pair window open, so every extension that gets loaded joins by itself */
+let ARM=0;function armExt(){api('personal-chrome/extension-path','POST',{}).then(r=>{EXTDIR=r.extension_dir||EXTDIR;if(EXTDIR)$('chromeDir').textContent=EXTDIR}).catch(()=>{})}
+$('dSet').addEventListener('close',()=>clearInterval(ARM));
+let seenP=null;function chromeLive(render){const ps=S.pc_profiles||[];if(!render){if(seenP===null)seenP=new Set(ps.map(p=>p.id));else for(const p of ps)if(!seenP.has(p.id)){seenP.add(p.id);toast(t('prof_new')+' '+p.name)}}
+const el=$('xLive');if(!el)return;const on=ps.filter(p=>p.connected);el.classList.toggle('ok',on.length>0);$('xLiveT').textContent=on.length?t('x_live_ok')+' '+on.map(p=>p.name).join(' · '):t('x_wait')}
 $('bHelp').onclick=()=>{renderHelp();$('dHelp').showModal();$('hBody').scrollTop=0};
 function renderHelp(){$('hBody').innerHTML=(HELP[lang]||HELP.fa).map((s,i)=>`<section class="hstep"><span class="hn">${i+1}</span><h4>${s.h}</h4><div class="hc">${s.b}</div></section>`).join('')}
 /* ---------- layout (cards per row) ---------- */
@@ -29718,8 +29927,8 @@ function applyLang(){document.documentElement.lang=lang;document.documentElement
 for(const el of document.querySelectorAll('[data-t]'))el.textContent=t(el.dataset.t);for(const el of document.querySelectorAll('[data-ph]'))el.placeholder=t(el.dataset.ph);
 $('bLang').setAttribute('aria-label',t('lang'));$('bTheme').setAttribute('aria-label',t('theme'));$('bSet').setAttribute('aria-label',t('settings'));
 for(const b of document.querySelectorAll('[data-close]'))b.setAttribute('aria-label',t('close'));
-$('codeCopy').innerHTML=ic('copy');$('codeCopy').setAttribute('aria-label',t('copy'));$('codeCopy').title=t('copy');$('pathCopy').innerHTML=ic('copy');$('pathCopy').setAttribute('aria-label',t('copy'));$('pathCopy').title=t('copy');
-ddM.lang='';ddEnv.set(envItems());applyCols();renderCode();renderHelp();rowSig={};boardSig='';renderAll()}
+$('codeCopy').innerHTML=ic('copy');$('codeCopy').setAttribute('aria-label',t('copy'));$('codeCopy').title=t('copy');$('pathCopy').innerHTML=ic('copy');$('pathCopy').setAttribute('aria-label',t('copy'));$('pathCopy').title=t('copy');$('urlCopy').innerHTML=ic('copy');$('urlCopy').setAttribute('aria-label',t('copy'));$('urlCopy').title=t('copy');
+ddM.lang='';ddEnv.set(envItems());applyCols();renderCode();renderHelp();rowSig={};boardSig='';renderAll();try{chromeLive(true)}catch(e){}}
 $('bLang').onclick=()=>{lang=lang==='fa'?'en':'fa';localStorage.lang=lang;applyLang()};
 function applyTheme(){document.documentElement.dataset.theme=localStorage.theme||(matchMedia('(prefers-color-scheme:light)').matches?'light':'dark')}
 $('bTheme').onclick=()=>{localStorage.theme=document.documentElement.dataset.theme==='dark'?'light':'dark';applyTheme()};
@@ -29788,12 +29997,12 @@ header,nav,main{position:relative;z-index:1}
 header{border-bottom:0;padding:18px 22px}
 h1{font-size:21px;letter-spacing:.2px;display:flex;align-items:center;gap:12px}
 h1::before{content:"\26A1";width:44px;height:44px;border-radius:14px;background:linear-gradient(135deg,var(--acc),var(--acc2));display:grid;place-items:center;font-size:21px;box-shadow:0 8px 24px rgba(124,92,255,.45)}
-.pill{background:var(--card);border:1px solid var(--line);padding:6px 14px;font-size:12.5px;backdrop-filter:blur(10px)}
+.pill{background:var(--card);border:1px solid var(--line);padding:6px 14px;font-size:12.5px}
 nav{border-bottom:0;gap:6px;padding:0 20px 8px}
 nav button{border:1px solid transparent;border-radius:12px;padding:8px 16px;transition:.15s}
 nav button:hover{background:var(--card);border-color:var(--line)}
 nav button.on{background:linear-gradient(135deg,rgba(124,92,255,.28),rgba(34,211,238,.12));border-color:rgba(124,92,255,.5);color:var(--tx)}
-.card{border-radius:18px;backdrop-filter:blur(14px);background:color-mix(in srgb,var(--card) 82%,transparent);box-shadow:0 10px 40px rgba(0,0,0,.28)}
+.card{border-radius:18px;background:color-mix(in srgb,var(--card) 82%,transparent);box-shadow:0 10px 40px rgba(0,0,0,.28)}
 :root[data-theme="light"] .card{box-shadow:0 10px 30px rgba(40,50,120,.12)}
 h2{font-size:15px}
 button,input,select{border-radius:11px;transition:.15s}
@@ -29998,6 +30207,7 @@ function jobOf(a){const js=(S.jobs||[]).filter(j=>j.account===a.id);return js[js
 function stepper(j){const cur=Math.max(0,STAGES.indexOf(j.stage)),fin=j.done&&j.ok;
 return '<ol class="steps">'+STAGES.map((s,i)=>{let c=fin||i<cur?'done':(i==cur?(j.done?'bad':'cur'):'');return `<li class="${c}"><i>${c=='done'?'✓':(c=='bad'?'✕':i+1)}</i><div>${esc(t('st_'+s))}</div></li>`}).join('')+'</ol>'}
 function failHint(e){e=String(e||'');if(/verification step|human check|not completed in time/i.test(e))return t('h_check');if(/closed|TargetClosed/i.test(e))return t('h_closed');return t('h_generic')}
+async function delProfileOld(id){if(!confirm('حذف پروفایل و همه‌ی اکانت‌هایش؟ / Delete this profile and all its accounts?'))return;try{await api('personal-chrome/profiles/'+encodeURIComponent(id),'DELETE');location.reload()}catch(e){alert(e.message)}}
 function profileOptions(current){const ps=S.pc_profiles||[];return `<option value="">${esc(t('profile_any'))}</option>`+ps.map(p=>`<option value="${esc(p.id)}" ${current===p.id?'selected':''}>${esc(p.name)}${p.connected?' · '+esc(t('profile_connected')):''}</option>`).join('')+(current&&!ps.some(p=>p.id===current)?`<option value="${esc(current)}" selected>${esc(current)} · ${esc(t('profile_disconnected'))}</option>`:'')}
 function accCard(a){const j=jobOf(a),run=j&&!j.done,fail=j&&j.done&&!j.ok&&a.state!=='ready',att=run&&j.attention&&j.attention.kind?j.attention:null;
 let s;if(run)s=att?'needs_you':'learning';else if(a.human)s='needs_you';else if(fail)s='failed';else if(a.state==='ready')s=a.cooling?'cooling':'ready';else if(a.state==='login_required')s='needs_login';else if(a.state==='needs_learning')s='needs_learning';else if(a.state==='learning')s='learning';else s=a.state||'learning';
@@ -30025,7 +30235,7 @@ function togDet(el){const id=el.dataset.id;if(el.open)openDet.add(id);else openD
 function render(){if(!S)return;$('st').textContent=t('running')+S.port;$('sts').textContent=S.stats.requests+' requests · '+S.stats.errors+' '+t('errors');
 $('acc').innerHTML=S.accounts.map(accCard).join('')||`<div class="card mut">${esc(t('no_acc'))}</div>`;
 const profiles=S.pc_profiles||[];$('pc_profile_status').textContent=profiles.length?profiles.map(p=>`${p.name}: ${p.connected?t('profile_connected'):t('profile_disconnected')}`).join(' · '):t('profile_none');
-$('pc_profiles_list').innerHTML=profiles.map(p=>`<div class="pool-item"><b>${esc(p.name)}</b><span class="mut ltr">${esc(p.id.slice(0,12))}</span><span class="b ${p.connected?'ready':'learning'}">${esc(t(p.connected?'profile_connected':'profile_disconnected'))}</span></div>`).join('')||`<p class="mut">${esc(t('profile_none'))}</p>`;
+$('pc_profiles_list').innerHTML=profiles.map(p=>`<div class="pool-item"><b>${esc(p.name)}</b><span class="mut ltr">${esc(p.id.slice(0,12))}</span><span class="b ${p.connected?'ready':'learning'}">${esc(t(p.connected?'profile_connected':'profile_disconnected'))}</span><button class="btn" onclick="delProfileOld(${escJ(p.id)})">\u2715</button></div>`).join('')||`<p class="mut">${esc(t('profile_none'))}</p>`;
 const ap=$('account_profile'),oldProfile=ap.value;ap.innerHTML=profileOptions('');if(oldProfile)ap.value=oldProfile;else if(profiles.length)ap.value=profiles[0].id;
 renderStrategy();
 if(!editing){const ks=$('keysel'),cur=ks.value;ks.innerHTML=S.keys.map(k=>`<option value="${esc(k.key)}">${esc(k.label)}</option>`).join('');if(cur)ks.value=cur;
@@ -36677,7 +36887,7 @@ def run_selftest(quick: bool = False) -> int:
         def test_extension_confirms_and_opens_logins_with_fewer_clicks(self) -> None:
             self.assertIn("autoOpenLogins", PC_BACKGROUND_JS)
             self.assertIn("watchLogin(c.account_id", PC_BACKGROUND_JS)
-            self.assertEqual(PC_VERSION, "1.5.0")
+            self.assertEqual(PC_VERSION, "1.6.0")
 
     FAKE_CLAUDE_PY = r'''
 import sys, os, json, subprocess, time
@@ -41461,6 +41671,23 @@ setTimeout(() => process.exit(0), 60000);
             self.assertEqual(self.hub.client_for_token(self.ORIGIN, tok_b), "profile-b")
             self.assertEqual(self.hub.profiles()[1]["name"], "Work")
 
+        def test_auto_pair_window_lets_several_profiles_join_one_after_another(self) -> None:
+            self.assertEqual(self.post("/pc/pair", {"auto": True, "client_id": "aaaa1111"}, origin=self.ORIGIN)[0], 403)                 # no window open: refused
+            self.hub.open_auto_pair(60.0)
+            s1, j1 = self.post("/pc/pair", {"auto": True, "client_id": "aaaa1111", "client_name": "Chrome aaaa1111"}, origin=self.ORIGIN)
+            s2, j2 = self.post("/pc/pair", {"auto": True, "client_id": "bbbb2222", "client_name": "Chrome bbbb2222"}, origin=self.ORIGIN)
+            self.assertEqual((s1, s2), (200, 200))                                                                                       # 1.6: the window stays open after the first one
+            self.assertEqual((j1["name"], j2["name"]), ("Chrome 1", "Chrome 2"))
+            self.assertEqual(len(self.hub.profiles()), 2)
+            self.hub.auto_until = 0.0
+            self.assertEqual(self.post("/pc/pair", {"auto": True, "client_id": "cccc3333"}, origin=self.ORIGIN)[0], 403)
+
+        def test_setup_card_is_two_copy_steps_and_the_popup_adds_a_tab_in_one_click(self) -> None:
+            for needle in ('id="urlCopy"', 'id="pathCopy"', 'id="xLive"', "copyText('chrome://extensions')", "armExt", "chromeLive"):
+                self.assertIn(needle, DASHBOARD2_HTML, needle)
+            self.assertNotIn('id="chromePair"', DASHBOARD2_HTML)
+            self.assertIn("confirmed", PC_BACKGROUND_JS)
+            self.assertIn("window.close()", PC_POPUP_JS)
 
         def test_pairing_rules(self) -> None:
             code = self.hub.new_pairing()
