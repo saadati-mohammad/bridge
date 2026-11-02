@@ -28,6 +28,14 @@ PERSONAL CHROME (7.24)
   talks to the extension over an authenticated loopback channel (pinned extension origin + token), and Chrome shows its own "is debugging this browser" bar while a tab is inspected.
   `python bridge.py --pc-status` prints what is and is not equivalent to the old Playwright browser. BRIDGE_BROWSER=playwright selects the old separate browser explicitly; nothing falls back to it silently.
 
+CLAUDE CODE FIDELITY (7.93)
+  7.93: closer to the real Anthropic API for Claude Code. Streams send `ping` every `sse_ping_seconds` (10) while the site is still generating (the stream starts at the first ping; before that an error is still a real
+  HTTP status); stop_reason is end_turn | tool_use | max_tokens | stop_sequence; usage always carries the four official counters and count_tokens uses the SAME estimator; every answer has `request-id`,
+  429/529 carry `retry-after` and `x-should-retry`; server-side tool types (web_search_*, ...) are kept out of the prompt (logged once), tool_choice none / disable_parallel_tool_use are honoured, bad bodies are a 400.
+  Tools: `tools_per_turn_max` 64, Task / TodoWrite / WebFetch ... are core and never hidden; Read results the model must copy from (Edit) are never cut; the Edit pre-check refuses only what this request's own history
+  proves impossible (a missing Read after a compaction is NOT proof). Client disconnect (ESC) cancels the generation at once; the advisor queues behind the owner's requests (same rotation / gap rules);
+  Claude Code's topic-detection and max_tokens=1 probes are answered locally; the launcher also sets ANTHROPIC_SMALL_FAST_MODEL and DISABLE_TELEMETRY; settings show a one-line compatibility status (GET /api/compat).
+
 CLAUDE CODE AS THE REPAIR AGENT (7.89) + ITS OWN BRAIN AND FINDINGS (7.90)
   7.90: `agent_backend` (auto | bridge | own) decides which MODEL the advisor's Claude Code thinks with. bridge = the accounts connected to this bridge (internal key `advisor`, no separate sign-in, nothing
   shared with the owner's own Claude Code); own = its own sign-in / agent_api_key; auto = own when it has one and it did not just fail, otherwise bridge. The agent's own traffic never starts a repair
@@ -198,7 +206,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.90"
+VERSION = "7.93"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -855,8 +863,11 @@ class Config:
         "precheck": True,                    # 7.71: refuse an Edit that provably cannot work, using what this request's history already read / changed
         "precheck_fs": False,                # 7.71: also look for the file on the local disk (only meaningful when the bridge runs on the machine that holds the project)
         "fix_retries": 2,                    # 7.71: how many times a bad tool call is sent back to the model with the exact error
-        "tools_per_turn_max": 16,            # 7.71: more tools than this -> only the relevant ones are shown in full (0 = always all)
-        "tools_core": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "MultiEdit"],     # 7.71: always shown in full
+        "tools_per_turn_max": 64,            # 7.71: more tools than this -> only the relevant ones are shown in full (0 = always all); 7.93: 16 -> 64 so a normal Claude Code session (with MCP tools) hides nothing
+        "tools_core": ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "MultiEdit", "Task", "TodoWrite", "WebFetch", "WebSearch", "NotebookEdit", "BashOutput", "KillShell", "ExitPlanMode", "Skill", "SlashCommand"],     # 7.71: always shown in full (7.93: never hidden, even above the cap)
+        "sse_ping_seconds": 10,              # 7.93: `ping` event interval while the site is still generating (0 = off)
+        "read_result_limit": 120000,         # 7.93: a Read result (file text the model must copy from for Edit) is never reduced below this many chars; above it only a vault reference with clear markers is shown
+        "disconnect_watch": True,            # 7.93: a closed client connection (ESC) cancels the upstream generation at once
         "tool_format": "auto",               # 7.71: auto (fenced for browser chats, tag otherwise) | fenced | tag | dsml
         "tool_format_by_host": {"deepseek": "dsml"},      # 7.71: substring of a site's host -> the markup its model was trained on
         "replay_record": True,               # 7.71: keep credential-masked real replies for `--replay`
@@ -991,6 +1002,13 @@ class Config:
         self.store = store
         self.data = dict(self.DEFAULTS)
         self.data.update(store.read("config.json", {}, critical=True) or {})
+        if not self.data.get("_tools_cap_793"):                          # 7.93: the old default (16) hid tools in normal sessions; a value the owner chose on purpose is kept
+            if int(self.data.get("tools_per_turn_max") or 0) == 16:
+                self.data["tools_per_turn_max"] = self.DEFAULTS["tools_per_turn_max"]
+            have_ = [str(x) for x in (self.data.get("tools_core") or [])]
+            if have_ == ["Bash", "Read", "Edit", "Write", "Glob", "Grep", "MultiEdit"]:
+                self.data["tools_core"] = list(self.DEFAULTS["tools_core"])
+            self.data["_tools_cap_793"] = True
         if not self.data.get("admin_key"):
             self.data["admin_key"] = "adm-" + secrets.token_urlsafe(24)
         if not self.data["keys"]:
@@ -7690,31 +7708,41 @@ class BreakerBoard:
 
 
 class Limiter:
-    """Per-account concurrency gate whose limit follows the account's CURRENT tier."""
+    """Per-account concurrency gate whose limit follows the account's CURRENT tier. 7.93: waiters are served first-come-first-served inside a priority (0 = the owner,
+    1 = the advisor); a lower-priority waiter never overtakes a higher-priority one, so the advisor queues behind the owner's requests."""
 
     def __init__(self, limit: int):
         self.limit, self.n, self.cv = max(1, limit), 0, threading.Condition()
+        self.waiting: List[Tuple[int, int]] = []
+        self.ticket = 0
 
     def set_limit(self, limit: int) -> None:
         with self.cv:
             self.limit = max(1, limit)
             self.cv.notify_all()
 
-    def acquire(self, timeout: Optional[float] = None) -> bool:
+    def acquire(self, timeout: Optional[float] = None, prio: int = 0) -> bool:
         end = None if timeout is None else time.monotonic() + timeout
         with self.cv:
-            while self.n >= self.limit:
-                rem = None if end is None else end - time.monotonic()
-                if rem is not None and rem <= 0:
-                    return False
-                self.cv.wait(rem)
-            self.n += 1
-            return True
+            self.ticket += 1
+            me = (int(prio), self.ticket)
+            self.waiting.append(me)
+            try:
+                while self.n >= self.limit or min(self.waiting) != me:
+                    rem = None if end is None else end - time.monotonic()
+                    if rem is not None and rem <= 0:
+                        return False
+                    self.cv.wait(rem)
+                self.n += 1
+                return True
+            finally:
+                self.waiting.remove(me)
+                self.cv.notify_all()
 
     def release(self) -> None:
         with self.cv:
             self.n = max(0, self.n - 1)
-            self.cv.notify()
+            self.cv.notify_all()
 
 
 # ============================================================================
@@ -18397,6 +18425,8 @@ class NormReq:
         self.system, self.messages, self.tools, self.tool_choice = system, messages, tools, tool_choice or {}
         self.stream, self.max_tokens, self.model, self.fmt = stream, max_tokens, model, fmt
         self.params: Dict[str, Any] = {}
+        self.no_parallel = False                       # 7.93: tool_choice.disable_parallel_tool_use
+        self.unsupported_tools: List[str] = []         # 7.93: server-side tool types that were kept out of the prompt
         self.variant_native = ""                       # set by the router: provider-native id of the selected variant ("" = account default)
         self.task_id = ""                              # D5: canonical task id (independent of account/route/model)
         self.task_base = ""                            # D7: hash of the whole request history; a retry of the same request has the same base
@@ -18430,16 +18460,57 @@ def _params(d: Dict[str, Any]) -> Dict[str, Any]:
     return {k: d[k] for k in PARAM_KEYS if k in d and d[k] is not None}
 
 
+_UNSUPPORTED_LOGGED: Set[str] = set()
+
+
+def _is_server_tool(t: Dict[str, Any]) -> bool:
+    """7.93: Anthropic-defined / server-side tools (web_search_20250305, code_execution_*, ...) carry a `type` and no input_schema: the web account cannot run them."""
+    ty = t.get("type")
+    return isinstance(ty, str) and ty not in ("", "custom") and not t.get("input_schema")
+
+
+def _note_unsupported(kinds: List[str]) -> None:
+    for k in kinds:
+        if k not in _UNSUPPORTED_LOGGED:
+            _UNSUPPORTED_LOGGED.add(k)
+            log(f"unsupported (ignored, kept out of the prompt): server-side tool type '{k}'", "warn")
+
+
+def _as_int(v: Any, default: int) -> int:
+    try:
+        n = int(v)
+        return n if n > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
 def normalize_anthropic(d: Dict[str, Any]) -> NormReq:
+    if not isinstance(d.get("messages"), list) or not d["messages"]:
+        raise ValueError("messages: at least one message is required")             # 7.93: the official API answers 400 invalid_request_error
     sysv = d.get("system", "")
     if isinstance(sysv, list):
         sysv = "\n".join(str(b.get("text", "")) for b in sysv if isinstance(b, dict))
-    msgs = [{"role": m.get("role", "user"), "content": _blocks(m.get("content"))} for m in d.get("messages") or []]
-    tools = {t["name"]: {"description": t.get("description", ""), "input_schema": t.get("input_schema") or {}}
-             for t in d.get("tools") or [] if isinstance(t, dict) and t.get("name")}
-    r = NormReq(str(sysv), msgs, tools, d.get("tool_choice"), bool(d.get("stream")), int(d.get("max_tokens") or 4096),
-                str(d.get("model", "")), "anthropic")
+    msgs = [{"role": m.get("role", "user"), "content": _blocks(m.get("content"))} for m in d.get("messages") or [] if isinstance(m, dict)]
+    tools: Dict[str, Dict[str, Any]] = {}
+    skipped: List[str] = []
+    for t in d.get("tools") or []:
+        if not isinstance(t, dict) or not t.get("name"):
+            continue
+        if _is_server_tool(t):
+            skipped.append(str(t.get("type")))
+            continue
+        tools[t["name"]] = {"description": t.get("description", ""), "input_schema": t.get("input_schema") or {}}
+    _note_unsupported(skipped)
+    tc = d.get("tool_choice")
+    if isinstance(tc, str):
+        tc = {"type": tc}
+    tc = tc if isinstance(tc, dict) else None
+    if tc and tc.get("type") == "none":
+        tools = {}                                                   # 7.93: tool_choice none = the model may not call tools: it is not told about any
+    r = NormReq(str(sysv), msgs, tools, tc, bool(d.get("stream")), _as_int(d.get("max_tokens"), 4096), str(d.get("model", "")), "anthropic")
     r.params = _params(d)
+    r.no_parallel = bool(tc and tc.get("disable_parallel_tool_use"))
+    r.unsupported_tools = skipped
     return r
 
 
@@ -18490,7 +18561,7 @@ def normalize_openai(d: Dict[str, Any]) -> NormReq:
 def _result_text(b: Dict[str, Any]) -> str:
     v = b.get("content", "")
     if isinstance(v, list):
-        return "\n".join(str(x.get("text", "")) if isinstance(x, dict) else str(x) for x in v if not (isinstance(x, dict) and x.get("type") == "image"))
+        return "\n".join(("[image omitted: this web account cannot receive images]" if (isinstance(x, dict) and x.get("type") == "image") else (str(x.get("text", "")) if isinstance(x, dict) else str(x))) for x in v)
     return str(v if v is not None else "")
 
 
@@ -19529,6 +19600,7 @@ def build_session_facts(messages: List[Dict[str, Any]]) -> Dict[str, Dict[str, A
                 elif kind == "bash" and _mutating_cmd(str(inp.get("command", ""))):
                     for f in files.values():
                         f["stale"] = True
+                        f["missing"] = False                              # 7.93: a shell command may have created a file an earlier Read found missing
     return files
 
 
@@ -19561,16 +19633,17 @@ def _check_edit_call(name: str, args: Dict[str, Any], kind: str, facts: Dict[str
     if f is not None and f.get("missing"):
         return f"tool '{name}': {path} does not exist (an earlier Read in this session said so). Check the path (Glob / ls) or create it with Write."
     if f is None:
+        # 7.93: NOT having seen a Read proves nothing (the Read may sit before a compaction / --resume / another conversation): Claude Code validates "read first" by itself.
         if fs_check and os.path.isabs(path) and not os.path.exists(path) and os.path.isdir(os.path.dirname(path)):
             return f"tool '{name}': {path} does not exist on this machine. Check the path or create the file with Write."
-        if has_read_tool:
-            return f"tool '{name}': {path} has not been read in this session. Read it first, then edit it."
         return ""
     if f.get("stale") or not f.get("full") or not isinstance(f.get("content"), str):
         return ""                                                         # not sure what the file looks like now: let Claude Code be the judge
     content = f["content"]
     for i, (old, _new, ra) in enumerate(pairs):
         c = content.count(old)
+        if c == 0 and _loosely_present(content, old):
+            return ""                                                     # 7.93: differs only in line ends / trailing blanks / tabs (the Read view normalises them): the real tool decides
         where = f" (edit {i + 1} of {len(pairs)})" if kind == "multiedit" else ""
         if c == 0:
             return (f"tool '{name}': old_string{where} was not found in {path} as it was last read in this session.{_closest_hint(content, old)} "
@@ -19579,6 +19652,13 @@ def _check_edit_call(name: str, args: Dict[str, Any], kind: str, facts: Dict[str
             return f"tool '{name}': old_string{where} appears {c} times in {path}. Add surrounding lines so it is unique, or set replace_all to true."
         content = content.replace(old, pairs[i][1]) if ra else content.replace(old, pairs[i][1], 1)
     return ""
+
+
+def _loosely_present(content: str, old: str) -> bool:
+    def norm(s: str) -> str:
+        return "\n".join(x.rstrip().replace("\t", "    ") for x in s.replace("\r\n", "\n").replace("\r", "\n").split("\n"))
+    n_old = norm(old).strip("\n")
+    return bool(n_old) and n_old in norm(content)
 
 
 def _note_batch(name: str, args: Dict[str, Any], batch: Dict[str, str]) -> None:
@@ -19671,6 +19751,7 @@ def select_tools(req: Any, cfg: Any, shown_before: Optional[Iterable[str]] = Non
         s += 5.0 if n in before else 0.0
         score[n] = s
     keep = set(sorted(order, key=lambda n: (-score[n], order.index(n)))[:maxn])
+    keep |= {n for n in order if n.lower() in core} | {n for n in forced if n}      # 7.93: Task, TodoWrite, Edit, Write, Read, Bash ... are never hidden, even when they are more than the cap
     return {n: tools[n] for n in order if n in keep}, {n: tools[n] for n in order if n not in keep}
 
 
@@ -20076,6 +20157,13 @@ def reliability_report(app: Any) -> Dict[str, Any]:
 _TL = threading.local()
 
 
+def _set_read_limit(cfg: Any) -> None:
+    try:
+        _TL.read_limit = int(cfg["read_result_limit"] or 120000)
+    except Exception:
+        _TL.read_limit = 120000
+
+
 def render_message(m: Dict[str, Any], rlimit: int, names: Dict[str, str], ctx: Optional[ContextCtx] = None) -> str:
     role = m["role"].upper()
     parts = []
@@ -20096,7 +20184,7 @@ def render_message(m: Dict[str, Any], rlimit: int, names: Dict[str, str], ctx: O
             body = _result_text(b)
             tid = b.get("tool_use_id", "")
             if ctx is None:
-                body = trim_middle(body, rlimit)
+                body = body if _tool_kind(nm, {"file_path": "x"}) == "read" else trim_middle(body, rlimit)
             else:
                 h = sha(body.strip())
                 if len(body) >= 600 and h in ctx.seen and ctx.seen[h] != tid and ctx.idx not in ctx.protect:
@@ -20107,7 +20195,11 @@ def render_message(m: Dict[str, Any], rlimit: int, names: Dict[str, str], ctx: O
                     lim = rlimit
                     if ctx.idx in ctx.protect:
                         lim = max(rlimit, 60000)
+                    if _tool_kind(nm, {"file_path": "x"}) == "read":      # 7.93: file text the model must copy from (Edit) is never cut to an excerpt
+                        lim = max(lim, int(getattr(_TL, "read_limit", 0) or 120000))
                     new, info = shrink_result(body, lim, ctx.terms)
+                    if info and _tool_kind(nm, {"file_path": "x"}) == "read":
+                        new = f"[bridge: this Read result ({info['chars_before']} chars) is too large to show here; it is NOT repeated. Read the file again with offset / limit to see exact lines.]"
                     if info:
                         ref = ctx.vault.put(body) if ctx.vault is not None else ""
                         info.update({"message": ctx.idx, "id": tid, "ref": ref})
@@ -20119,6 +20211,8 @@ def render_message(m: Dict[str, Any], rlimit: int, names: Dict[str, str], ctx: O
             parts.append(f"[TOOL_RESULT {nm} id={tid}{err}]\n{neutralise(body)}")
         elif t == "image":
             parts.append("[image omitted]")
+        elif t == "document":
+            parts.append("[document omitted]")
     return f"[{role}]\n" + "\n".join(p for p in parts if p)
 
 
@@ -20201,6 +20295,7 @@ def plan_context(req: "NormReq", cfg: "Config", vault: Optional[ResultVault] = N
     ctx = ContextCtx(vault, terms)
     ctx.protect = {len(msgs) - 1}
     rl = int(cfg["result_limit"])
+    _set_read_limit(cfg)
     rendered: List[str] = []
     for i, m in enumerate(msgs):
         ctx.idx = i
@@ -20259,6 +20354,7 @@ def build_prompt(req: NormReq, cfg: Config, fenced: bool, delta_from: Optional[i
             if b.get("type") == "tool_use":
                 names[b.get("id", "")] = b.get("name", "")
     rl = int(cfg["result_limit"])
+    _set_read_limit(cfg)
     if delta_from is not None:
         last_user = next((" ".join(str(b.get("text", "")) for b in m["content"] if b.get("type") == "text") for m in reversed(req.messages) if m["role"] == "user"), "")
         ctx = ContextCtx(vault, key_terms(last_user))
@@ -25494,7 +25590,7 @@ class Router:
         last: Optional[BridgeError] = None
         last_route: Optional[Tuple[str, str, str]] = None           # (account id, variant id, route id) of the failed attempt
         rid = str((meta or {}).get("request_id") or "req_" + uuid.uuid4().hex[:16])
-        conv_key = sha(scope + req.system + "".join(b.get("text", "") for m in req.messages[:1] for b in m["content"] if b.get("type") == "text"))[:16]
+        conv_key = conv_key_for(scope, req)
         first_fallback = False
         last_cat, last_scope = "", ""
         auto_tries = 0
@@ -25546,10 +25642,11 @@ class Router:
             req.handoff = (self._t(self.tasks.handoff_note, tid, sel_route, acct["label"]) or "") if tid else ""      # D6: only for a route that has not served this task
             sem = self.acc.sem(acct)
             probe_s = float(self.cfg["queue_probe_seconds"] or 0)
+            _prio = 1 if scope == "advisor" else 0                    # 7.93: the advisor queues behind the owner's requests (same rotation / gap rules)
             if busy_force or probe_s <= 0:
-                got_sem = sem.acquire(self.cfg["queue_wait_seconds"])
+                got_sem = sem.acquire(self.cfg["queue_wait_seconds"], _prio)
             else:
-                got_sem = sem.acquire(probe_s)
+                got_sem = sem.acquire(probe_s, _prio)
                 if not got_sem:                                       # 7.81: this account is busy: look for a free one first
                     self.acc.breakers.release(acct["id"], vid)
                     self.engine.finish(dec, "skipped:busy")
@@ -26269,6 +26366,9 @@ class Router:
                            precheck_rejects=pre_n, marker_expected=bool(flags.get("marker_expected")), marker_seen=bool(flags.get("marker_seen")), net_used=bool(flags.get("net_used")),
                            net_streams=int(flags.get("net_streams") or 0), end_via=str(flags.get("end_via") or ""), seconds=time.monotonic() - t_run0,
                            format=detect_tool_format(text) if (first_n or first_problems) else "", error=(problems[0] if problems and not calls else ""))
+        if getattr(req, "no_parallel", False) and len(calls) > 1:       # 7.93: tool_choice.disable_parallel_tool_use: ONE call per turn
+            log(f"disable_parallel_tool_use: delivering 1 of {len(calls)} tool calls", "debug")
+            calls = calls[:1]
         self.bump("chars_out", len(text))
         if use_cont:
             ne = ConvEntry(conv, sigs + [outcome_sig(clean, calls)], tsig, ssig, "uncertain", 1)
@@ -26305,6 +26405,81 @@ SECURITY_HEADERS = {
 
 def anthropic_error(kind: str, msg: str) -> Dict[str, Any]:
     return {"type": "error", "error": {"type": kind, "message": msg}}
+
+
+def conv_key_for(scope: str, req: Any) -> str:
+    """7.93: the identity of a conversation: who asks (scope) + the system prompt + the FIRST message. A Task-tool subagent has its own system prompt, so it gets its own key (its own remote chat);
+    --resume / --continue replay the same first message, so they keep the key; later messages never change it."""
+    return sha(scope + req.system + "".join(b.get("text", "") for m in req.messages[:1] for b in m["content"] if b.get("type") == "text"))[:16]
+
+
+def local_shortcut(req: Any) -> Optional[Tuple[str, str]]:
+    """7.93: Claude Code's own housekeeping calls that need NO browser turn -> (kind, answer text). Anything else (and anything with tools) goes to the model."""
+    if getattr(req, "fmt", "") != "anthropic" or req.tools:
+        return None
+    msgs = req.messages
+    first = "".join(b.get("text", "") for m in msgs[:1] for b in m["content"] if b.get("type") == "text").strip().lower()
+    one_user = len(msgs) == 1 and msgs[0]["role"] == "user"
+    if one_user and first == "quota":
+        return "quota-probe", "OK"
+    if one_user and req.max_tokens <= 8 and first in ("ping", "test", "hi", "hello", "hey", "."):
+        return "quota-probe", "OK"                                    # the same connectivity / quota probe with another word: a one-token answer, nothing to think about
+    sysl = req.system.lower()
+    if "title" in sysl and ("sentence-case" in sysl or "sentence case" in sysl) and "json" in sysl:
+        first_txt = "".join(b.get("text", "") for m in msgs for b in m["content"] if m["role"] == "user" and b.get("type") == "text")
+        words = re.sub(r"<[^>]+>", " ", first_txt).split()[:6]
+        return "title", json.dumps({"title": " ".join(words).capitalize() or "New chat"})
+    if "isnewtopic" in (sysl + " " + first) and "title" in (sysl + " " + first) and "json" in (sysl + " " + first):
+        return "topic", json.dumps({"isNewTopic": False, "title": None})   # 'not a new topic' changes nothing in the client and costs no turn
+    return None
+
+
+def compat_status() -> Dict[str, Any]:
+    """7.93: what this bridge supports / ignores for Claude Code (one line for the settings page; GET /api/compat)."""
+    supported = ["streaming (SSE + ping)", "tool_use incl. parallel", "tool_choice", "stop_reason", "usage + count_tokens", "429 / 529 + retry-after", "/v1/models (opus / sonnet / haiku)"]
+    ignored = ["thinking (never invented)", "cache_control (cache counters 0)", "metadata", "top_k", "context_management", "anthropic-beta / -version", "server-side tools (web_search_*)"]
+    limits = ["images and documents are not sent to the site (marked as omitted)", "extended thinking is not available through a web chat"]
+    return {"supported": supported, "ignored": ignored, "limits": limits,
+            "line": "Claude Code compatibility - supported: " + ", ".join(supported) + ". Ignored: " + ", ".join(ignored) + ". Not possible: " + "; ".join(limits) + "."}
+
+
+def req_in_tokens(req: "NormReq") -> int:
+    """7.93: THE input-token estimate. /v1/messages usage and /v1/messages/count_tokens both use it, so Claude Code's context meter and auto-compact agree with the count it asked for."""
+    return est_tokens(req.system + jdump([m["content"] for m in req.messages]) + jdump(req.tools))
+
+
+def usage_block(in_tok: int, out_tok: int) -> Dict[str, int]:
+    return {"input_tokens": int(in_tok), "output_tokens": int(out_tok), "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+
+
+def stop_sequences_of(req: Any) -> List[str]:
+    p = getattr(req, "params", None) or {}
+    v = p.get("stop_sequences") or p.get("stop")
+    if isinstance(v, str):
+        v = [v]
+    return [s for s in v if isinstance(s, str) and s][:8] if isinstance(v, list) else []
+
+
+def text_char_cap(req: Any) -> int:
+    """7.93: the character budget that max_tokens means for a text-only answer (same 3.6 chars/token as est_tokens). With tools and a normal max_tokens nothing is cut (a tool call must never be cut)."""
+    mt = int(getattr(req, "max_tokens", 0) or 0)
+    return int(mt * 3.6) if (mt > 0 and (not getattr(req, "tools", None) or mt < 1024)) else 0
+
+
+def shape_text(req: Any, text: str, has_calls: bool) -> Tuple[str, str, Optional[str]]:
+    """(text, stop_reason, stop_sequence) of a finished, NON-streamed answer: end_turn | tool_use | max_tokens | stop_sequence."""
+    reason, seq = "end_turn", None
+    stops = stop_sequences_of(req)
+    hits = [(text.find(s), s) for s in stops if s in text]
+    if hits:
+        i, s = min(hits)
+        text, reason, seq = text[:i], "stop_sequence", s
+    cap = text_char_cap(req)
+    if cap and len(text) > cap:
+        text, reason, seq = text[:cap], "max_tokens", None
+    if has_calls:
+        reason, seq = "tool_use", None
+    return text, reason, seq
 
 
 def http_error_parts(e: BridgeError) -> Tuple[int, str]:
@@ -26510,7 +26685,7 @@ def open_workspace_tool(app_name: str, folder: str, port: int, api_key: str, mod
         if not api_key:
             raise BridgeError("select an API key for Claude Code first", "client", 400)
         env.update(ANTHROPIC_BASE_URL=f"http://127.0.0.1:{int(port)}", ANTHROPIC_API_KEY=api_key,
-                   ANTHROPIC_MODEL="sonnet", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
+                   ANTHROPIC_MODEL="sonnet", ANTHROPIC_SMALL_FAST_MODEL="haiku", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1", DISABLE_TELEMETRY="1")
         # Do not set ANTHROPIC_DEFAULT_{SONNET,OPUS,HAIKU}_MODEL to the aliases
         # themselves. Claude Code treats those as pinned model IDs for a gateway;
         # self-pinning `sonnet` caused v2.1.304 to warn that the model was unknown.
@@ -26630,7 +26805,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("content-type", "application/json; charset=utf-8")
         self.send_header("content-length", str(len(b)))
-        for k, v in (extra or {}).items():
+        hdrs_ = dict(extra or {})
+        if not any(k_.lower() == "request-id" for k_ in hdrs_) and getattr(self, "_rid", ""):
+            hdrs_["request-id"] = self._rid
+        for k, v in hdrs_.items():
             self.send_header(k, v)
         self.end_headers()
         self.wfile.write(b)
@@ -26682,7 +26860,7 @@ class Handler(BaseHTTPRequestHandler):
     @staticmethod
     def bridge_headers(meta: Optional[Dict[str, Any]], req: Optional["NormReq"] = None) -> Dict[str, str]:
         meta = meta or {}
-        h = {"x-bridge-request-id": str(meta.get("request_id", "")), "x-bridge-usage": "estimated"}
+        h = {"x-bridge-request-id": str(meta.get("request_id", "")), "x-bridge-usage": "estimated", "request-id": str(meta.get("request_id", ""))}
         if meta.get("account"):
             h["x-bridge-account"] = str(meta["account"])
             h["x-bridge-tier"] = str(meta.get("tier", ""))
@@ -26707,13 +26885,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def _fail(self, e: BridgeError, openai: bool = False, meta: Optional[Dict[str, Any]] = None) -> None:
         code, kind = http_error_parts(e)
-        extra: Dict[str, str] = {"retry-after": str(int(max(e.retry_after, 1)))} if e.kind == "rate_limit" else {}
+        extra: Dict[str, str] = {}
+        if e.kind == "rate_limit" or code in (429, 529) or (code >= 500 and getattr(e, "retry_after", 0)):
+            extra["retry-after"] = str(int(max(e.retry_after or 0, 5 if code == 529 else 1)))      # 7.93: Claude Code's own retry logic waits this long
+        extra["x-should-retry"] = "true" if (code in (408, 409, 429) or code >= 500) else "false"
         extra.update(self.bridge_headers(meta))
         info = e.info or classify_error(e)                             # D1: every failure answer says what it was, how sure we are, and whether retrying can help
         extra.update({"x-bridge-error-category": info.category, "x-bridge-error-scope": info.scope, "x-bridge-retryable": "true" if info.retryable else "false"})
         if info.outcome_uncertain:
             extra["x-bridge-outcome"] = "uncertain"                   # D4: the request may have been processed; the bridge did not resend it
         body = {"error": {"message": str(e), "type": kind, "code": e.kind}} if openai else anthropic_error(kind, str(e))
+        if not openai:
+            body["request_id"] = (meta or {}).get("request_id") or getattr(self, "_rid", "")
         body["x_bridge"] = {"error": info.public()}
         log_kv(f"request FAILED: {str(e)[:400]}", "error" if code >= 500 else "warn", http=code, req=(meta or {}).get("request_id"), category=info.category, scope=info.scope,
                retryable=info.retryable, confidence=info.confidence, auth=("yes" if getattr(info, "auth_implicated", False) else ""),
@@ -26741,6 +26924,7 @@ class Handler(BaseHTTPRequestHandler):
     def _dispatch(self, method: str) -> None:
         t0 = time.time()
         self._st, self._rh, self._note = 0, {}, ""
+        self._rid = "req_" + uuid.uuid4().hex[:16]                  # 7.93: one id per request: the `request-id` header, the error body and the log all carry it
         self._body_read = False
         try:
             self._dispatch_inner(method)
@@ -26826,6 +27010,13 @@ class Handler(BaseHTTPRequestHandler):
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             data = [{"type": "model", "object": "model", "id": e["id"], "display_name": e["display_name"], "created_at": "1970-01-01T00:00:00Z",
                      "created": 0, "owned_by": "bridge", "x_bridge": e["x_bridge"]} for e in lst["data"]]
+            have_ = {d["id"] for d in data}
+            for fam_, disp_ in (("opus", "Claude Opus"), ("sonnet", "Claude Sonnet"), ("haiku", "Claude Haiku")):      # 7.93: Claude-style ids, all mapped to the bridge routes (/model, ANTHROPIC_MODEL, ANTHROPIC_SMALL_FAST_MODEL)
+                for mid_, dn_ in ((fam_, f"{disp_} (alias -> bridge routes)"), (f"claude-{fam_}-4-5", f"{disp_} 4.5 (-> bridge routes)")):
+                    if mid_ not in have_:
+                        data.append({"type": "model", "object": "model", "id": mid_, "display_name": dn_, "created_at": "2025-01-01T00:00:00Z", "created": 0, "owned_by": "bridge",
+                                     "max_input_tokens": 200000, "max_tokens": 64000, "x_bridge": {"kind": "client_alias", "maps_to": "the bridge's default routing (client_model_prefixes)"}})
+                        have_.add(mid_)
             ids = [d["id"] for d in data]
             try:                                                   # Anthropic-style paging; without ?limit the whole list is returned (OpenAI clients never page)
                 lim = int(q["limit"][0]) if q.get("limit") else 0
@@ -26847,36 +27038,58 @@ class Handler(BaseHTTPRequestHandler):
         if method != "POST":
             return self._json(404, {"error": "not found"})
         data = self._body()
+
+        def norm_(fn: Callable[[Dict[str, Any]], "NormReq"]) -> "NormReq":
+            try:
+                return fn(data)
+            except (TypeError, ValueError, AttributeError, KeyError, IndexError) as e_:       # 7.93: a malformed body is the client's mistake (400), never a 500
+                raise BridgeError(f"invalid request body: {type(e_).__name__}: {str(e_)[:120]}", "client", 400)
         if path == "/v1/messages/count_tokens":
-            req = normalize_anthropic(data)
-            return self._json(200, {"input_tokens": est_tokens(req.system + jdump([m["content"] for m in req.messages]) + jdump(req.tools))},
-                              {"x-bridge-usage": "estimated"})
+            return self._json(200, {"input_tokens": req_in_tokens(norm_(normalize_anthropic))}, {"x-bridge-usage": "estimated"})
         if path == "/v1/messages":
-            return self._chat(normalize_anthropic(data), key)
+            return self._chat(norm_(normalize_anthropic), key)
         if path == "/v1/chat/completions":
-            return self._chat(normalize_openai(data), key)
+            return self._chat(norm_(normalize_openai), key)
         self._json(404, {"error": "not found"})
+
+    def _watch_disconnect(self, cancel: threading.Event, stop: threading.Event) -> None:
+        """7.93: ESC / a closed connection cancels the upstream generation at once (the account is freed by the router's own cleanup). Only peeks; never consumes bytes."""
+        sock = getattr(self, "connection", None)
+        if sock is None:
+            return
+
+        def run() -> None:
+            import select
+            while not stop.wait(0.4):
+                try:
+                    r_, _w, _x = select.select([sock], [], [], 0)
+                    if r_ and sock.recv(1, socket.MSG_PEEK) == b"":
+                        cancel.set()
+                        log("client disconnected: cancelling the upstream generation", "info")
+                        return
+                except (OSError, ValueError):
+                    cancel.set()
+                    return
+        threading.Thread(target=run, daemon=True, name="disconnect-watch").start()
 
     def _chat(self, req: NormReq, key: Dict[str, Any]) -> None:
         oa = req.fmt == "openai"
-        in_tok = est_tokens(req.system + jdump([m["content"] for m in req.messages]) + jdump(req.tools))
+        in_tok = req_in_tokens(req)
         cancel = threading.Event()
-        meta: Dict[str, Any] = {"request_id": "req_" + uuid.uuid4().hex[:16]}
-        first = "".join(b.get("text", "") for m in req.messages[:1] for b in m["content"] if b.get("type") == "text").strip().lower()
-        # local shortcut ONLY for Claude Code's exact startup probe: one message that says "quota", no tools
-        if not req.tools and len(req.messages) == 1 and req.messages[0]["role"] == "user" and first == "quota":
-            meta["shortcut"] = "quota-probe"
-            return self._respond(req, Outcome("OK", [], ""), in_tok, None, meta)
-        sysl = req.system.lower()
-        if not req.tools and "title" in sysl and ("sentence-case" in sysl or "sentence case" in sysl) and "json" in sysl:
-            first_txt = "".join(b.get("text", "") for m in req.messages for b in m["content"] if m["role"] == "user" and b.get("type") == "text")
-            words = re.sub(r"<[^>]+>", " ", first_txt).split()[:6]
-            meta["shortcut"] = "title"
-            return self._respond(req, Outcome(json.dumps({"title": " ".join(words).capitalize() or "New chat"}), [], ""), in_tok, None, meta)
+        meta: Dict[str, Any] = {"request_id": getattr(self, "_rid", "") or ("req_" + uuid.uuid4().hex[:16])}
         writer = (OpenAIWriter if oa else AnthropicWriter)(self, req.model, in_tok, meta, req) if req.stream else None
+        sc = local_shortcut(req)                                      # 7.93: housekeeping calls (quota probe, title, topic detection) never use a browser turn
+        if sc is not None:
+            meta["shortcut"] = sc[0]
+            return self._respond(req, Outcome(sc[1], [], ""), in_tok, writer, meta)
         t_chat = time.time()
         log_kv("chat request", "info", req=meta["request_id"], api=("openai" if oa else "anthropic"), model=req.model, stream=req.stream, messages=len(req.messages), tools=len(req.tools or []),
                system_chars=len(req.system or ""), est_in_tokens=in_tok, key=key.get("label") or key.get("id"), pinned_account=key.get("account"))
+        stop_watch = threading.Event()
+        if self.app.cfg["disconnect_watch"]:
+            self._watch_disconnect(cancel, stop_watch)
+        if writer is not None:
+            writer.start_keepalive(float(self.app.cfg["sse_ping_seconds"] or 0))
 
         def emit(t: str) -> None:
             if writer is None:
@@ -26889,13 +27102,21 @@ class Handler(BaseHTTPRequestHandler):
         try:
             out = self.app.router.handle(req, emit, key.get("account", ""), cancel, scope=str(key.get("id", "")), meta=meta)
         except BridgeError as e:
-            if writer is not None and writer.started:
+            started = writer.close_for_error() if writer is not None else False
+            if cancel.is_set():
+                self._note = "client disconnected: the generation was cancelled"
+                return
+            if writer is not None and started:
                 self._note = f"the stream had already started; ended with an error event: {str(e)[:160]}"
                 log_kv(f"stream ended with an ERROR after output had started: {str(e)[:300]}", "error", req=meta["request_id"], kind=e.kind, account=meta.get("account"),
                        route=meta.get("route"), ms=int((time.time() - t_chat) * 1000))
                 writer.error(e)
                 return
             return self._fail(e, oa, meta)
+        finally:
+            stop_watch.set()
+            if writer is not None:
+                writer.stop_keepalive()
         log_kv("chat answered", "info" if (out.text or out.calls) else "warn", req=meta["request_id"], account=meta.get("account"), tier=meta.get("tier"), route=meta.get("route"),
                model=meta.get("model"), fallback=("yes" if meta.get("fallback") == "true" else ""), task=meta.get("task"), cache=meta.get("cache"), out_chars=len(out.text or ""),
                tool_calls=len(out.calls or []), ms=int((time.time() - t_chat) * 1000), note=("" if (out.text or out.calls) else "EMPTY ANSWER (no text, no tool call)"))
@@ -26928,11 +27149,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"id": "chatcmpl-" + uuid.uuid4().hex[:20], "object": "chat.completion", "created": int(now()), "model": req.model,
                                     "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls" if out.calls else "stop"}],
                                     "usage": {"prompt_tokens": in_tok, "completion_tokens": out_tok, "total_tokens": in_tok + out_tok}}, hdr)
-        content: List[Dict[str, Any]] = ([{"type": "text", "text": out.text}] if out.text else []) + \
+        text_, reason_, seq_ = shape_text(req, out.text or "", bool(out.calls))
+        content: List[Dict[str, Any]] = ([{"type": "text", "text": text_}] if text_ else []) + \
             [{"type": "tool_use", "id": c["id"], "name": c["name"], "input": c["input"]} for c in out.calls]
         self._json(200, {"id": "msg_" + uuid.uuid4().hex[:24], "type": "message", "role": "assistant", "model": req.model, "content": content or [{"type": "text", "text": ""}],
-                         "stop_reason": "tool_use" if out.calls else "end_turn", "stop_sequence": None,
-                         "usage": {"input_tokens": in_tok, "output_tokens": out_tok}}, hdr)
+                         "stop_reason": reason_, "stop_sequence": seq_,
+                         "usage": usage_block(in_tok, est_tokens(text_ + jdump(out.calls)))}, hdr)
 
     # -- dashboard API ----------------------------------------------------------------------
     def _api(self, method: str, path: str) -> None:
@@ -26953,6 +27175,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, result_)
         if path == "/api/personal-chrome" and method == "GET":
             return self._json(200, pc_api_status())
+        if path == "/api/compat" and method == "GET":                                            # 7.93: what Claude Code can rely on / what is ignored
+            return self._json(200, compat_status())
         if path == "/api/guard" and method == "GET":                                             # 7.87
             return self._json(200, GUARD.view())
         if path == "/api/guard/prompt" and method == "GET":
@@ -27505,23 +27729,91 @@ class _SSEBase:
         self.h.wfile.write(s.encode("utf-8"))
         self.h.wfile.flush()
 
+    def start_keepalive(self, interval: float) -> None:               # 7.93: only the Anthropic stream has pings
+        return None
+
+    def stop_keepalive(self) -> None:
+        return None
+
+    def close_for_error(self) -> bool:
+        return self.started
+
 
 class AnthropicWriter(_SSEBase):
+    """The official Anthropic SSE order: message_start, [ping], content_block_start / _delta / _stop, message_delta (stop_reason, stop_sequence, usage), message_stop.
+    7.93: `ping` while the site is still generating (the stream - HTTP 200 + message_start - begins at the first ping; before that an error is still a real HTTP status),
+    stop_reason end_turn | tool_use | max_tokens | stop_sequence, the four official usage counters, every write under one lock (the ping thread and the answer never interleave)."""
+
     def __init__(self, h: Handler, model: str, in_tok: int, meta: Optional[Dict[str, Any]] = None, req: Optional[NormReq] = None):
         super().__init__(h, model, in_tok, meta, req)
         self.idx, self.text_open, self.sent = 0, False, ""
+        self.lock = threading.RLock()
+        self.closed, self.truncated, self.stop_hit, self._hold = False, False, "", ""
+        self._ka_stop = threading.Event()
+        self._ka_thread: Optional[threading.Thread] = None
+        self.char_cap = text_char_cap(req) if req is not None else 0
+        self.stops = stop_sequences_of(req) if req is not None else []
 
     def _ev(self, name: str, data: Dict[str, Any]) -> None:
-        self._raw(f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n")
+        with self.lock:
+            self._raw(f"event: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n")
 
     def _start(self) -> None:
-        if not self.started:
-            self._begin()
-            self._ev("message_start", {"type": "message_start", "message": {"id": "msg_" + self.id, "type": "message", "role": "assistant",
-                                                                            "model": self.model, "content": [], "stop_reason": None, "stop_sequence": None,
-                                                                            "usage": {"input_tokens": self.in_tok, "output_tokens": 1}}})
+        with self.lock:
+            if not self.started:
+                self._begin()
+                self._ev("message_start", {"type": "message_start", "message": {"id": "msg_" + self.id, "type": "message", "role": "assistant",
+                                                                                "model": self.model, "content": [], "stop_reason": None, "stop_sequence": None,
+                                                                                "usage": usage_block(self.in_tok, 1)}})
 
-    def text(self, t: str) -> None:
+    # -- keepalive ---------------------------------------------------------------------------
+    def start_keepalive(self, interval: float) -> None:
+        if interval <= 0 or self._ka_thread is not None:
+            return
+
+        def run() -> None:
+            while not self._ka_stop.wait(interval):
+                try:
+                    with self.lock:
+                        if self.closed:
+                            return
+                        self._start()
+                        self._ev("ping", {"type": "ping"})
+                except OSError:
+                    return
+        self._ka_thread = threading.Thread(target=run, daemon=True, name="sse-ping")
+        self._ka_thread.start()
+
+    def stop_keepalive(self) -> None:
+        self._ka_stop.set()
+
+    def close_for_error(self) -> bool:
+        """Stop the pings for good and say whether the stream had already begun (then the error is an `error` event, otherwise a real HTTP status)."""
+        self._ka_stop.set()
+        with self.lock:
+            self.closed = True
+            return self.started
+
+    # -- text --------------------------------------------------------------------------------
+    def _gate(self, t: str, final: bool) -> str:
+        buf = self._hold + t
+        self._hold = ""
+        hits = [(buf.find(s), s) for s in self.stops if s in buf]
+        if hits:
+            i, s = min(hits)
+            self.stop_hit, buf = s, buf[:i]
+        elif self.stops and not final:
+            keep = max(len(s) for s in self.stops) - 1                # a stop sequence may still complete in the next chunk: hold that tail back
+            if keep > 0:
+                self._hold, buf = buf[-keep:], buf[:-keep]
+        if self.char_cap:
+            room = self.char_cap - len(self.sent)
+            if len(buf) > room:
+                buf, self.truncated = buf[:max(0, room)], True
+        return buf
+
+    def _push(self, t: str, final: bool) -> None:
+        t = self._gate(t, final)
         if not t:
             return
         self._start()
@@ -27531,32 +27823,57 @@ class AnthropicWriter(_SSEBase):
         self.sent += t
         self._ev("content_block_delta", {"type": "content_block_delta", "index": self.idx, "delta": {"type": "text_delta", "text": t}})
 
+    def text(self, t: str) -> None:
+        if not t:
+            return
+        with self.lock:
+            if self.closed or self.truncated or self.stop_hit:
+                return
+            self._push(t, False)
+
     def finish(self, out: Outcome) -> None:
-        self._start()
-        _rest = _unsent_tail(out.text, self.sent)
-        if _rest:
-            self.text(_rest)
-        if self.text_open:
-            self._ev("content_block_stop", {"type": "content_block_stop", "index": self.idx})
-            self.idx += 1
-        for c in out.calls:
-            self._ev("content_block_start", {"type": "content_block_start", "index": self.idx,
-                                             "content_block": {"type": "tool_use", "id": c["id"], "name": c["name"], "input": {}}})
-            self._ev("content_block_delta", {"type": "content_block_delta", "index": self.idx,
-                                             "delta": {"type": "input_json_delta", "partial_json": json.dumps(c["input"], ensure_ascii=False)}})
-            self._ev("content_block_stop", {"type": "content_block_stop", "index": self.idx})
-            self.idx += 1
-        if self.idx == 0:
-            self._ev("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
-            self._ev("content_block_stop", {"type": "content_block_stop", "index": 0})
-        self._ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use" if out.calls else "end_turn", "stop_sequence": None},
-                                   "usage": {"output_tokens": est_tokens(out.text + jdump(out.calls))}})
-        self._ev("message_stop", {"type": "message_stop"})
+        with self.lock:
+            self._ka_stop.set()
+            self._start()
+            if not (self.truncated or self.stop_hit):
+                self._hold = ""
+                rest = _unsent_tail(out.text, self.sent)
+                if rest:
+                    self._push(rest, True)
+            if self.text_open:
+                self._ev("content_block_stop", {"type": "content_block_stop", "index": self.idx})
+                self.idx += 1
+            for c in out.calls:
+                self._ev("content_block_start", {"type": "content_block_start", "index": self.idx,
+                                                 "content_block": {"type": "tool_use", "id": c["id"], "name": c["name"], "input": {}}})
+                self._ev("content_block_delta", {"type": "content_block_delta", "index": self.idx,
+                                                 "delta": {"type": "input_json_delta", "partial_json": json.dumps(c["input"], ensure_ascii=False)}})
+                self._ev("content_block_stop", {"type": "content_block_stop", "index": self.idx})
+                self.idx += 1
+            if self.idx == 0:
+                self._ev("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
+                self._ev("content_block_stop", {"type": "content_block_stop", "index": 0})
+            if out.calls:
+                reason, seq = "tool_use", None
+            elif self.stop_hit:
+                reason, seq = "stop_sequence", self.stop_hit
+            elif self.truncated:
+                reason, seq = "max_tokens", None
+            else:
+                reason, seq = "end_turn", None
+            shown = self.sent if (self.truncated or self.stop_hit) else out.text
+            self._ev("message_delta", {"type": "message_delta", "delta": {"stop_reason": reason, "stop_sequence": seq}, "usage": usage_block(self.in_tok, est_tokens(shown + jdump(out.calls)))})
+            self._ev("message_stop", {"type": "message_stop"})
+            self.closed = True
 
     def error(self, e: BridgeError) -> None:
-        body = anthropic_error(http_error_parts(e)[1], str(e))
-        body["x_bridge"] = {"error": (e.info or classify_error(e, partial_output=True)).public()}
-        self._ev("error", body)
+        with self.lock:
+            self._ka_stop.set()
+            body = anthropic_error(http_error_parts(e)[1], str(e))
+            body["request_id"] = str((self.meta or {}).get("request_id", ""))
+            body["x_bridge"] = {"error": (e.info or classify_error(e, partial_output=True)).public()}
+            self._ev("error", body)
+            self.closed = True
 
 
 class OpenAIWriter(_SSEBase):
@@ -28269,8 +28586,10 @@ _CLAUDE_SHELL_EXE = {"powershell": "powershell", "pwsh": "pwsh", "wsl": "wsl", "
 
 
 def claude_launch_env(base_url: str, api_key: str) -> Dict[str, str]:
-    """The three variables Claude Code needs (the same ones the dashboard snippets show)."""
-    return {"ANTHROPIC_BASE_URL": base_url, "ANTHROPIC_API_KEY": api_key, "ANTHROPIC_MODEL": "sonnet"}
+    """The variables the launcher sets (the same ones the dashboard snippets show). 7.93: + the small/fast model (titles, summaries - answered locally or cheaply) and the two switches that stop
+    background traffic / telemetry (older Claude Code versions simply ignore variables they do not know)."""
+    return {"ANTHROPIC_BASE_URL": base_url, "ANTHROPIC_API_KEY": api_key, "ANTHROPIC_MODEL": "sonnet", "ANTHROPIC_SMALL_FAST_MODEL": "haiku",
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_TELEMETRY": "1"}
 
 
 def _git_bash_path() -> str:
@@ -28666,7 +28985,7 @@ dialog.help[open]{display:flex;flex-direction:column;overflow:hidden}
 <button class="helpcard" id="bHelp"><span class="hi" data-ic="book"></span><span class="ht"><b data-t="help"></b><small data-t="help_sub"></small></span><span data-ic="chevr"></span></button>
 <div class="sec"><h3><span data-ic="plug"></span><span data-t="connect"></span></h3>
 <div class="ctl"><span class="lbl" data-t="key_l"></span><div id="ddKey"></div></div>
-<div class="code"><div class="ch"><span class="tt"><span data-ic="terminal"></span><span id="codeT"></span></span><button class="cp" id="codeCopy" type="button"></button></div><pre><code id="codeBody"></code></pre></div>
+<div class="code"><div class="ch"><span class="tt"><span data-ic="terminal"></span><span id="codeT"></span></span><button class="cp" id="codeCopy" type="button"></button></div><pre><code id="codeBody"></code></pre></div><p class="hin ltr" id="compatLine" style="font-size:.78rem;opacity:.8;margin:.4rem 0 0"></p>
 <div class="ctl runrow"><div id="ddEnv"></div><button class="btn p" id="runBtn" type="button"><span data-ic="play"></span><span data-t="run"></span></button></div>
 <p class="hint" id="envHint"></p></div>
 <div class="sec"><h3><span data-ic="package"></span><span data-t="chrome"></span></h3>
@@ -28918,7 +29237,7 @@ const ENVS=[{id:'cmd',g:'win',label:'Command Prompt (cmd)',run:1},{id:'powershel
 {id:'nushell',g:'other',label:'Nushell',run:1},{id:'xonsh',g:'other',label:'Xonsh'},{id:'elvish',g:'other',label:'Elvish'},
 {id:'dotenv',g:'file',label:'.env file',title:'.env'},{id:'settings',g:'file',label:'Claude Code settings.json',title:'~/.claude/settings.json'},{id:'openai',g:'file',label:'OpenAI-compatible (Cursor, VS Code…)'}];
 const T=(c,x)=>[c,x];
-function snipLines(id,u,k){const V=['ANTHROPIC_BASE_URL','ANTHROPIC_API_KEY','ANTHROPIC_MODEL'],val=[u,k,'sonnet'],rows=[],each=f=>V.forEach((n,i)=>rows.push(f(n,val[i])));
+function snipLines(id,u,k){const V=['ANTHROPIC_BASE_URL','ANTHROPIC_API_KEY','ANTHROPIC_MODEL','ANTHROPIC_SMALL_FAST_MODEL','CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC','DISABLE_TELEMETRY'],val=[u,k,'sonnet','haiku','1','1'],rows=[],each=f=>V.forEach((n,i)=>rows.push(f(n,val[i])));
 switch(id){
 case 'cmd':each((n,v)=>[T('k','set'),T('',' '),T('v',n),T('o','='),T('s',v)]);rows.push([T('f','claude')]);break;
 case 'powershell':case 'pwsh':each((n,v)=>[T('v','$env:'+n),T('o','='),T('s','"'+v+'"')]);rows.push([T('f','claude')]);break;
@@ -28950,7 +29269,7 @@ $('pathCopy').onclick=async()=>{if(EXTDIR&&await copyText(EXTDIR)){flash($('path
 $('chromeGo').onclick=async()=>{const prof=ddChrome.get();if(!prof)return toast(t('ext_noprof'));localStorage.chromeProf=prof;if(EXTDIR){await copyText(EXTDIR);flash($('pathCopy'))}
 const r=await post('personal-chrome/open-extensions',{profile:prof});if(r){if(r.extension_dir){EXTDIR=r.extension_dir;$('chromeDir').textContent=EXTDIR}toast(t('ext_copied'));let n=0;const iv=setInterval(async()=>{await tick();if(++n>60||S.pc_profiles.some(p=>p.connected))clearInterval(iv)},3000)}};
 $('logCopy').onclick=async()=>{try{const r=await api('logfile?level=info&tail=300&report=1');await copyText(typeof r==='string'?r:JSON.stringify(r));toast(t('copied'))}catch(x){toast(x.message.slice(0,80))}};
-$('bSet').onclick=async()=>{renderKeys();loadUiSites();advRender();bkRender();agentInfo(false);$('pcAutoOn').checked=!(S.settings&&S.settings.pc_autostart_profiles===false);gPromptInfo();$('dSet').showModal();
+$('bSet').onclick=async()=>{renderKeys();loadUiSites();advRender();bkRender();agentInfo(false);$('pcAutoOn').checked=!(S.settings&&S.settings.pc_autostart_profiles===false);gPromptInfo();api('compat').then(c=>{$('compatLine').textContent=c.line}).catch(()=>{});$('dSet').showModal();
 try{const r=await api('personal-chrome/profiles'),ps=r.profiles||[];ddChrome.set(ps.map(p=>({v:p.dir,label:p.name,sub:p.email||'',k:p.dir})),ps.some(p=>p.dir===localStorage.chromeProf)?localStorage.chromeProf:undefined)}catch(e){}
 try{const r=await api('personal-chrome/extension-path','POST',{});EXTDIR=r.extension_dir||'';$('chromeDir').textContent=EXTDIR}catch(e){}
 try{SH=await api('claude-shells');ddEnv.set(envItems(),defEnv());renderCode()}catch(e){}};
@@ -29235,9 +29554,9 @@ document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));d
 if(S&&S.presets&&$('preset').options.length)$('preset').options[0].textContent=t('preset');navRender();render();renderCtx()}
 function navRender(){$('nav').innerHTML=VIEWS.map(v=>`<button class="${v[0]==view?'on':''}" onclick="go('${v[0]}')">${esc(t(v[1]))}</button>`).join('')}
 function go(v){view=v;document.querySelectorAll('.view').forEach(e=>e.classList.toggle('on',e.id=='v_'+v||(v=='accounts'&&e.id=='v_adv')));navRender()}
-function snippets(k,port,model){const u='http://127.0.0.1:'+port;return{'claude-ps':`Remove-Item Env:ANTHROPIC_DEFAULT_SONNET_MODEL,Env:ANTHROPIC_DEFAULT_OPUS_MODEL,Env:ANTHROPIC_DEFAULT_HAIKU_MODEL -ErrorAction SilentlyContinue\n$env:ANTHROPIC_BASE_URL="${u}"\n$env:ANTHROPIC_API_KEY="${k}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nclaude`,
-'claude-sh':`unset ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL\nexport ANTHROPIC_BASE_URL=${u}\nexport ANTHROPIC_API_KEY=${k}\nexport ANTHROPIC_MODEL=sonnet\nexport CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
-'claude-cmd':`set ANTHROPIC_DEFAULT_SONNET_MODEL=\nset ANTHROPIC_DEFAULT_OPUS_MODEL=\nset ANTHROPIC_DEFAULT_HAIKU_MODEL=\nset ANTHROPIC_BASE_URL=${u}\nset ANTHROPIC_API_KEY=${k}\nset ANTHROPIC_MODEL=sonnet\nset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nclaude`,
+function snippets(k,port,model){const u='http://127.0.0.1:'+port;return{'claude-ps':`Remove-Item Env:ANTHROPIC_DEFAULT_SONNET_MODEL,Env:ANTHROPIC_DEFAULT_OPUS_MODEL,Env:ANTHROPIC_DEFAULT_HAIKU_MODEL -ErrorAction SilentlyContinue\n$env:ANTHROPIC_BASE_URL="${u}"\n$env:ANTHROPIC_API_KEY="${k}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:ANTHROPIC_SMALL_FAST_MODEL="haiku"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\n$env:DISABLE_TELEMETRY="1"\nclaude`,
+'claude-sh':`unset ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL\nexport ANTHROPIC_BASE_URL=${u}\nexport ANTHROPIC_API_KEY=${k}\nexport ANTHROPIC_MODEL=sonnet\nexport ANTHROPIC_SMALL_FAST_MODEL=haiku\nexport CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nexport DISABLE_TELEMETRY=1\nclaude`,
+'claude-cmd':`set ANTHROPIC_DEFAULT_SONNET_MODEL=\nset ANTHROPIC_DEFAULT_OPUS_MODEL=\nset ANTHROPIC_DEFAULT_HAIKU_MODEL=\nset ANTHROPIC_BASE_URL=${u}\nset ANTHROPIC_API_KEY=${k}\nset ANTHROPIC_MODEL=sonnet\nset ANTHROPIC_SMALL_FAST_MODEL=haiku\nset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1\nset DISABLE_TELEMETRY=1\nclaude`,
 'openai':`Base URL : ${u}/v1\nAPI key  : ${k}\nModel    : bridge-auto   (or acct:<id> / the exact account label to force one account)\n\nCursor / VS Code agents / Continue / Cline / any OpenAI-compatible client:\nuse the "OpenAI compatible" provider with the values above.`}}
 const names={'claude-ps':'Claude Code (PowerShell)','claude-sh':'Claude Code (bash)','claude-cmd':'Claude Code (cmd)','openai':'Cursor / VS Code / OpenAI-compatible'};
 const mmss=s=>{s=Math.max(0,Math.floor(s));return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
@@ -29350,7 +29669,7 @@ async function addAcc(){const url=$('url').value.trim();if(!url)return alert(t('
 async function selectWorkspace(){try{const r=await api('workspace/select','POST',{});if(r.folder){$('workspace_path').value=r.folder;localStorage.workspacePath=r.folder;$('workspace_status').textContent=t('workspace_ready')}else $('workspace_status').textContent=t('workspace_cancel');updateWorkspaceCommand()}catch(e){$('workspace_status').textContent=t('workspace_error')+errMsg(e)}}
 function workspaceModel(){return 'sonnet'}
  function updateWorkspaceCommand(){const app=$('workspace_app').value,folder=$('workspace_path').value,keyValue=(S&&S.keys.find(k=>k.id===$('workspace_key').value)||{}).key||'',base='http://127.0.0.1:'+(S?S.port:'8788'),policy=workspaceModel();localStorage.workspaceApp=app;localStorage.claudeFullAccess=$('claude_full_access').checked?'1':'0';let cmd='';const psPath="'"+folder.replace(/'/g,"''")+"'";
- if(!folder)cmd=t('workspace_ph');else if(app==='claude'&&!keyValue)cmd=t('workspace_key_required');else if(app==='claude'){const full=$('claude_full_access').checked,flag=full?' --dangerously-skip-permissions':'';cmd=`Remove-Item Env:ANTHROPIC_DEFAULT_SONNET_MODEL,Env:ANTHROPIC_DEFAULT_OPUS_MODEL,Env:ANTHROPIC_DEFAULT_HAIKU_MODEL -ErrorAction SilentlyContinue\n$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_API_KEY="${keyValue}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\nSet-Location -LiteralPath ${psPath}\nclaude${flag}`}
+ if(!folder)cmd=t('workspace_ph');else if(app==='claude'&&!keyValue)cmd=t('workspace_key_required');else if(app==='claude'){const full=$('claude_full_access').checked,flag=full?' --dangerously-skip-permissions':'';cmd=`Remove-Item Env:ANTHROPIC_DEFAULT_SONNET_MODEL,Env:ANTHROPIC_DEFAULT_OPUS_MODEL,Env:ANTHROPIC_DEFAULT_HAIKU_MODEL -ErrorAction SilentlyContinue\n$env:ANTHROPIC_BASE_URL="${base}"\n$env:ANTHROPIC_API_KEY="${keyValue}"\n$env:ANTHROPIC_MODEL="sonnet"\n$env:ANTHROPIC_SMALL_FAST_MODEL="haiku"\n$env:CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1"\n$env:DISABLE_TELEMETRY="1"\nSet-Location -LiteralPath ${psPath}\nclaude${flag}`}
 else if(app==='vscode')cmd=`code "${folder}"`;else if(app==='cursor')cmd=`cursor "${folder}"`;else if(app==='cmd')cmd=`cd /d "${folder}"`;else cmd=`Set-Location -LiteralPath ${psPath}`;
  $('workspace_command').textContent=cmd||'Select a workspace folder to prepare the command.'}
 async function copyWorkspaceCommand(){updateWorkspaceCommand();const cmd=$('workspace_command').textContent;if(!cmd||cmd===t('workspace_ph')||cmd===t('workspace_key_required'))return;try{await navigator.clipboard.writeText(cmd);$('workspace_status').textContent=t('workspace_copied')}catch(e){$('workspace_status').textContent=cmd}}
@@ -30031,9 +30350,12 @@ def run_selftest(quick: bool = False) -> int:
             self.assertEqual(call(self.p, "GET", "/v1/models")[0], 401)
             st, _, b = call(self.p, "GET", "/v1/models", headers=self.H())
             ids = [m["id"] for m in json.loads(b)["data"]]
-            self.assertEqual(ids, ["bridge-auto", "acct:a1", "acct:b2"])
+            self.assertEqual(ids[:3], ["bridge-auto", "acct:a1", "acct:b2"])
+            self.assertTrue({"opus", "sonnet", "haiku", "claude-sonnet-4-5"} <= set(ids))       # 7.93: Claude-style aliases, all mapped to the bridge routes
             st, _, b = call(self.p, "GET", "/v1/models", headers=self.H(self.pinned["key"]))
-            self.assertEqual([m["id"] for m in json.loads(b)["data"]], ["bridge-auto", "acct:a1"])   # never lists what the key cannot use
+            pids = [m["id"] for m in json.loads(b)["data"]]
+            self.assertEqual(pids[:2], ["bridge-auto", "acct:a1"])
+            self.assertNotIn("acct:b2", pids)                                                 # never lists what the key cannot use
             self.assertEqual(call(self.p, "GET", "/api/state")[0], 401)
             self.assertEqual(call(self.p, "GET", "/api/state", headers={"x-admin-key": self.admin})[0], 200)
             self.assertEqual(call(self.p, "GET", "/api/state", headers={"x-admin-key": self.key})[0], 401)  # a client key is not an admin key
@@ -41441,7 +41763,7 @@ setTimeout(() => process.exit(0), 60000);
             ok, pr = run([ed("def a():", "def a():")])
             self.assertIn("identical", pr[0])
             ok, pr = run([{"name": "Edit", "input": {"file_path": "/other.py", "old_string": "a", "new_string": "b"}}])
-            self.assertIn("has not been read", pr[0])
+            self.assertEqual((len(ok), pr), (1, []))                                      # 7.93: no Read seen is NOT proof (compaction / --resume): Claude Code validates "read first" itself
             ok, pr = run([ed("12\u2192def a():")])
             self.assertTrue(pr)
             miss = [{"role": "assistant", "content": [{"type": "tool_use", "id": "m1", "name": "Read", "input": {"file_path": "/p/gone.py"}}]},
@@ -42386,7 +42708,358 @@ setTimeout(() => process.exit(0), 60000);
             self.assertEqual(http_error_parts(BridgeError("slow down", "rate_limit", 429))[0], 429)
             self.assertEqual(classify_error(BridgeError("could not prepare the runtime", "setup", 502)).category, "setup_required")   # classification is untouched
 
-    all_cases = (TestAccountGuard787, TestConnectionRealTest, TestRelease776, TestFixes725, TestResolver, TestHashing, TestStreamDecoder, TestRouterCore, TestHTTP, TestPersistence, TestSecurityHelpers, TestApiBackend, TestCatalog, TestRouting, TestResolutionCatalog,
+    class TestClaudeCodeFidelity793(unittest.TestCase):
+        """7.93: Claude Code through the bridge behaves like Claude Code against the official API (mock server / model only)."""
+
+        class _FakeH:
+            def __init__(self) -> None:
+                self.buf = io.BytesIO()
+                self.wfile = self
+                self.hdr: Dict[str, str] = {}
+                self.close_connection = False
+
+            def write(self, b: bytes) -> None:
+                self.buf.write(b)
+
+            def flush(self) -> None:
+                pass
+
+            def send_response(self, c: int) -> None:
+                self.code = c
+
+            def send_header(self, k: str, v: str) -> None:
+                self.hdr[k.lower()] = v
+
+            def end_headers(self) -> None:
+                pass
+
+        @staticmethod
+        def _req(**kw: Any) -> NormReq:
+            d: Dict[str, Any] = {"model": "bridge-auto", "max_tokens": 4096, "stream": True, "messages": [{"role": "user", "content": "hi"}]}
+            d.update(kw)
+            return normalize_anthropic(d)
+
+        def _stream(self, steps: Any, calls: Optional[List[Dict[str, Any]]] = None, text: str = "", **kw: Any) -> Tuple[List[Tuple[Optional[str], str]], Dict[str, Any]]:
+            h = self._FakeH()
+            req = self._req(**kw)
+            w = AnthropicWriter(h, "bridge-auto", 10, {"request_id": "req_t"}, req)      # type: ignore[arg-type]
+            for s in steps:
+                w.text(s)
+            w.finish(Outcome(text or "".join(steps), calls or [], ""))
+            evs = sse_events(h.buf.getvalue())
+            return evs, check_anthropic(evs)
+
+        def _serve(self, run: Any, cfg_extra: Optional[Dict[str, Any]] = None) -> Tuple[Any, Any, Any, Dict[str, str], Any]:
+            tmp, _store, cfg, app = mk_env(dict({"cache_seconds": 0}, **(cfg_extra or {})))
+            add_acct(app, "q1", "Quick", "quick.test")
+            app.router._run = run                                            # type: ignore[assignment]
+            srv = Server(app)
+            self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+            self.addCleanup(srv.close)
+            return srv, cfg, app, {"x-api-key": cfg.add_key("t", None)["key"]}, tmp
+
+        # ---- A: golden SSE streams
+        def test_golden_plain_text(self) -> None:
+            evs, info = self._stream(["Hello", " world"])
+            self.assertEqual([n for n, _ in evs], ["message_start", "content_block_start", "content_block_delta", "content_block_delta", "content_block_stop", "message_delta", "message_stop"])
+            self.assertEqual(info["stop_reason"], "end_turn")
+            md = json.loads(evs[-2][1])
+            self.assertEqual(set(md["usage"]), {"input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"})
+            self.assertIsNone(md["delta"]["stop_sequence"])
+            self.assertEqual(set(json.loads(evs[0][1])["message"]["usage"]), set(md["usage"]))
+
+        def test_golden_one_tool_call_and_parallel_calls(self) -> None:
+            c1 = {"id": "toolu_aaa", "name": "Bash", "input": {"command": "ls"}}
+            c2 = {"id": "toolu_bbb", "name": "Read", "input": {"file_path": "/x"}}
+            evs, info = self._stream(["Looking"], [c1], "Looking")
+            self.assertEqual([n for n, _ in evs], ["message_start", "content_block_start", "content_block_delta", "content_block_stop",
+                                                   "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"])
+            self.assertEqual(info["stop_reason"], "tool_use")
+            deltas = [json.loads(d)["delta"] for n, d in evs if n == "content_block_delta"]
+            self.assertEqual(deltas[-1]["type"], "input_json_delta")
+            self.assertEqual(json.loads(deltas[-1]["partial_json"]), {"command": "ls"})
+            evs2, info2 = self._stream([], [c1, c2], "")
+            starts = [json.loads(d)["content_block"] for n, d in evs2 if n == "content_block_start"]
+            self.assertEqual([s["id"] for s in starts], ["toolu_aaa", "toolu_bbb"])
+            self.assertEqual([json.loads(d)["index"] for n, d in evs2 if n == "content_block_start"], [0, 1])
+            self.assertEqual(info2["stop_reason"], "tool_use")
+
+        def test_golden_max_tokens_and_stop_sequence(self) -> None:
+            evs, info = self._stream(["Hello there, friend"], max_tokens=1)
+            self.assertEqual(info["stop_reason"], "max_tokens")
+            self.assertEqual("".join(json.loads(d)["delta"]["text"] for n, d in evs if n == "content_block_delta"), "Hel")
+            evs, info = self._stream(["abc E", "ND def"], stop_sequences=["END"])
+            self.assertEqual(info["stop_reason"], "stop_sequence")
+            self.assertEqual("".join(json.loads(d)["delta"]["text"] for n, d in evs if n == "content_block_delta"), "abc ")
+            self.assertEqual(json.loads(evs[-2][1])["delta"]["stop_sequence"], "END")
+            _t, reason, seq = shape_text(self._req(stop_sequences=["X"]), "aXb", False)
+            self.assertEqual((_t, reason, seq), ("a", "stop_sequence", "X"))
+            _t, reason, _s = shape_text(self._req(max_tokens=1000, tools=[{"name": "Bash", "input_schema": {}}]), "y" * 5000, True)
+            self.assertEqual((len(_t), reason), (3600, "tool_use"))          # with tools nothing is ever cut to hide a call: only a text-only 1000-token answer is
+
+        def test_golden_error_mid_stream(self) -> None:
+            h = self._FakeH()
+            w = AnthropicWriter(h, "bridge-auto", 10, {"request_id": "req_t"}, self._req())   # type: ignore[arg-type]
+            w.text("partial")
+            self.assertTrue(w.close_for_error())
+            w.error(BridgeError("slow down", "overloaded", 529))
+            evs = sse_events(h.buf.getvalue())
+            self.assertEqual(evs[-1][0], "error")
+            body = json.loads(evs[-1][1])
+            self.assertEqual((body["type"], body["error"]["type"], body["request_id"]), ("error", "overloaded_error", "req_t"))
+            check_anthropic(evs, expect_error=True)
+
+        def test_ping_events_while_the_site_is_still_generating(self) -> None:
+            def run(acct: Any, req: Any, emit: Any, cancel: Any) -> Outcome:
+                time.sleep(0.9)
+                emit("done")
+                return Outcome("done", [], "done")
+            srv, _cfg, _app, hd, _ = self._serve(run, {"sse_ping_seconds": 0.25})
+            st, hh, b = call(srv.port, "POST", "/v1/messages", {"model": "bridge-auto", "max_tokens": 50, "stream": True, "messages": [{"role": "user", "content": "x"}]}, hd)
+            self.assertEqual(st, 200)
+            evs = sse_events(b)
+            names = [n for n, _ in evs]
+            self.assertGreaterEqual(names.count("ping"), 2)
+            self.assertLess(names.index("ping"), names.index("content_block_start"))
+            self.assertEqual(names[0], "message_start")
+            self.assertEqual(check_anthropic(evs)["stop_reason"], "end_turn")
+            self.assertTrue(hh.get("request-id"))
+
+        # ---- A: usage, count_tokens, errors, unknown fields, models
+        def test_usage_count_tokens_share_one_estimator(self) -> None:
+            srv, _c, _a, hd, _ = self._serve(lambda acct, req, emit, cancel: (emit("ok"), Outcome("ok", [], "ok"))[1])
+            body = {"model": "bridge-auto", "max_tokens": 50, "system": "be brief", "messages": [{"role": "user", "content": "count me please"}]}
+            st, _, b = call(srv.port, "POST", "/v1/messages/count_tokens", body, hd)
+            n = json.loads(b)["input_tokens"]
+            st, hh, b = call(srv.port, "POST", "/v1/messages", body, hd)
+            d = json.loads(b)
+            self.assertEqual((st, d["usage"]["input_tokens"]), (200, n))
+            self.assertEqual((d["usage"]["cache_creation_input_tokens"], d["usage"]["cache_read_input_tokens"], d["stop_reason"]), (0, 0, "end_turn"))
+            self.assertTrue(hh["request-id"].startswith("req_"))
+
+        def test_non_stream_max_tokens(self) -> None:
+            srv, _c, _a, hd, _ = self._serve(lambda acct, req, emit, cancel: Outcome("Hello there", [], ""))
+            st, _, b = call(srv.port, "POST", "/v1/messages", {"model": "bridge-auto", "max_tokens": 1, "messages": [{"role": "user", "content": "x"}]}, hd)
+            d = json.loads(b)
+            self.assertEqual((d["stop_reason"], d["content"][0]["text"]), ("max_tokens", "Hel"))
+
+        def test_unknown_optional_fields_are_accepted_and_bad_bodies_are_400(self) -> None:
+            srv, _c, _a, hd, _ = self._serve(lambda acct, req, emit, cancel: (emit("ok"), Outcome("ok", [], "ok"))[1])
+            body = {"model": "claude-sonnet-4-5", "max_tokens": 100, "thinking": {"type": "enabled", "budget_tokens": 1024}, "metadata": {"user_id": "u"}, "top_k": 5,
+                    "context_management": {"edits": []}, "cache_control": {"type": "ephemeral"},
+                    "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}],
+                    "messages": [{"role": "user", "content": [{"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}}]}]}
+            st, _, b = call(srv.port, "POST", "/v1/messages", dict(body), dict(hd, **{"anthropic-beta": "x-y", "anthropic-version": "2023-06-01"}))
+            self.assertEqual(st, 200, b)
+            self.assertNotIn("thinking", [c["type"] for c in json.loads(b)["content"]])                  # never invented
+            st, _, b = call(srv.port, "POST", "/v1/messages", {"model": "x", "messages": "nope"}, hd)
+            self.assertEqual(st, 400)
+            self.assertEqual(json.loads(b)["error"]["type"], "invalid_request_error")
+            st, _, b = call(srv.port, "POST", "/v1/messages", dict(body, max_tokens="abc"), hd)
+            self.assertEqual(st, 200)
+
+        def test_busy_and_limit_errors_carry_retry_headers(self) -> None:
+            def run(acct: Any, req: Any, emit: Any, cancel: Any) -> Outcome:
+                raise BridgeError("slow down", "rate_limit", 429, retry_after=7)
+            srv, _c, _a, hd, _ = self._serve(run)
+            st, hh, b = call(srv.port, "POST", "/v1/messages", {"model": "bridge-auto", "max_tokens": 5, "messages": [{"role": "user", "content": "x"}]}, hd)
+            self.assertIn(st, (429, 502, 529))
+            self.assertEqual(hh.get("x-should-retry"), "true")
+            self.assertTrue(hh.get("request-id"))
+            d = json.loads(b)
+            self.assertEqual(d["type"], "error")
+            self.assertTrue(d["request_id"])
+            self.assertEqual(http_error_parts(BridgeError("busy", "overloaded", 529))[0], 529)
+
+        def test_models_have_claude_aliases_mapped_to_the_bridge(self) -> None:
+            srv, _c, _a, hd, _ = self._serve(lambda acct, req, emit, cancel: Outcome("ok", [], ""))
+            st, _, b = call(srv.port, "GET", "/v1/models", None, hd)
+            data = {m["id"]: m for m in json.loads(b)["data"]}
+            for k in ("opus", "sonnet", "haiku", "claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"):
+                self.assertIn(k, data)
+                self.assertEqual((data[k]["type"], data[k]["max_input_tokens"]), ("model", 200000))
+                self.assertTrue(data[k]["display_name"])
+            st, _, b = call(srv.port, "POST", "/v1/messages", {"model": "claude-haiku-4-5", "max_tokens": 5, "messages": [{"role": "user", "content": "x"}]}, hd)
+            self.assertEqual(st, 200)                                                                     # the alias routes like any model
+
+        # ---- A/B: tools
+        def test_server_tools_tool_choice_and_parallel(self) -> None:
+            r = self._req(tools=[{"type": "web_search_20250305", "name": "web_search"}, {"name": "Bash", "description": "d", "input_schema": {"type": "object"}}],
+                          tool_choice={"type": "auto", "disable_parallel_tool_use": True})
+            self.assertEqual(list(r.tools), ["Bash"])
+            self.assertEqual((r.unsupported_tools, r.no_parallel), (["web_search_20250305"], True))
+            self.assertIn("web_search_20250305", " ".join(_UNSUPPORTED_LOGGED))
+            r = self._req(tools=[{"name": "Bash", "input_schema": {}}], tool_choice={"type": "none"})
+            self.assertEqual(r.tools, {})
+            self.assertEqual(self._req(tool_choice="any", tools=[{"name": "Bash", "input_schema": {}}]).tool_choice, {"type": "any"})
+
+        def test_default_tool_cap_and_core_tools_never_hidden(self) -> None:
+            tmp, _s, cfg, _a = mk_env({})
+            try:
+                self.assertEqual(cfg["tools_per_turn_max"], 64)
+                for core in ("Task", "TodoWrite", "Edit", "Write", "Read", "Bash"):
+                    self.assertIn(core, cfg["tools_core"])
+                tools = [{"name": f"mcp__srv__tool{i}", "description": "x", "input_schema": {"type": "object"}} for i in range(120)]
+                tools += [{"name": n, "description": "x", "input_schema": {"type": "object"}} for n in ("Task", "TodoWrite", "Edit", "Write", "Read", "Bash")]
+                shown, hidden = select_tools(self._req(tools=tools), {"tools_per_turn_max": 4, "tools_core": cfg["tools_core"]})
+                for core in ("Task", "TodoWrite", "Edit", "Write", "Read", "Bash"):
+                    self.assertIn(core, shown)                                                            # even when the cap is below the number of core tools
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+        def test_tool_call_parser_survives_hard_arguments(self) -> None:
+            tools = {"Write": {"description": "", "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}}, "required": ["file_path", "content"]}}}
+            for content in ('say "hi" and \\"nested\\"', "Gr\u00fc\u00dfe \u65e5\u672c\u8a9e \U0001F600", "a\r\nb\r\n", "x" * 200000, "```inner fence```"):
+                reply = "```tool_call\n" + json.dumps({"name": "Write", "arguments": {"file_path": "/a", "content": content}}) + "\n```"
+                _c, calls, problems = parse_tool_calls(reply, tools, "s")
+                self.assertEqual((len(calls), problems), (1, []), content[:20])
+                self.assertEqual(calls[0]["input"]["content"], content)
+                self.assertTrue(calls[0]["id"].startswith("toolu_"))
+            bad = '```tool_call\n{"name": "Write", "arguments": {"file_path": "/a", "content": "oops\n```'
+            _c, calls, problems = parse_tool_calls(bad, tools, "s")
+            self.assertEqual(calls, [])                                                                   # never a half-built call
+            two = "```tool_call\n" + json.dumps({"name": "Write", "arguments": {"file_path": "/a", "content": "1"}}) + "\n```\n```tool_call\n" + json.dumps({"name": "Write", "arguments": {"file_path": "/a", "content": "1"}}) + "\n```"
+            _c, calls, _p = parse_tool_calls(two, tools, "s")
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(len({c["id"] for c in calls}), 2)                                            # same arguments, still unique ids
+
+        def test_tool_result_error_and_image(self) -> None:
+            msgs = [{"role": "user", "content": "go"},
+                    {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "/a.png"}}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": True, "content": [{"type": "text", "text": "boom"}, {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}]}]}]
+            p = build_prompt(self._req(messages=msgs, tools=[{"name": "Read", "input_schema": {}}]), Config(Store(Path(tempfile.mkdtemp()))), False)
+            text = p if isinstance(p, str) else json.dumps(p)
+            self.assertIn("boom", text)
+            self.assertIn("image omitted", text)
+            self.assertNotIn("AAAA", text)
+
+        def test_read_results_are_never_cut(self) -> None:
+            body = "\n".join(f"{i:6d}\u2192line {i} " + "y" * 60 for i in range(1, 700))                  # ~50 KB: more than result_limit (20000)
+            msgs = [{"role": "user", "content": "edit it"},
+                    {"role": "assistant", "content": [{"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "/p/big.py"}}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r1", "content": body}]},
+                    {"role": "assistant", "content": "ok"}, {"role": "user", "content": "now change line 400"}]
+            out = render_message(msgs[2], 20000, {"r1": "Read"}, None)
+            self.assertIn(body, out)                                                                      # byte-exact
+            huge = "z" * 400000
+            m2 = dict(msgs[2], content=[{"type": "tool_result", "tool_use_id": "r1", "content": huge}])
+            o2 = render_message(m2, 20000, {"r1": "Read"}, None)
+            self.assertTrue(("z" * 400000) in o2 or ("NOT repeated" in o2 and "zzzzzzzzzz" not in o2))           # whole, or only a clear marker: never an excerpt
+
+        # ---- B: Edit pre-check
+        def test_precheck_never_refuses_after_a_compaction(self) -> None:
+            ed = {"name": "Edit", "input": {"file_path": "/p/f.py", "old_string": "def a():", "new_string": "def b():"}}
+            summary = [{"role": "user", "content": "This session is being continued from a previous conversation. Summary: we edited /p/f.py"}, {"role": "assistant", "content": "ok"}, {"role": "user", "content": "go on"}]
+            req = self._req(messages=summary, tools=[{"name": "Read", "input_schema": {}}, {"name": "Edit", "input_schema": {}}])
+            ok, pr = precheck_calls(req, [ed], {})
+            self.assertEqual((len(ok), pr), (1, []))                                                      # the Read sits before the compaction: no proof
+            body = "def a():\r\n    return 1\r\n"
+            hist = [{"role": "user", "content": "x"}, {"role": "assistant", "content": [{"type": "tool_use", "id": "r1", "name": "Read", "input": {"file_path": "/p/f.py"}}]},
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r1", "content": "     1\u2192def a():\n     2\u2192    return 1\n"}]}]
+            ok, pr = precheck_calls(self._req(messages=hist, tools=[{"name": "Read", "input_schema": {}}, {"name": "Edit", "input_schema": {}}]),
+                                    [{"name": "Edit", "input": {"file_path": "/p/f.py", "old_string": "def a():\r\n    return 1", "new_string": "z"}}], {})
+            self.assertEqual((len(ok), pr), (1, []), body)                                                # CRLF in the file, LF in the Read view: the tool decides
+            ok, pr = precheck_calls(self._req(messages=hist, tools=[{"name": "Read", "input_schema": {}}, {"name": "Edit", "input_schema": {}}]),
+                                    [{"name": "Edit", "input": {"file_path": "/p/f.py", "old_string": "def nothing_like_this():", "new_string": "z"}}], {})
+            self.assertTrue(pr)                                                                           # provably impossible: still refused
+            gone = hist[:2] + [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "r1", "is_error": True, "content": "File does not exist."}]},
+                               {"role": "assistant", "content": [{"type": "tool_use", "id": "b1", "name": "Bash", "input": {"command": "touch /p/f.py"}}]},
+                               {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "b1", "content": ""}]}]
+            ok, pr = precheck_calls(self._req(messages=gone, tools=[{"name": "Read", "input_schema": {}}, {"name": "Edit", "input_schema": {}}, {"name": "Bash", "input_schema": {}}]), [ed], {})
+            self.assertEqual((len(ok), pr), (1, []))                                                      # a shell command created the file after the failed Read
+
+        # ---- C: queue, identity, cancel, utility calls
+        def test_advisor_queues_behind_the_owner(self) -> None:
+            lim = Limiter(1)
+            self.assertTrue(lim.acquire(1))
+            order: List[str] = []
+
+            def worker(name: str, prio: int) -> None:
+                if lim.acquire(5, prio):
+                    order.append(name)
+                    time.sleep(0.05)
+                    lim.release()
+            a = threading.Thread(target=worker, args=("advisor", 1))
+            a.start()
+            time.sleep(0.15)
+            o = threading.Thread(target=worker, args=("owner", 0))
+            o.start()
+            time.sleep(0.15)
+            lim.release()
+            a.join(5)
+            o.join(5)
+            self.assertEqual(order, ["owner", "advisor"])
+            lim2 = Limiter(1)
+            lim2.acquire(1)
+            self.assertFalse(lim2.acquire(0.05))                                                           # a busy account still times out (backpressure, not a hang)
+            lim2.release()
+            self.assertTrue(lim2.acquire(0.05))
+
+        def test_conversation_key_is_stable_and_per_subagent(self) -> None:
+            a = self._req(system="main agent", messages=[{"role": "user", "content": "task"}])
+            a2 = self._req(system="main agent", messages=[{"role": "user", "content": "task"}, {"role": "assistant", "content": "x"}, {"role": "user", "content": "more"}])
+            sub = self._req(system="subagent explore", messages=[{"role": "user", "content": "task"}])
+            self.assertEqual(conv_key_for("k1", a), conv_key_for("k1", a2))                                 # --resume / --continue replay: same identity
+            self.assertNotEqual(conv_key_for("k1", a), conv_key_for("k1", sub))                             # a Task subagent gets its own conversation
+            self.assertNotEqual(conv_key_for("k1", a), conv_key_for("advisor", a))
+
+        def test_disconnect_cancels_the_generation(self) -> None:
+            started, cancelled = threading.Event(), threading.Event()
+
+            def run(acct: Any, req: Any, emit: Any, cancel: Any) -> Outcome:
+                started.set()
+                if cancel.wait(8):
+                    cancelled.set()
+                return Outcome("", [], "")
+            srv, _c, _a, hd, _ = self._serve(run)
+            body = json.dumps({"model": "bridge-auto", "max_tokens": 10, "messages": [{"role": "user", "content": "x"}]}).encode()
+            s = socket.create_connection(("127.0.0.1", srv.port), timeout=5)
+            s.sendall(b"POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:" + str(srv.port).encode() + b"\r\nx-api-key: " + hd["x-api-key"].encode() + b"\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+            if not started.wait(5):
+                s.settimeout(2)
+                self.fail("the request never reached the model: " + repr(s.recv(600)))
+            s.close()                                                                                      # ESC
+            self.assertTrue(cancelled.wait(5), "the upstream generation was not cancelled")
+
+        def test_utility_calls_do_not_use_a_browser_turn(self) -> None:
+            calls: List[int] = []
+
+            def run(acct: Any, req: Any, emit: Any, cancel: Any) -> Outcome:
+                calls.append(1)
+                return Outcome("model", [], "")
+            srv, _c, _a, hd, _ = self._serve(run)
+            post = lambda b: call(srv.port, "POST", "/v1/messages", dict({"model": "haiku", "max_tokens": 1}, **b), hd)                  # noqa: E731
+            st, _, b = post({"messages": [{"role": "user", "content": "quota"}]})
+            self.assertEqual((st, json.loads(b)["content"][0]["text"]), (200, "OK"))
+            st, _, b = post({"max_tokens": 200, "system": "Analyze if this message indicates a new conversation topic. Respond with a JSON object: isNewTopic (boolean) and title.",
+                             "messages": [{"role": "user", "content": "now fix the login bug"}]})
+            self.assertEqual(json.loads(json.loads(b)["content"][0]["text"]), {"isNewTopic": False, "title": None})
+            st, _, b = post({"stream": True, "messages": [{"role": "user", "content": "quota"}]})                                         # a streamed probe is answered as a stream
+            self.assertIn(check_anthropic(sse_events(b))["stop_reason"], ("end_turn", "max_tokens"))
+            self.assertEqual(calls, [])
+            st, _, b = post({"max_tokens": 50, "messages": [{"role": "user", "content": "explain this function"}]})
+            self.assertEqual(calls, [1])                                                                   # a real question still goes to the model
+            self.assertIsNone(local_shortcut(self._req(tools=[{"name": "Bash", "input_schema": {}}], messages=[{"role": "user", "content": "quota"}])))
+
+        # ---- D: launcher + compatibility line
+        def test_launcher_env_and_compat_line(self) -> None:
+            env = claude_launch_env("http://127.0.0.1:1", "k")
+            for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "DISABLE_TELEMETRY"):
+                self.assertIn(k, env)
+            self.assertIn("ANTHROPIC_SMALL_FAST_MODEL", DASHBOARD2_HTML)
+            self.assertIn("DISABLE_TELEMETRY", DASHBOARD2_HTML)
+            srv, cfg, _a, hd, _ = self._serve(lambda acct, req, emit, cancel: Outcome("ok", [], ""))
+            st, _, b = call(srv.port, "GET", "/api/compat", None, {"x-admin-key": cfg["admin_key"]})
+            self.assertEqual(st, 200)
+            self.assertIn("Claude Code compatibility", json.loads(b)["line"])
+            self.assertIn("thinking", json.loads(b)["line"])
+
+        def test_advisor_chip_and_isolation_untouched(self) -> None:
+            self.assertEqual(AGENT.backend(), "bridge")                                                    # (b) the advisor always thinks through the bridge accounts
+            self.assertIn("cAdv", DASHBOARD2_HTML)                                                         # (c) the header chip
+            self.assertIn("pc_open_extensions", globals())                                                 # (a) chrome://extensions alone first
+
+    all_cases = (TestClaudeCodeFidelity793, TestAccountGuard787, TestConnectionRealTest, TestRelease776, TestFixes725, TestResolver, TestHashing, TestStreamDecoder, TestRouterCore, TestHTTP, TestPersistence, TestSecurityHelpers, TestApiBackend, TestCatalog, TestRouting, TestResolutionCatalog,
                  TestErrorsAndLimits, TestTaskStateAndFailover, TestContextEngine, TestSubmission, TestGroupO, TestGroupOSetup, TestGroupOCapture, TestGroupO5, TestGroupO17, TestGroupO18, TestGroupO19, TestGroupO8, TestGroupO9, TestGroupO9Supervisor, TestGroupO827, TestGroupO827b, TestGroupO21Link, TestGroupO21Grammar, TestGroupO21CallGraph, TestGroupO29Diversity, TestGroupO5Origins, TestGroupO26Tools, TestGroupO14, TestGroupO13, TestGroupO15, TestGroupO25, TestGroupO26, TestGroupO27, TestGroupO28, TestWorkspaceAndOptionalLearning, TestServingModesAndEvidence, TestAutomaticDependencySetup, TestReportInSync, TestFixes732, TestGroupO12Dash, TestGroupO11, TestLogFile, TestAccessAndDashboardLog, TestPersonalChrome, TestToolCallParser, TestUIWait, TestUIAnswerReader, TestReliability771, TestDashboard786, TestClaudeAgent789, TestAgentBackend790, TestQuickSmoke)
     only = os.environ.get("BRIDGE_SELFTEST_ONLY", "")             # lean workflow (section 0A): BRIDGE_SELFTEST_ONLY=TestSubmission,TestContextEngine runs just those classes
     for case in ((TestQuickSmoke, TestToolCallParser, TestUIWait, TestRelease776) if quick else tuple(c for c in all_cases if not only or c.__name__ in only.split(","))):
