@@ -22299,10 +22299,15 @@ class ClaudeAgent:
             st["reason"] = "the `claude` command was not found (install Claude Code, or set agent_cli)"
         else:
             try:
-                r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30, env=self.env(), stdin=subprocess.DEVNULL)
-                st["version"] = (r.stdout or r.stderr or "").strip().splitlines()[0][:80] if (r.stdout or r.stderr) else ""
-                if r.returncode != 0:
-                    st["reason"] = f"`claude --version` exited with {r.returncode}"
+                vout, verr, vrc = self._run_text([path, "--version"], "", 10.0)
+                vtxt = (vout or verr or "").strip()
+                if vrc == 0 and vtxt:
+                    st["version"] = vtxt.splitlines()[0][:80]
+                elif "no answer within" in (verr or ""):
+                    st["version"] = "?"                                   # the program exists but is slow to start: not a reason to refuse the repair, the real run has its own timeout
+                    log("advisor: `claude --version` did not answer within 10 s (the program was found; continuing)", "warn")
+                elif vrc != 0:
+                    st["reason"] = f"`claude --version` exited with {vrc}: {vtxt[:100]}"
             except Exception as e:
                 st["reason"] = f"{type(e).__name__}: {str(e)[:100]}"
             if check_login and not st["reason"]:
@@ -24325,6 +24330,7 @@ class AccountGuard:
         rec: Dict[str, Any] = {"id": pid, "host": host, "account": label, "account_id": aid, "started": round(now(), 1), "trigger": "deep_check" if deep else ("manual" if manual else "request_failure"),
                                "symptom": {k: seed.get(k) for k in ("category", "scope", "kind", "message", "partial")}, "attempts": [], "outcome": "", "evidence": {}, "exported": False}
         self.stats["repairs"] += 1
+        log(f"guard: repair of {label} ({host}) started - scanning the page through its browser tab", "info")
         history: List[str] = []
         attempts = max(1, min(6, int(self._c("guard_repair_attempts", 3) or 3)))
         agent_tried = False
@@ -24349,6 +24355,7 @@ class AccountGuard:
                     scan, why = self._scan(aid)
                     if scan is None:
                         self._step(aid, "scan", "fail", why)
+                        log(f"guard: repair of {label}: the page could not be scanned ({why}) - attempt {n + 1} of {attempts}", "warn")
                         history.append(f"attempt {n + 1}: the page could not be scanned ({why})")
                         self._recover_browser(aid, why)
                         continue
@@ -24392,10 +24399,12 @@ class AccountGuard:
         """7.89: one Claude Code session. -> 'passed' (the bridge's own gate passed and the fix is saved) | 'failed' (it worked and could not fix it) | 'skipped' (it could not run / never
         used the toolkit: an infrastructure problem, the one-shot / rules path may still help)."""
         self._step(aid, "agent", "run", "Claude Code is working on the page")
+        log(f"guard: repair of {label}: starting Claude Code (details of this run: bridge_data\\agent\\jobs\\<latest>\\stderr.txt and transcript.jsonl)", "info")
         res = agent_session(self, aid, host, label, seed, history, scan)
         if not res.get("ran") or not res.get("ops"):
             why = str(res.get("reason") or "it never used the toolkit")
             self._step(aid, "agent", "fail", why[:80])
+            log(f"guard: repair of {label}: Claude Code did not do any work ({why[:200]})", "warn")
             history.append(f"attempt {n + 1}: Claude Code did not do any work ({why[:120]})")
             return "skipped"
         plan = res.get("plan") or {}
