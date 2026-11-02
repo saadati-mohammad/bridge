@@ -2544,6 +2544,17 @@ async function autoOpenLogins() {
 }
 (function autoOpenTick() { autoOpenLogins().catch(() => {}).then(() => setTimeout(autoOpenTick, 3000)); })();
 
+const HUB_PORT = Number('__HUB_PORT__') || 18765;
+async function tryAutoPair() {                       // the owner pressed "open chrome://extensions" in the dashboard: the loaded extension pairs itself, no code and no profile choice
+  if (await loadCfg()) return;
+  const ident = await getIdentity();
+  const r = await fetch('http://127.0.0.1:' + HUB_PORT + '/pc/pair', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({auto: true, client_id: ident.clientId, client_name: ident.profileName})});
+  if (!r.ok) return;
+  const j = await r.json(); if (!j.token) return;
+  await chrome.storage.local.set({port: HUB_PORT, token: j.token}); cfg = null; pollLoop();
+}
+(function autoPairTick() { tryAutoPair().catch(() => {}).then(() => setTimeout(autoPairTick, 3000)); })();
+
 chrome.runtime.onMessage.addListener((msg, sender, send) => {
   if (sender.id !== chrome.runtime.id) return false;
   (async () => {
@@ -2770,7 +2781,7 @@ PC_PAIR_JS = r"""(() => {
 def pc_assets() -> Dict[str, Any]:
     """The embedded extension assets; nothing is shipped as a separate file."""
     port_ = str(int(PC_DASH_PORT[0] or 0))
-    return {"manifest.json": json.dumps(pc_manifest(), indent=2), "background.js": PC_BACKGROUND_JS.replace("__DASH_PORT__", port_), "pair.js": PC_PAIR_JS.replace("__DASH_PORT__", port_),
+    return {"manifest.json": json.dumps(pc_manifest(), indent=2), "background.js": PC_BACKGROUND_JS.replace("__DASH_PORT__", port_).replace("__HUB_PORT__", str(int(os.environ.get("BRIDGE_PC_PORT") or PC_DEFAULT_PORT))), "pair.js": PC_PAIR_JS.replace("__DASH_PORT__", port_),
             "popup.html": PC_POPUP_HTML, "popup.js": PC_POPUP_JS,
             "options.html": PC_OPTIONS_HTML, "options.js": PC_OPTIONS_JS, "ext.css": PC_CSS,
             **{f"icons/icon{s}.png": pc_icon_png(s) for s in (16, 32, 48, 128)}}
@@ -2864,6 +2875,7 @@ class PCHub:
         self.grace = PC_CONNECT_GRACE
         self.listeners: List[Callable[[Dict[str, Any]], None]] = []
         self.pair_code, self.pair_until, self.pair_fails = "", 0.0, 0
+        self.auto_until = 0.0                                                          # while open, the first extension that asks is paired without a code
         self.login_requests_provider: Optional[Callable[[str], List[Dict[str, Any]]]] = None
         self.login_claim_handler: Optional[Callable[[str, Dict[str, Any]], Tuple[int, Dict[str, Any]]]] = None
         self.login_confirm_handler: Optional[Callable[[str, Dict[str, Any]], Tuple[int, Dict[str, Any]]]] = None
@@ -2914,6 +2926,11 @@ class PCHub:
             self.pair_code = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
             self.pair_until, self.pair_fails = time.time() + 600, 0
             return self.pair_code                                                    # the previous pairing stays valid until a new one succeeds
+
+    def open_auto_pair(self, seconds: float = 900.0) -> None:
+        """The owner just opened chrome://extensions from the dashboard: for a few minutes the extension that gets loaded pairs itself (no code, no profile choice)."""
+        with self.lock:
+            self.auto_until = time.time() + float(seconds)
 
     def paired(self) -> bool:
         return bool(self.state.get("origin") and (self.state.get("clients") or self.state.get("token_sha256")))
@@ -3192,10 +3209,17 @@ class PCHub:
             if not origin.startswith("chrome-extension://") or len(origin) > 80:
                 log("personal chrome pairing refused: the request did not come from a Chrome extension", "warn")
                 return 403, {"error": "pairing is only accepted from the extension"}
-            if not self.pair_code or time.time() > self.pair_until or self.pair_fails >= 5:
+            auto_ = bool(body.get("auto")) and time.time() < self.auto_until
+            if not auto_ and body.get("auto"):
+                return 403, {"error": "no auto-pairing window open"}                     # silent: the extension asks every few seconds until the owner presses the button
+            cid_ = re.sub(r"[^a-zA-Z0-9_-]", "", str(body.get("client_id") or ""))[:64]
+            if not auto_ and not self.pair_code and cid_ and cid_ in (self.state.get("clients") or {}) and origin == self.state.get("origin"):
+                log("personal chrome: extension asked to pair again but is already paired (ignored)", "debug")
+                return 409, {"error": "already paired"}
+            if not auto_ and (not self.pair_code or time.time() > self.pair_until or self.pair_fails >= 5):
                 log("personal chrome pairing refused: no active code (expired, used, or 5 wrong tries) - run `python bridge.py --pc-pair` or press the pair button in the dashboard", "warn")
                 return 403, {"error": "no active pairing code (ask the bridge for a new one)"}
-            if not hmac.compare_digest(str(body.get("code") or "").strip().upper(), self.pair_code):
+            if not auto_ and not hmac.compare_digest(str(body.get("code") or "").strip().upper(), self.pair_code):
                 self.pair_fails += 1
                 log(f"personal chrome pairing refused: wrong code (try {self.pair_fails} of 5)", "warn")
                 if self.pair_fails >= 5:
@@ -3204,6 +3228,8 @@ class PCHub:
                 return 403, {"error": "wrong code"}
             client_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(body.get("client_id") or "legacy"))[:64] or "legacy"
             name = re.sub(r"[\x00-\x1f\x7f]", "", str(body.get("client_name") or "Chrome profile")).strip()[:80] or "Chrome profile"
+            if auto_ and PC_PENDING_DIR[0][0] and time.time() - PC_PENDING_DIR[0][1] < 1800:      # the profile Chrome was opened in is known from the dashboard click: use its own name
+                name = next((p_["name"] for p_ in pc_chrome_profiles() if p_["dir"] == PC_PENDING_DIR[0][0]), name)
             if self.state.get("origin") and self.state["origin"] != origin:
                 return 403, {"error": "extension id differs from the paired extension"}
             clients = dict(self.state.get("clients") or {})
@@ -3215,6 +3241,7 @@ class PCHub:
                                   "chrome_dir": (PC_PENDING_DIR[0][0] if PC_PENDING_DIR[0][0] and time.time() - PC_PENDING_DIR[0][1] < 900 else (clients.get(client_id) or {}).get("chrome_dir", ""))}
             self.state = {"clients": clients, "origin": origin, "paired_at": self.state.get("paired_at") or time.time(), "version": PC_VERSION}
             self.pair_code = ""
+            self.auto_until = 0.0
             PC_PENDING_DIR[0] = ("", 0.0)
             self._save()
         log("personal Chrome extension paired", "ok")
@@ -5366,7 +5393,7 @@ _UI_CLICK_IDX_JS = r"""() => {
 
 
 UI_HOST_ANSWER_SELECTORS = (                                   # 7.94: data, not branches: (host suffix, CSS selector list of ONE assistant answer). The page-text fallback covers a markup change.
-    ("chatgpt.com", '[data-message-author-role="assistant"]'),
+    ("chatgpt.com", '[data-message-author-role="assistant"], [data-turn="assistant"]'),
     ("deepseek.com", '.ds-assistant-message-main-content.ds-markdown, [data-message-author-role="assistant"], [data-role="assistant"]'),
     ("claude.ai", '.font-claude-response, [data-testid="ai-message"], [data-testid="message-assistant"], .assistant-message'),
 )
@@ -6181,20 +6208,69 @@ def ui_diff_lines(body: str, before: Set[str], prompt: str) -> List[str]:
 
 
 _UI_LABEL_RE = re.compile(r"^(?!you\b)[\w .\-]{1,30}\s(?:said|responded|replied)\s*:?$", re.I)
-_UI_FOOT_RE = re.compile(r"can make mistakes|check important info|^latest response$|^response complete$|^ai-generated|^(?:copy|share|regenerate|read aloud|good response|bad response|retry)$", re.I)
+_UI_FOOT_RE = re.compile(r"do you like this personality|is this conversation helpful|you'?re giving feedback on a new version|which response do you prefer|^(?:recents|library|scheduled|plugins|explore|images|new chat|search|skip to content)$|can make mistakes|check important info|^latest response$|^response complete$|^ai-generated|^(?:copy|share|regenerate|read aloud|good response|bad response|retry)$", re.I)
 _UI_THINK_RE = re.compile(r"^(?:think(?:ing)?|reasoning|searching(?: the web)?|loading profile|free offer)\b.{0,24}$", re.I)
+
+
+def ui_after_prompt(body: str, prompt: str) -> str:
+    """Only the page text AFTER our own (last) message, so older messages of the same chat never leak into the answer. Not found = unchanged."""
+    try:
+        _zw = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"))
+        b = str(body or "").translate(_zw)
+        words = str(prompt or "").translate(_zw).split()
+        if len(words) < 3:
+            return b
+        pat = r"\s+".join(re.escape(w) for w in words[-10:])
+        last = None
+        for last in re.finditer(pat, b):
+            pass
+        return b[last.end():] if last else b
+    except Exception:
+        return str(body or "")
+
+
+UI_MAIN_TEXT_JS = r"""() => {
+  const main = document.querySelector('main, [role="main"]') || document.body;
+  const c = main.cloneNode(true);
+  c.querySelectorAll('nav,aside,header,footer,[role="navigation"],[role="banner"],script,style,svg,.sr-only,[class*="left-panel"],[data-app-shell-left-panel-appearance]').forEach(x => x.remove());
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed;left:-99999px;top:0;width:1000px;white-space:normal;pointer-events:none;';
+  box.appendChild(c);
+  document.body.appendChild(box);
+  try { return c.innerText; } finally { box.remove(); }
+}"""
+
+
+def ui_main_text(pg: Any) -> str:
+    """Text of the conversation area only (no sidebar, top bar, hidden labels); the whole body when the page does not allow it."""
+    try:
+        t = pg.evaluate(UI_MAIN_TEXT_JS)
+        if isinstance(t, str) and t.strip():
+            return t
+    except Exception:
+        pass
+    return pg.inner_text("body")
 
 
 def ui_fallback_answer(body: str, before: Set[str], prompt: str) -> str:
     """7.94: the answer text taken from the page TEXT when the configured answer selector matches no element at all (the site changed its markup).
     New lines only (the request echo is removed), from the last "<Name> said:" label on, up to the footer ('... can make mistakes', 'Response complete' ...); thinking indicators are skipped."""
-    lines = ui_diff_lines(body, before, prompt)
+    lines = ui_diff_lines(ui_after_prompt(body, prompt), before, prompt)
     last = -1
     for k, ln in enumerate(lines):
         if _UI_LABEL_RE.match(ln.strip()):
             last = k
     if last >= 0:
         lines = lines[last + 1:]
+    # The page shows our own (long) message first, split into many short lines ("# Harness", "[USER]", "CronList" ...). Short lines of the request survive ui_diff_lines
+    # (it only drops lines of 10+ characters), and used to be returned as the "answer". The echo is a leading run of lines that all occur in the request: drop it.
+    _n = lambda x: re.sub(r"\s+", " ", str(x or "")).strip().lower()
+    req_lines = {_n(x) for x in str(prompt or "").splitlines() if _n(x)}
+    if req_lines:
+        k = 0
+        while k < len(lines) and (not _n(lines[k]) or _n(lines[k]) in req_lines):
+            k += 1
+        lines = lines[k:]
     out: List[str] = []
     for ln in lines:
         s = ln.strip()
@@ -6479,6 +6555,13 @@ class UIBackend:
                 self.select_model(pg, str(model))
                 conv["model"] = model
             try:
+                _prev_len = -1
+                for _ in range(8):                                  # let the old messages of a continued chat finish rendering
+                    _cur_len = len(pg.inner_text("body"))
+                    if _cur_len == _prev_len:
+                        break
+                    _prev_len = _cur_len
+                    pg.wait_for_timeout(350)
                 before.update(l.strip() for l in pg.inner_text("body").splitlines() if l.strip())      # 7.94: also kept for the page-text fallback below
             except Exception:
                 pass
@@ -6516,7 +6599,7 @@ class UIBackend:
             if time.monotonic() - t_empty < UI_SELECTOR_GRACE_S:
                 return res
             pg = _page(self.ab, ctx, base, self.recipe.get("entry"))
-            fb = ui_fallback_answer(pg.inner_text("body"), before, prompt)
+            fb = ui_fallback_answer(ui_main_text(pg), before, prompt)
             if not fb:
                 return res
             if not state.get("fb_logged"):
@@ -20534,7 +20617,13 @@ def build_prompt(req: NormReq, cfg: Config, fenced: bool, delta_from: Optional[i
             _D = _DSML
             _hint = (f' Skeleton: <{_D}DSML{_D}function_calls><{_D}DSML{_D}invoke name="TOOL"><{_D}DSML{_D}parameter name="ARG" string="true">VALUE</{_D}DSML{_D}parameter>'
                      f'</{_D}DSML{_D}invoke></{_D}DSML{_D}function_calls> - every opened tag must be closed, in that order.')
-        tail = (("\n\n(Continue as the assistant. To call a tool use ONLY the " + {"fenced": "```tool_call fenced JSON block", "dsml": "DSML function_calls format"}.get(fmt, "tag format") +
+        try:
+            _tn = [str(getattr(t_, "name", None) or (t_.get("name") if isinstance(t_, dict) else "") or "") for t_ in (req.tools or [])]
+            _tn = [x_ for x_ in _tn if x_][:12]
+        except Exception:
+            _tn = []
+        _tools_note = (" You DO have tools in this chat (" + ", ".join(_tn) + "): never say you cannot access local files - call a tool instead.") if _tn else ""
+        tail = (("\n\n(Continue as the assistant." + _tools_note + " To call a tool use ONLY the " + {"fenced": "```tool_call fenced JSON block", "dsml": "DSML function_calls format"}.get(fmt, "tag format") +
                  " exactly as defined at the start of this chat" + ("" if fmt == "dsml" else " - never XML/DSML/<invoke>") + "." + _hint +
                  (f" End the reply with the line {_mk}." if _mk else "") + ")") if req.tools else "")
         upd, shown_now = "", None
@@ -26813,41 +26902,67 @@ def pc_copy_to_clipboard(text: str) -> bool:
     return False
 
 
-def pc_open_extensions(home: Path, dash_port: int, admin_key: str, profile: str) -> Dict[str, Any]:
+def pc_last_used_profile() -> str:
+    """The Chrome profile folder Chrome itself opens by default (Local State: profile.last_used), else the only profile, else ''."""
+    try:
+        if os.name == "nt":
+            base = Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data"
+        elif sys.platform == "darwin":
+            base = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+        else:
+            base = Path.home() / ".config" / "google-chrome"
+        lu = str((json.loads((base / "Local State").read_text("utf-8")).get("profile") or {}).get("last_used") or "")
+        dirs = [p["dir"] for p in pc_chrome_profiles()]
+        if lu in dirs:
+            return lu
+        return dirs[0] if len(dirs) == 1 else ""
+    except Exception:
+        return ""
+
+
+def pc_open_extensions(home: Path, dash_port: int, admin_key: str, profile: str, pair: bool = False) -> Dict[str, Any]:
     """One click: (re)write the extension, make a one-time code, copy the extension folder path to the clipboard and open Chrome IN THE CHOSEN PROFILE on
     chrome://extensions plus the dashboard (which hands the code to the extension as soon as it is loaded). Chrome itself still requires the owner to switch on
     Developer mode and press 'Load unpacked' - extensions cannot be installed silently - so the path is already on the clipboard: paste it into the folder box."""
     known = {p["dir"]: p for p in pc_chrome_profiles()}
     if profile not in known:
-        raise BridgeError("choose one of the Chrome profiles from the list", "client", 400)
+        profile = pc_last_used_profile()                                          # no choice needed: the profile the owner is using; the extension reports itself once loaded
+    if profile and profile not in known:
+        profile = ""
+    known.setdefault(profile, {"dir": profile, "name": profile or "Chrome", "email": ""})
+    pf_args = [f"--profile-directory={profile}"] if profile else []
     chrome = pc_find_chrome()
     if not chrome:
         raise BridgeError("Google Chrome was not found on this computer; open chrome://extensions in your profile yourself and load the folder", "setup", 404)
     PC_DASH_PORT[0] = int(dash_port)
     hub = pc_hub(home)
     ext = pc_extract(hub.root)["path"]
-    code = hub.new_pairing()
-    clip = pc_copy_to_clipboard(str(ext))
-    dash = f"http://127.0.0.1:{int(dash_port)}/#k={urllib.parse.quote(admin_key, safe='')}&pair={hub.port}:{code}&pn={urllib.parse.quote(known[profile]['name'], safe='')}"
-    PC_PENDING_DIR[0] = (profile, time.time())
-    # chrome://extensions must be opened ALONE: when Chrome is already running, a command line that mixes a chrome:// URL with an http URL drops the chrome:// one
-    # and only the dashboard opens (a duplicate bridge tab). Open the extensions page first, then (after a short pause) the dashboard that carries the pairing code.
     _kw = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if os.name == "nt":
         _kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    opened_ext = False
-    try:
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", "-a", "Google Chrome", "--args", f"--profile-directory={profile}", "--new-tab", "chrome://extensions/"], **_kw)
-        else:
-            subprocess.Popen([chrome, f"--profile-directory={profile}", "--new-tab", "chrome://extensions/"], **_kw)
-        opened_ext = True
-    except Exception as e:
-        log(f"personal chrome setup: could not open chrome://extensions ({type(e).__name__}); open it yourself", "warn")
-    time.sleep(1.5)
-    subprocess.Popen([chrome, f"--profile-directory={profile}", "--new-tab", dash], **_kw)
-    log(f"personal chrome setup: opened Chrome profile '{known[profile]['name']}' on chrome://extensions", "info")
-    return {"opened": True, "extension_dir": str(ext), "clipboard": clip, "profile": known[profile]["name"], "port": hub.port, "code": code}
+    if pair:
+        # STEP 2 (only after the extension was loaded): open the dashboard in that profile with the one-time code; the extension's content script hands it over.
+        code = hub.new_pairing()
+        clip = False
+        dash = f"http://127.0.0.1:{int(dash_port)}/#k={urllib.parse.quote(admin_key, safe='')}&pair={hub.port}:{code}&pn={urllib.parse.quote(known[profile]['name'], safe='')}"
+        PC_PENDING_DIR[0] = (profile, time.time())
+        subprocess.Popen([chrome, *pf_args, "--new-tab", dash], **_kw)
+        log(f"personal chrome setup: opened the dashboard in Chrome profile '{known[profile]['name']}' to pair", "info")
+    else:
+        # STEP 1: copy the folder path and open ONLY chrome://extensions in the chosen profile (no dashboard tab - it used to open instead of / next to it).
+        code = ""
+        hub.open_auto_pair(900.0)
+        PC_PENDING_DIR[0] = (profile, time.time())
+        clip = pc_copy_to_clipboard(str(ext))
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", "-a", "Google Chrome", "--args", *pf_args, "--new-tab", "chrome://extensions/"], **_kw)
+            else:
+                subprocess.Popen([chrome, *pf_args, "--new-tab", "chrome://extensions/"], **_kw)
+        except Exception as e:
+            log(f"personal chrome setup: could not open chrome://extensions ({type(e).__name__}); open it yourself", "warn")
+        log(f"personal chrome setup: opened Chrome profile '{known[profile]['name']}' on chrome://extensions", "info")
+    return {"opened": True, "extension_dir": str(ext), "clipboard": clip, "profile": known[profile]["name"], "port": hub.port, "code": code, "step": "pair" if pair else "extensions"}
 
 
 def pc_api_status() -> Dict[str, Any]:
@@ -26857,8 +26972,68 @@ def pc_api_status() -> Dict[str, Any]:
             "extension_dir": str(hub.root / "extension"), "extension_version": PC_VERSION}
 
 
+_WIN_FOLDER_PICKER_PS = r"""
+$ErrorActionPreference='Stop'
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class BridgeFolderPicker {
+  [ComImport, Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7")] class FileOpenDialogRCW {}
+  [ComImport, Guid("42f85136-db7e-439c-85f1-e4075d135fc8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IFileOpenDialog {
+    [PreserveSig] int Show(IntPtr hwnd);
+    void SetFileTypes(uint c, IntPtr t); void SetFileTypeIndex(uint i); void GetFileTypeIndex(out uint i);
+    void Advise(IntPtr e, out uint c); void Unadvise(uint c);
+    void SetOptions(uint o); void GetOptions(out uint o);
+    void SetDefaultFolder(IShellItem i); void SetFolder(IShellItem i); void GetFolder(out IShellItem i); void GetCurrentSelection(out IShellItem i);
+    void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string n); void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string n);
+    void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string t); void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string t); void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string t);
+    void GetResult(out IShellItem i);
+  }
+  [ComImport, Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IShellItem { void BindToHandler(IntPtr p, ref Guid b, ref Guid r, out IntPtr o); void GetParent(out IShellItem i);
+    void GetDisplayName(uint n, [MarshalAs(UnmanagedType.LPWStr)] out string s); void GetAttributes(uint m, out uint a); void Compare(IShellItem i, uint h, out int o); }
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  public static string Pick(string title) {
+    var d = (IFileOpenDialog)new FileOpenDialogRCW();
+    uint o; d.GetOptions(out o); d.SetOptions(o | 0x20 | 0x40 | 0x800);   // PICKFOLDERS | FORCEFILESYSTEM | PATHMUSTEXIST
+    d.SetTitle(title);
+    int hr = d.Show(GetForegroundWindow());
+    if (hr == unchecked((int)0x800704C7)) return "";                        // cancelled
+    if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+    IShellItem it; d.GetResult(out it); string path; it.GetDisplayName(0x80058000, out path); return path;
+  }
+}
+'@
+[Console]::OutputEncoding=[System.Text.Encoding]::UTF8
+[Console]::Out.Write([BridgeFolderPicker]::Pick('Choose a Claude Code workspace'))
+"""
+
+
+def _pick_workspace_directory_windows() -> Optional[str]:
+    """The modern Windows 'Select Folder' dialog (the same one Explorer/Office use). None = it could not be opened (the caller falls back to Tk); '' = cancelled."""
+    ps = shutil.which("powershell") or shutil.which("pwsh")
+    if not ps:
+        return None
+    enc = base64.b64encode(_WIN_FOLDER_PICKER_PS.encode("utf-16-le")).decode("ascii")
+    try:
+        r = subprocess.run([ps, "-NoProfile", "-NonInteractive", "-STA", "-WindowStyle", "Hidden", "-EncodedCommand", enc], capture_output=True, timeout=600,
+                           stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception as e:
+        log(f"folder picker: native dialog failed ({type(e).__name__}); using the fallback", "warn")
+        return None
+    if r.returncode != 0:
+        log("folder picker: native dialog failed; using the fallback", "warn")
+        return None
+    out = r.stdout.decode("utf-8", "replace").strip().lstrip("\ufeff")
+    return str(Path(out).resolve()) if out and Path(out).is_dir() else ""
+
+
 def pick_workspace_directory() -> str:
     """Open the native folder picker on the local machine running the bridge."""
+    if os.name == "nt":
+        got = _pick_workspace_directory_windows()
+        if got is not None:
+            return got
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -27511,13 +27686,13 @@ class Handler(BaseHTTPRequestHandler):
             if not key_:
                 return self._json(404, {"error": "unknown API key"})
             try:
-                return self._json(200, launch_claude_terminal(str(b_.get("shell") or ""), int(cfg["port"]), str(key_["key"])))
+                return self._json(200, launch_claude_terminal(str(b_.get("shell") or ""), int(cfg["port"]), str(key_["key"]), str(b_.get("folder") or ""), bool(b_.get("auto"))))
             except BridgeError as e_:
                 return self._json(e_.status, {"error": str(e_)})
         if path == "/api/personal-chrome/open-extensions" and method == "POST":
             body_ = self._body()
             try:
-                return self._json(200, pc_open_extensions(app.store.home, int(cfg["port"]), str(cfg.get("admin_key") or ""), str((body_ or {}).get("profile") or "")))
+                return self._json(200, pc_open_extensions(app.store.home, int(cfg["port"]), str(cfg.get("admin_key") or ""), str((body_ or {}).get("profile") or ""), bool((body_ or {}).get("pair"))))
             except BridgeError as e_:
                 return self._json(e_.status, {"error": str(e_)})
         if path == "/api/personal-chrome/setup" and method == "POST":
@@ -28828,29 +29003,30 @@ def claude_shell_available(shell: str) -> bool:
     return bool(shutil.which(_CLAUDE_SHELL_EXE.get(shell, shell)))
 
 
-def claude_launch_argv(shell: str, env: Dict[str, str]) -> Tuple[List[str], bool]:
+def claude_launch_argv(shell: str, env: Dict[str, str], auto: bool = False) -> Tuple[List[str], bool]:
     """-> (argv, env_by_process). env_by_process True: the variables travel in the environment of the new process (Windows) or an `env` prefix (Unix);
     False (WSL): they are exported inside the command because Windows variables do not cross into WSL by themselves. No string from the browser is ever part of argv."""
     q = shlex.quote
+    cl = "claude --dangerously-skip-permissions" if auto else "claude"          # the owner's switch "fully automatic": Claude Code never asks for approval
     if shell == "cmd":
-        return ["cmd.exe", "/k", "claude"], True
+        return ["cmd.exe", "/k", cl], True
     if shell in ("powershell", "pwsh"):
-        return [shutil.which(shell) or (shell + (".exe" if os.name == "nt" else "")), "-NoLogo", "-NoExit", "-Command", "claude"], True
+        return [shutil.which(shell) or (shell + (".exe" if os.name == "nt" else "")), "-NoLogo", "-NoExit", "-Command", cl], True
     if shell == "gitbash":
-        return [_git_bash_path() or "bash.exe", "--login", "-i", "-c", "claude; exec bash --login -i"], True
+        return [_git_bash_path() or "bash.exe", "--login", "-i", "-c", cl + "; exec bash --login -i"], True
     if shell == "wsl":
         inline = "; ".join(f"export {k}={q(v)}" for k, v in env.items())
-        return [shutil.which("wsl") or "wsl.exe", "--", "bash", "-lc", inline + "; claude; exec bash -l"], False
+        return [shutil.which("wsl") or "wsl.exe", "--", "bash", "-lc", inline + "; " + cl + "; exec bash -l"], False
     if shell in ("bash", "zsh"):
-        return [shell, "-l", "-i", "-c", f"claude; exec {shell} -l -i"], True
+        return [shell, "-l", "-i", "-c", f"{cl}; exec {shell} -l -i"], True
     if shell == "fish":
-        return ["fish", "-i", "-C", "claude"], True
+        return ["fish", "-i", "-C", cl], True
     if shell in ("sh", "ksh"):
-        return [shell, "-c", f"claude; exec {shell}"], True
+        return [shell, "-c", f"{cl}; exec {shell}"], True
     if shell == "tcsh":
-        return ["tcsh", "-c", "claude; exec tcsh"], True
+        return ["tcsh", "-c", cl + "; exec tcsh"], True
     if shell == "nushell":
-        return ["nu", "-e", "claude"], True
+        return ["nu", "-e", cl], True
     raise BridgeError("unknown environment", "client", 400)
 
 
@@ -28863,7 +29039,7 @@ def _linux_terminal_prefix() -> List[str]:
     return []
 
 
-def launch_claude_terminal(shell: str, port: int, api_key: str) -> Dict[str, Any]:
+def launch_claude_terminal(shell: str, port: int, api_key: str, folder: str = "", auto: bool = False) -> Dict[str, Any]:
     """Open a NEW terminal window in the chosen environment with the bridge variables set and `claude` started. Every call opens one more window,
     so any number of Claude Code sessions can run side by side. The key never goes into the log."""
     if shell not in CLAUDE_SHELL_IDS:
@@ -28873,8 +29049,18 @@ def launch_claude_terminal(shell: str, port: int, api_key: str) -> Dict[str, Any
     if not claude_shell_available(shell):
         raise BridgeError(f"'{shell}' was not found on this computer; copy the command and use it where it exists", "setup", 404)
     env = claude_launch_env(f"http://127.0.0.1:{int(port)}", api_key)
-    argv, by_env = claude_launch_argv(shell, env)
+    argv, by_env = claude_launch_argv(shell, env, auto)
     home = str(Path.home())
+    folder = (folder or "").strip()
+    if folder:                                                  # the owner's own working folder for this Claude Code (empty = the home folder, as before)
+        wd_ = Path(folder).expanduser()
+        if not wd_.is_dir():
+            raise BridgeError("the working folder does not exist: " + folder[:200], "client", 400)
+        home = str(wd_.resolve())
+        if shell == "wsl":
+            argv = argv[:1] + ["--cd", home] + argv[1:]
+        elif shell == "gitbash":
+            env = dict(env, CHERE_INVOKING="1")                 # Git Bash login shells would otherwise jump to ~
     try:
         if os.name == "nt":
             penv = os.environ.copy()
@@ -28884,7 +29070,7 @@ def launch_claude_terminal(shell: str, port: int, api_key: str) -> Dict[str, Any
         else:
             full = (["env"] + [f"{k}={v}" for k, v in env.items()] if by_env else []) + argv
             if sys.platform == "darwin":
-                script = 'tell application "Terminal"\n activate\n do script "' + shlex.join(full).replace("\\", "\\\\").replace('"', '\\"') + '"\nend tell'
+                script = 'tell application "Terminal"\n activate\n do script "' + ("cd " + shlex.quote(home) + " && " + shlex.join(full)).replace("\\", "\\\\").replace('"', '\\"') + '"\nend tell'
                 proc = subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 term = _linux_terminal_prefix()
@@ -28893,7 +29079,7 @@ def launch_claude_terminal(shell: str, port: int, api_key: str) -> Dict[str, Any
                 proc = subprocess.Popen(term + full, cwd=home, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError as e:
         raise BridgeError(f"could not start {shell}: {e}", "setup", 500)
-    log(f"Claude Code started in a new {shell} window", "info")
+    log(f"Claude Code started in a new {shell} window" + (f" (folder {home})" if folder else "") + (" - fully automatic (no approvals)" if auto else ""), "info")
     return {"ok": True, "shell": shell, "pid": int(proc.pid)}
 
 
@@ -29089,6 +29275,35 @@ dialog.dr[open]{animation:drw .22s ease-out}
 .dh{display:flex;align-items:center;gap:.6rem;margin-bottom:.9rem;font-weight:700;font-size:1.1rem}
 .sec{display:grid;gap:.7rem;padding:1rem 0;border-top:1px solid var(--ln)}
 .sec h3{font-size:.93rem;color:var(--mu);font-weight:600;display:flex;align-items:center;gap:.5rem}
+
+dialog.dr{background:radial-gradient(130% 34% at 50% 0,rgba(124,92,255,.20),transparent 62%),var(--bg)}
+.dh{align-items:center;gap:.8rem;margin-bottom:1rem}
+.dh .hbadge{width:2.6rem;height:2.6rem;border-radius:.9rem;display:grid;place-items:center;color:#fff;font-size:1.15rem;background:linear-gradient(135deg,var(--a1),var(--a2));box-shadow:0 8px 22px -8px var(--a1)}
+.dh .htx{display:grid;line-height:1.35}.dh .htx b{font-size:1.15rem}.dh .htx small{font-weight:400;font-size:.8rem;color:var(--mu)}
+.helpcard{margin-bottom:.9rem}
+details.sec.card{display:block;padding:0;border:1px solid var(--ln);border-radius:1.15rem;background:var(--s1);margin-bottom:.7rem;transition:border-color .2s,box-shadow .2s}
+details.sec.card:hover{border-color:rgba(124,92,255,.45)}
+details.sec.card[open]{border-color:rgba(124,92,255,.5);box-shadow:0 14px 34px -22px var(--a1)}
+details.card>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:.8rem;padding:.8rem .9rem;border-radius:1.15rem;-webkit-user-select:none;user-select:none}
+details.card>summary::-webkit-details-marker{display:none}
+details.card>summary:focus-visible{outline:2px solid var(--a1);outline-offset:-2px}
+details.card>summary::after{content:"";flex:none;width:.5rem;height:.5rem;border:solid var(--mu);border-width:0 2px 2px 0;transform:rotate(45deg);transition:transform .2s;margin-inline:.3rem .2rem}
+details.card[open]>summary::after{transform:rotate(-135deg)}
+.sico{flex:none;width:2.4rem;height:2.4rem;border-radius:.8rem;display:grid;place-items:center;color:var(--a1);font-size:1.05rem;background:linear-gradient(135deg,rgba(124,92,255,.20),rgba(34,211,238,.14));border:1px solid rgba(124,92,255,.22)}
+.stx{flex:1;min-width:0;display:grid;line-height:1.4}.stx b{font-size:.98rem;font-weight:700;color:var(--tx)}.stx small{font-size:.8rem;color:var(--mu);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+details.card>.fb{display:grid;gap:.8rem;padding:.2rem .9rem 1rem}
+details.card[open]>.fb{animation:fbin .22s ease-out}@keyframes fbin{from{opacity:0;transform:translateY(-.35rem)}to{opacity:1;transform:none}}
+details.card input[type=text]{border-radius:.85rem;padding:.6rem .85rem;transition:border-color .15s,box-shadow .15s}
+details.card input[type=text]:focus{outline:0;border-color:var(--a1);box-shadow:0 0 0 3px rgba(124,92,255,.22)}
+.wdbox{display:grid;gap:.5rem;padding:.8rem;border-radius:.95rem;background:var(--s2);border:1px dashed var(--ln)}
+.wdrow{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}.wdrow input{flex:1 1 11rem}
+.autobox{display:flex;align-items:center;gap:.8rem;padding:.7rem .8rem;border-radius:.95rem;background:var(--s2);border:1px solid var(--ln);cursor:pointer}.autobox:has(input:checked){border-color:var(--wa);background:rgba(251,191,36,.08)}.autobox .atx{display:grid;line-height:1.5}.autobox .atx b{font-size:.93rem}.autobox .atx small{color:var(--mu);font-size:.8rem}
+.okline{min-height:1.2em;color:var(--ok);font-weight:600;word-break:break-all;direction:ltr;text-align:start}
+.compat{font-size:.78rem;line-height:1.7;opacity:.85;padding:.7rem .8rem;border-radius:.8rem;background:var(--s2);border:1px solid var(--ln);margin:0}
+.runrow .btn.p{box-shadow:0 10px 24px -12px var(--a1)}
+.btn.p:hover{filter:brightness(1.08)}
+.xsteps{padding:.2rem 0}.xsteps li{align-items:flex-start}
+@media(prefers-reduced-motion:reduce){details.card[open]>.fb,dialog.dr[open]{animation:none}}
 .sites{display:grid;grid-template-columns:repeat(auto-fill,minmax(7.2rem,1fr));gap:.6rem}
 .site{display:grid;justify-items:center;gap:.5rem;padding:.9rem .4rem;border-radius:.9rem;background:var(--s2);border:1px solid var(--ln);min-width:0}
 .site span{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -29188,21 +29403,26 @@ dialog.help[open]{display:flex;flex-direction:column;overflow:hidden}
 <div class="ctl" style="margin-bottom:.8rem"><span class="lbl" data-t="profile"></span><div id="ddAdd"></div></div>
 <div class="sites" id="sites"></div>
 <div class="ctl" style="margin-top:.9rem"><input type="text" class="ltr" id="addUrl" placeholder="https://…" style="flex:1 1 12rem"><button class="btn p" id="addGo" data-t="add"></button></div></dialog>
-<dialog id="dSet" class="dr"><div class="dh"><span data-ic="gear"></span><span data-t="settings"></span><span class="sp"></span><button class="ib sm" data-close data-ic="x" aria-label="Close"></button></div>
+<dialog id="dSet" class="dr"><div class="dh"><span class="hbadge" data-ic="gear"></span><span class="htx"><b data-t="settings"></b><small data-t="settings_sub"></small></span><span class="sp"></span><button class="ib sm" data-close data-ic="x" aria-label="Close"></button></div>
 <button class="helpcard" id="bHelp"><span class="hi" data-ic="book"></span><span class="ht"><b data-t="help"></b><small data-t="help_sub"></small></span><span data-ic="chevr"></span></button>
-<div class="sec"><h3><span data-ic="plug"></span><span data-t="connect"></span></h3>
+<details class="sec card" open><summary><span class="sico" data-ic="plug"></span><span class="stx"><b data-t="connect"></b><small data-t="connect_sub"></small></span></summary><div class="fb">
 <div class="ctl"><span class="lbl" data-t="key_l"></span><div id="ddKey"></div></div>
-<div class="code"><div class="ch"><span class="tt"><span data-ic="terminal"></span><span id="codeT"></span></span><button class="cp" id="codeCopy" type="button"></button></div><pre><code id="codeBody"></code></pre></div><p class="hin ltr" id="compatLine" style="font-size:.78rem;opacity:.8;margin:.4rem 0 0"></p>
+<div class="code"><div class="ch"><span class="tt"><span data-ic="terminal"></span><span id="codeT"></span></span><button class="cp" id="codeCopy" type="button"></button></div><pre><code id="codeBody"></code></pre></div>
+<div class="wdbox"><span class="lbl"><span data-ic="folder"></span><span data-t="wd_l"></span></span>
+<div class="wdrow"><input type="text" id="wdPath" class="ltr" dir="ltr" data-ph="wd_ph" autocomplete="off" spellcheck="false"><button class="btn sm" id="wdPick" type="button"><span data-ic="folder"></span><span data-t="wd_pick"></span></button><button class="btn sm p" id="wdSave" type="button"><span data-ic="check"></span><span data-t="wd_save"></span></button></div>
+<p class="hint okline" id="wdState"></p></div>
+<label class="autobox"><span class="sw"><input type="checkbox" id="autoOn"><i></i></span><span class="atx"><b data-t="auto_l"></b><small data-t="auto_h"></small></span></label>
 <div class="ctl runrow"><div id="ddEnv"></div><button class="btn p" id="runBtn" type="button"><span data-ic="play"></span><span data-t="run"></span></button></div>
-<p class="hint" id="envHint"></p></div>
-<div class="sec"><h3><span data-ic="package"></span><span data-t="chrome"></span></h3>
+<p class="hint" id="envHint"></p></div></details>
+<details class="sec card" open><summary><span class="sico" data-ic="package"></span><span class="stx"><b data-t="chrome"></b><small data-t="chrome_sub"></small></span></summary><div class="fb">
 <div class="ctl"><span class="lbl" data-t="profile"></span><div id="ddChrome"></div></div>
 <div class="pathbox"><code id="chromeDir" tabindex="0"></code><button class="cp" id="pathCopy" type="button"></button></div>
 <button class="btn p wide" id="chromeGo" type="button"><span data-ic="package"></span><span data-t="ext_btn"></span></button>
-<ol class="xsteps"><li data-t="ext_s1"></li><li data-t="ext_s2"></li></ol></div>
-<div class="sec"><h3><span data-ic="grid"></span><span data-t="layout"></span></h3><div class="lbl" data-t="cols_l"></div><div class="chips" id="colChips"></div><p class="hint" data-t="cols_hint"></p></div>
-<div class="sec"><h3><span data-ic="key"></span><span data-t="keys"></span></h3><div id="keys"></div><div class="ctl"><input type="text" id="keyLbl" style="flex:1 1 8rem" data-ph="key_name"><button class="btn sm" id="keyNew" data-t="create"></button></div></div>
-<div class="sec"><h3><span data-ic="sparkle"></span><span data-t="advisor"></span></h3><div class="lbl" data-t="adv_engine_l"></div><div class="chips" id="advChips"></div><p class="hint" id="advEngineHint"></p>
+<ol class="xsteps"><li data-t="ext_s1"></li><li data-t="ext_s2"></li><li data-t="ext_s3"></li></ol>
+<button class="btn wide" id="chromePair" type="button"><span data-ic="plug"></span><span data-t="ext_pair"></span></button></div></details>
+<details class="sec card"><summary><span class="sico" data-ic="grid"></span><span class="stx"><b data-t="layout"></b><small data-t="layout_sub"></small></span></summary><div class="fb"><div class="lbl" data-t="cols_l"></div><div class="chips" id="colChips"></div><p class="hint" data-t="cols_hint"></p></div></details>
+<details class="sec card"><summary><span class="sico" data-ic="key"></span><span class="stx"><b data-t="keys"></b><small data-t="keys_sub"></small></span></summary><div class="fb"><div id="keys"></div><div class="ctl"><input type="text" id="keyLbl" style="flex:1 1 8rem" data-ph="key_name"><button class="btn sm" id="keyNew" data-t="create"></button></div></div></details>
+<details class="sec card"><summary><span class="sico" data-ic="sparkle"></span><span class="stx"><b data-t="advisor"></b><small data-t="advisor_sub"></small></span></summary><div class="fb"><div class="lbl" data-t="adv_engine_l"></div><div class="chips" id="advChips"></div><p class="hint" id="advEngineHint"></p>
 <div class="ctl"><span class="hint" id="agentInfo"></span><button class="btn sm" id="agentLogin" type="button" data-t="agent_signin" style="display:none"></button><button class="btn sm" id="agentChk" type="button" data-t="agent_check"></button></div>
 <p class="hint" data-t="agent_own" style="display:none"></p>
 <div class="lbl" data-t="bk_l" style="display:none"></div><div class="chips" id="agBackChips" style="display:none"></div><p class="hint" id="agBackHint" style="display:none"></p>
@@ -29211,8 +29431,9 @@ dialog.help[open]{display:flex;flex-direction:column;overflow:hidden}
 <label class="ctl"><span class="sw"><input type="checkbox" id="uiLearnOn"><i></i></span><span data-t="sites_on"></span></label>
 <label class="ctl"><span class="sw"><input type="checkbox" id="pcAutoOn"><i></i></span><span data-t="pcauto_on"></span></label>
 <div class="ctl"><button class="btn sm" id="gPrompt" data-t="g_prompt"></button><button class="btn sm" id="gApplied" data-t="g_applied"></button><span class="hint" id="gPromptN"></span></div>
-<h3 style="margin-top:.4rem"><span data-ic="globe"></span><span data-t="sites_l"></span></h3><div id="uiSites"></div></div>
-<div class="sec"><h3><span data-ic="wrench"></span><span data-t="more"></span></h3><div class="ctl"><button class="btn sm" id="logCopy" data-t="copy_log"></button><a class="btn sm" href="/classic" id="classic" data-t="classic"></a></div></div></dialog>
+<h3 style="margin-top:.4rem"><span data-ic="globe"></span><span data-t="sites_l"></span></h3><div id="uiSites"></div></div></details>
+<details class="sec card"><summary><span class="sico" data-ic="wrench"></span><span class="stx"><b data-t="more"></b><small data-t="more_sub"></small></span></summary><div class="fb"><div class="ctl"><button class="btn sm" id="logCopy" data-t="copy_log"></button><a class="btn sm" href="/classic" id="classic" data-t="classic"></a></div>
+<div class="lbl" data-t="compat_l"></div><p class="hint ltr compat" id="compatLine"></p></div></details></dialog>
 <dialog id="dHelp" class="help" aria-labelledby="hTitle"><div class="hhd"><span class="hi" data-ic="book"></span><span id="hTitle" data-t="help_title"></span><span class="sp"></span><button class="ib sm" data-close data-ic="x" aria-label="Close"></button></div><div class="hbd" id="hBody"></div></dialog>
 <div id="toast" role="status" aria-live="polite"></div>
 <script>
@@ -29225,7 +29446,7 @@ const api=async(p,m,b)=>{const o={method:m||'GET',headers:{'x-admin-key':K,'cont
 /* ---------- icons ---------- */
 const IC={bolt:'<path d="M13 2 3 14h8l-1 8 10-12h-8z"/>',gear:'<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
 contrast:'<circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/>',book:'<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V3H6.5A2.5 2.5 0 0 0 4 5.5z"/><path d="M20 17v4H6.5A2.5 2.5 0 0 1 4 18.5"/>',
-plug:'<path d="M12 22v-5M9 8V2M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8z"/>',package:'<path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="m3 8 9 5 9-5M12 13v8"/>',
+folder:'<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',plug:'<path d="M12 22v-5M9 8V2M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8z"/>',package:'<path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="m3 8 9 5 9-5M12 13v8"/>',
 copy:'<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',check:'<path d="M20 6 9 17l-5-5"/>',play:'<path d="M7 4v16l13-8z"/>',
 terminal:'<path d="m4 17 6-6-6-6M12 19h8"/>',plus:'<path d="M12 5v14M5 12h14"/>',x:'<path d="M18 6 6 18M6 6l12 12"/>',chev:'<path d="m6 9 6 6 6-6"/>',chevr:'<path d="m9 18 6-6-6-6"/>',
 search:'<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',link:'<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
@@ -29262,7 +29483,7 @@ test:'تست اتصال',relogin:'ورود دوباره',def:'اکانت اصل�
 rr:'چرخشی',po:'به ترتیب اولویت (بعدی فقط در صورت نیاز)',drag:'جابه‌جایی اکانت (بکش، یا با کلید جهت‌دار)',drag_p:'جابه‌جایی پروفایل (بکش، یا با کلید جهت‌دار)',saved:'ترتیب ذخیره شد',sites_l:'یادگیری سایت‌ها',sites_on:'مشاور ظاهر صفحهٔ هر سایت جدید را یک بار یاد بگیرد',sites_none:'هنوز سایتی یاد گرفته نشده',forget:'فراموش کن',st_learned:'یاد گرفته (منتظر تأیید)',st_verified:'تأیید شده',st_stale:'قدیمی شده',st_rejected:'نتیجه‌ای نداشت',ll:'کم‌کارترین',lru:'بیشترین استراحت',rnd:'تصادفی',pf:'اکانت اصلی اول',hw:'بهترین سلامت',ok_t:'عالی',fail_t:'ناموفق',sure:'مطمئنی؟',custom:'آدرس دلخواه',connected:'متصل',
 help:'راهنما',help_sub:'آموزش کامل و ساده استفادهٔ برنامه',help_title:'راهنمای استفاده',close:'بستن',key_l:'کلید',run:'اجرا',run_ok:'Claude Code در یک پنجرهٔ تازه باز شد',no_key:'اول یک کلید بساز',
 hint_run:'«اجرا» یک پنجرهٔ ترمینال تازه با Claude Code باز می‌کند؛ هر بار که بزنی یک نشست جدا و هم‌زمان می‌گیری.',hint_copy:'این گزینه فقط برای کپی است و اجرا ندارد.',hint_missing:'این محیط روی این کامپیوتر پیدا نشد؛ کپی کردن دستور همچنان کار می‌کند.',hint_wsl:'در WSL برای رسیدن به 127.0.0.1 ویندوز معمولاً باید شبکهٔ WSL روی حالت mirrored باشد.',
-g_win:'ویندوز',g_unix:'یونیکس / مک',g_other:'سایر شل‌ها',g_file:'فایل / تنظیمات',ext_btn:'کپی آدرس و باز کردن افزونه‌ها',ext_s1:'در صفحهٔ باز شده «Developer mode» را روشن کن تا دکمهٔ «Load unpacked» ظاهر شود.',ext_s2:'روی Load unpacked بزن، آدرس کپی‌شده را در پنجره Paste کن و تأیید (OK) را بزن تا افزونه نصب شود.',ext_copied:'آدرس کپی شد و Chrome باز شد',ext_noprof:'اول یک پروفایل Chrome انتخاب کن',
+g_win:'ویندوز',g_unix:'یونیکس / مک',g_other:'سایر شل‌ها',g_file:'فایل / تنظیمات',ext_btn:'باز کردن صفحهٔ افزونه‌ها (chrome://extensions)',ext_s1:'مسیر پوشه کپی می‌شود و فقط صفحهٔ افزونه‌ها باز می‌شود. «Developer mode» را روشن کن.',ext_s2:'روی «Load unpacked» بزن، مسیر کپی‌شده را Paste کن و OK بزن.',ext_s3:'بعد از نصب، دکمهٔ زیر را بزن تا اتصال خودکار انجام شود.',ext_pair:'افزونه نصب شد؛ اتصال خودکار',ext_paired:'داشبورد در Chrome باز شد؛ اتصال خودکار انجام می‌شود',wd_l:'پوشهٔ کار Claude Code',wd_ph:'مثلاً C:\\Projects\\my-app  (خالی = پوشهٔ خانه)',wd_pick:'انتخاب پوشه',wd_hint:'«اجرا» ترمینال را در همین پوشه باز می‌کند و دستور کپی‌شده هم با cd به آن شروع می‌شود.',wd_nopick:'پنجرهٔ انتخاب پوشه باز نشد؛ مسیر را دستی بنویس',ext_copied:'آدرس کپی شد و Chrome باز شد',ext_noprof:'اول یک پروفایل Chrome انتخاب کن',settings_sub:'اتصال، افزونه و ظاهر برنامه',auto_l:'حالت کاملاً خودکار',auto_h:'Claude Code هیچ تأییدی نمی‌خواهد (--dangerously-skip-permissions)؛ فقط روی پوشهٔ پروژه‌ات استفاده کن',connect_sub:'کلید، دستور و پوشهٔ پروژه',chrome_sub:'نصب افزونه و اتصال به پروفایل',layout_sub:'تعداد کارت در هر ردیف',keys_sub:'ساخت و مدیریت کلیدهای API',advisor_sub:'تعمیر خودکار و یادگیری سایت‌ها',more_sub:'گزارش خطا و سازگاری',compat_l:'سازگاری Claude Code',wd_save:'ثبت',wd_saved:'پوشه ثبت شد',wd_saved_l:'✓ ثبت‌شده:',wd_unsaved:'هنوز ثبت نشده',
 layout:'چیدمان کارت‌ها',cols_l:'تعداد کارت در هر ردیف',cols_auto:'خودکار',cols_hint:'روی صفحه‌های کوچک‌تر خودکار کمتر می‌شود تا چیزی به هم نریزد.',search:'جستجو…',no_results:'نتیجه‌ای نیست',
 poff:'پروفایل خاموش',prof_on:'پروفایل روشن شد',prof_off:'پروفایل خاموش شد',poff_note:'این پروفایل خاموش است؛ اکانت‌هایش از چرخش بیرون‌اند و تنظیماتشان سر جایش مانده.',prof_sw:'روشن / خاموش کردن کل پروفایل',
 rename:'تغییر نام',dbl_rename:'دابل‌کلیک برای تغییر نام',global_s:'کلی',follow_tip:'از قانون کلی پیروی می‌کند؛ بزن تا عدد مخصوص خودش را داشته باشد',back_global:'برگشت به قانون کلی',acc_sw:'روشن / خاموش',theme:'تم',lang:'زبان'},
@@ -29272,7 +29493,7 @@ test:'Test connection',relogin:'Log in again',def:'Main account',del:'Remove',do
 rr:'Round robin',po:'By priority (next only if needed)',drag:'Move account (drag, or use arrow keys)',drag_p:'Move profile (drag, or use arrow keys)',saved:'Order saved',sites_l:'Learned sites',sites_on:"Let the advisor learn each new site's page once",sites_none:'No site learned yet',forget:'Forget',st_learned:'Learned (awaiting confirmation)',st_verified:'Verified',st_stale:'Stale',st_rejected:'Nothing learned',ll:'Least busy',lru:'Longest rested',rnd:'Random',pf:'Main account first',hw:'Best health',ok_t:'Great',fail_t:'Failed',sure:'Sure?',custom:'Custom URL',connected:'connected',
 help:'Help',help_sub:'A complete, simple guide to using the app',help_title:'How to use',close:'Close',key_l:'Key',run:'Run',run_ok:'Claude Code opened in a new window',no_key:'Create a key first',
 hint_run:'“Run” opens a fresh terminal window with Claude Code; every press gives you another separate, parallel session.',hint_copy:'This option is copy-only; it has no Run.',hint_missing:'This environment was not found on this computer; copying the command still works.',hint_wsl:'In WSL, reaching Windows 127.0.0.1 usually needs WSL networking in mirrored mode.',
-g_win:'Windows',g_unix:'Unix / Mac',g_other:'Other shells',g_file:'Files / settings',ext_btn:'Copy path & open extensions',ext_s1:'On the page that opens, turn on “Developer mode” so the “Load unpacked” button appears.',ext_s2:'Press Load unpacked, paste the copied path into the folder box and confirm (OK) to install the extension.',ext_copied:'Path copied and Chrome opened',ext_noprof:'Pick a Chrome profile first',
+g_win:'Windows',g_unix:'Unix / Mac',g_other:'Other shells',g_file:'Files / settings',ext_btn:'Open extensions page (chrome://extensions)',ext_s1:'The folder path is copied and only the extensions page opens. Turn on “Developer mode”.',ext_s2:'Press “Load unpacked”, paste the copied path and press OK.',ext_s3:'After it is installed, press the button below to connect automatically.',ext_pair:'Extension installed - connect automatically',ext_paired:'The dashboard opened in Chrome; connecting automatically',wd_l:'Claude Code working folder',wd_ph:'e.g. C:\\Projects\\my-app  (empty = home folder)',wd_pick:'Choose folder',wd_hint:'“Run” opens the terminal in this folder, and the copied command starts with a cd to it.',wd_nopick:'The folder picker could not open; type the path',ext_copied:'Path copied and Chrome opened',ext_noprof:'Pick a Chrome profile first',settings_sub:'Connection, extension and appearance',auto_l:'Fully automatic mode',auto_h:'Claude Code never asks for approval (--dangerously-skip-permissions); use it only on your own project folder',connect_sub:'Key, command and project folder',chrome_sub:'Install the extension and link a profile',layout_sub:'Cards per row',keys_sub:'Create and manage API keys',advisor_sub:'Auto-repair and site learning',more_sub:'Error report and compatibility',compat_l:'Claude Code compatibility',wd_save:'Save',wd_saved:'Folder saved',wd_saved_l:'✓ Saved:',wd_unsaved:'Not saved yet',
 layout:'Card layout',cols_l:'Cards per row',cols_auto:'Auto',cols_hint:'On smaller screens it automatically uses fewer so nothing breaks.',search:'Search…',no_results:'No results',
 poff:'Profile off',prof_on:'Profile turned on',prof_off:'Profile turned off',poff_note:'This profile is off; its accounts are out of rotation and all their settings are kept.',prof_sw:'Turn the whole profile on / off',
 rename:'Rename',dbl_rename:'Double-click to rename',global_s:'Global',follow_tip:'Follows the global rule; press to give it its own number',back_global:'Back to the global rule',acc_sw:'On / off',theme:'Theme',lang:'Language'}};
@@ -29462,7 +29683,7 @@ const curEnv=()=>ENVS.find(x=>x.id===ddEnv.get())||ENVS[0],curKey=()=>{const ks=
 const envAvail=e=>!e.run?false:(SH?!!(SH.shells.find(s=>s.id===e.id)||{}).available:true);
 function defEnv(){let v=localStorage.env;if(!ENVS.some(x=>x.id===v)){const o=SH&&SH.os;v=o==='macos'?'zsh':o==='linux'?'bash':'cmd'}return v}
 function envItems(){return ENVS.map(e=>({v:e.id,label:e.label,ltr:true,g:t('g_'+e.g),dim:!!e.run&&!envAvail(e),sub:!e.run?t('copy'):(envAvail(e)?'':'—'),k:e.id}))}
-function renderCode(){const e=curEnv(),k=curKey(),lines=snipLines(e.id,location.origin,k?k.key:'<your-key>');$('codeT').textContent=e.title||e.label;
+function renderCode(){const e=curEnv(),k=curKey(),lines=snipLines(e.id,location.origin,k?k.key:'<your-key>'),wd=($('wdPath')&&$('wdPath').value||'').trim();if($('autoOn')&&$('autoOn').checked){for(const l of lines){const x=l[l.length-1];if(x&&x[1]==='claude')x[1]='claude --dangerously-skip-permissions'}}if(wd&&e.id!=='wsl')lines.unshift([T('',(e.id==='cmd'?'cd /d "'+wd+'"':'cd "'+wd+'"'))]);$('codeT').textContent=e.title||e.label;
 $('codeBody').innerHTML=lines.map(l=>`<span class="ln">${l.map(([c,x])=>c?`<span class="${c}">${E(x)}</span>`:E(x)).join('')}</span>`).join('');CODE_TXT=lines.map(l=>l.map(x=>x[1]).join('')).join('\n');
 const can=envAvail(e);$('runBtn').disabled=!can;$('envHint').textContent=!e.run?t('hint_copy'):!can?t('hint_missing'):e.id==='wsl'?t('hint_wsl'):t('hint_run')}
 function renderKeys(){const ks=S.keys||[];ddKey.set(ks.map(k=>({v:k.id,label:k.label||k.id,sub:k.key.slice(0,6)+'…'+k.key.slice(-4),ltr:true})));
@@ -29471,12 +29692,18 @@ document.addEventListener('click',async e=>{const b=e.target.closest('[data-kcop
 $('keyNew').onclick=async()=>{await post('keys',{label:$('keyLbl').value.trim()||'key',account:''});$('keyLbl').value='';renderKeys()};
 $('codeCopy').onclick=async()=>{if(await copyText(CODE_TXT)){flash($('codeCopy'));toast(t('copied'))}else toast(t('fail_t'))};
 $('runBtn').onclick=async()=>{const e=curEnv(),k=curKey();if(!e.run||$('runBtn').disabled)return;if(!k)return toast(t('no_key'));$('runBtn').disabled=true;
-try{await api('launch-claude','POST',{shell:e.id,key:k.id});toast(t('run_ok'))}catch(x){toast(x.message.slice(0,140))}setTimeout(()=>{$('runBtn').disabled=!envAvail(curEnv())},700)};
+try{await api('launch-claude','POST',{shell:e.id,key:k.id,folder:($('wdPath').value||'').trim(),auto:$('autoOn').checked});toast(t('run_ok'))}catch(x){toast(x.message.slice(0,140))}setTimeout(()=>{$('runBtn').disabled=!envAvail(curEnv())},700)};
+function wdState(){const v=($('wdPath').value||'').trim();let sv='';try{sv=localStorage.workDir||''}catch(e){}$('wdState').textContent=v&&v===sv?t('wd_saved_l')+' '+sv:(v?t('wd_unsaved'):'');$('wdSave').disabled=!v||v===sv;$('wdState').style.color=v&&v===sv?'':'var(--wa)'}
+$('autoOn').onchange=()=>{try{localStorage.autoRun=$('autoOn').checked?'1':''}catch(e){}renderCode()};
+$('wdPath').oninput=()=>{wdState();renderCode()};$('wdPath').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();$('wdSave').click()}};
+$('wdSave').onclick=()=>{const v=$('wdPath').value.trim();try{localStorage.workDir=v}catch(e){}wdState();renderCode();toast(t('wd_saved'))};
+$('wdPick').onclick=async()=>{try{const r=await api('workspace/select','POST',{});if(r&&r.folder){$('wdPath').value=r.folder;try{localStorage.workDir=r.folder}catch(e){}wdState();renderCode()}}catch(x){toast(t('wd_nopick'))}};
 $('pathCopy').onclick=async()=>{if(EXTDIR&&await copyText(EXTDIR)){flash($('pathCopy'));toast(t('copied'))}};
-$('chromeGo').onclick=async()=>{const prof=ddChrome.get();if(!prof)return toast(t('ext_noprof'));localStorage.chromeProf=prof;if(EXTDIR){await copyText(EXTDIR);flash($('pathCopy'))}
-const r=await post('personal-chrome/open-extensions',{profile:prof});if(r){if(r.extension_dir){EXTDIR=r.extension_dir;$('chromeDir').textContent=EXTDIR}toast(t('ext_copied'));let n=0;const iv=setInterval(async()=>{await tick();if(++n>60||S.pc_profiles.some(p=>p.connected))clearInterval(iv)},3000)}};
+$('chromeGo').onclick=async()=>{const prof=ddChrome.get()||'';if(prof)localStorage.chromeProf=prof;if(EXTDIR){await copyText(EXTDIR);flash($('pathCopy'))}
+const r=await post('personal-chrome/open-extensions',{profile:prof});if(r){if(r.extension_dir){EXTDIR=r.extension_dir;$('chromeDir').textContent=EXTDIR}toast(t('ext_copied'))}};
+$('chromePair').onclick=async()=>{const prof=ddChrome.get()||'';const r=await post('personal-chrome/open-extensions',{profile:prof,pair:true});if(r){toast(t('ext_paired'));let n=0;const iv=setInterval(async()=>{await tick();if(++n>60||S.pc_profiles.some(p=>p.connected))clearInterval(iv)},3000)}};
 $('logCopy').onclick=async()=>{try{const r=await api('logfile?level=info&tail=300&report=1');await copyText(typeof r==='string'?r:JSON.stringify(r));toast(t('copied'))}catch(x){toast(x.message.slice(0,80))}};
-$('bSet').onclick=async()=>{renderKeys();loadUiSites();advRender();bkRender();agentInfo(false);$('pcAutoOn').checked=!(S.settings&&S.settings.pc_autostart_profiles===false);gPromptInfo();api('compat').then(c=>{$('compatLine').textContent=c.line}).catch(()=>{});$('dSet').showModal();
+$('bSet').onclick=async()=>{try{$('wdPath').value=localStorage.workDir||'';$('autoOn').checked=localStorage.autoRun==='1'}catch(e){}wdState();renderKeys();loadUiSites();advRender();bkRender();agentInfo(false);$('pcAutoOn').checked=!(S.settings&&S.settings.pc_autostart_profiles===false);gPromptInfo();api('compat').then(c=>{$('compatLine').textContent=c.line}).catch(()=>{});$('dSet').showModal();
 try{const r=await api('personal-chrome/profiles'),ps=r.profiles||[];ddChrome.set(ps.map(p=>({v:p.dir,label:p.name,sub:p.email||'',k:p.dir})),ps.some(p=>p.dir===localStorage.chromeProf)?localStorage.chromeProf:undefined)}catch(e){}
 try{const r=await api('personal-chrome/extension-path','POST',{});EXTDIR=r.extension_dir||'';$('chromeDir').textContent=EXTDIR}catch(e){}
 try{SH=await api('claude-shells');ddEnv.set(envItems(),defEnv());renderCode()}catch(e){}};
@@ -29887,7 +30114,7 @@ async function loadStrategy(){try{const r=await api('strategy');const s=$('strat
 async function saveStrategy(){try{await api('strategy','POST',{strategy:$('strat_sel').value,rotate_every:+$('strat_every').value||1,account_min_gap_seconds:+$('strat_gap').value||0});await loadStrategy();$('strat_state').textContent=t('strat_saved')+' '+$('strat_state').textContent}catch(e){$('strat_state').textContent=errMsg(e)}}
 async function loadChromeProfiles(){try{const r=await api('personal-chrome/profiles');const s=$('pc_profile_sel');s.textContent='';for(const p of (r.profiles||[])){const o=document.createElement('option');o.value=p.dir;o.textContent=p.name+(p.email?' - '+p.email:'')+' ('+p.dir+')';s.appendChild(o)}}catch(e){}}
 async function copyPcFolder(){const f=$('pc_folder').textContent;try{await navigator.clipboard.writeText(f);$('pc_open_state').textContent=t('pc_copied')}catch(e){$('pc_open_state').textContent=f}}
-async function openPcExtensions(){const st=$('pc_open_state');const prof=$('pc_profile_sel').value;if(!prof){st.textContent=t('pc_chrome_failed');return}st.textContent=t('pc_opening_chrome');try{const r=await api('personal-chrome/open-extensions','POST',{profile:prof});$('pc_code').textContent=r.code;$('pc_port').textContent=r.port;$('pc_folder').textContent=r.extension_dir;st.textContent=t('pc_chrome_opened')+(r.clipboard?' '+t('pc_clip_ok'):'');pollPcConnect()}catch(e){st.textContent=t('pc_chrome_failed')+errMsg(e)}}
+async function openPcExtensions(){const st=$('pc_open_state');const prof=$('pc_profile_sel').value||'';st.textContent=t('pc_opening_chrome');try{const r=await api('personal-chrome/open-extensions','POST',{profile:prof});$('pc_code').textContent=r.code;$('pc_port').textContent=r.port;$('pc_folder').textContent=r.extension_dir;st.textContent=t('pc_chrome_opened')+(r.clipboard?' '+t('pc_clip_ok'):'');pollPcConnect()}catch(e){st.textContent=t('pc_chrome_failed')+errMsg(e)}}
 function pollPcConnect(){clearInterval(_pcPoll);let n=0;_pcPoll=setInterval(async()=>{n++;try{const r=await api('personal-chrome');const ps=(r.status&&r.status.profiles)||[];if(ps.some(p=>p.connected)&&!(r.status&&r.status.pairing_code_active)){clearInterval(_pcPoll);sessionStorage.removeItem('pair');$('pc_open_state').textContent=t('pc_connected_ok')}}catch(e){}if(n>90)clearInterval(_pcPoll)},2000)}
 async function startPcSetup(){const b=$('pc_start'),s=$('pc_state');b.disabled=true;s.textContent=t('pc_opening');loadChromeProfiles();try{const r=await api('personal-chrome/setup','POST',{});$('pc_code').textContent=r.code;$('pc_port').textContent=r.port;$('pc_folder').textContent=r.extension_dir;$('pc_steps').hidden=false;s.textContent=t('pc_ready')}catch(e){s.textContent=t('pc_error')+errMsg(e)}finally{b.disabled=false}}
 async function copyPcCode(){try{await navigator.clipboard.writeText($('pc_code').textContent);$('pc_state').textContent=t('pc_copied')}catch(e){$('pc_state').textContent=$('pc_code').textContent}}
