@@ -36,6 +36,15 @@ CLAUDE CODE FIDELITY (7.93)
   proves impossible (a missing Read after a compaction is NOT proof). Client disconnect (ESC) cancels the generation at once; the advisor queues behind the owner's requests (same rotation / gap rules);
   Claude Code's topic-detection and max_tokens=1 probes are answered locally; the launcher also sets ANTHROPIC_SMALL_FAST_MODEL and DISABLE_TELEMETRY; settings show a one-line compatibility status (GET /api/compat).
 
+REPAIR IS ONLY EVER STARTED BY THE OWNER, CANCEL IS COMPLETE, NO ACCOUNT IS STUCK (7.95)
+  7.95: nothing starts a repair by itself any more: not a failed request, not a restart, not a retry timer, not the engine chip / `guard_enabled` (both are ignored for this). A failed account is still marked red and
+  SKIPPED at once (the next account serves, nothing waits) and stays red until the owner presses repair on it. CANCEL stops everything at once: the test message in flight, an advisor question in flight,
+  the Claude Code process with everything it started, the toolkit door of its job (a fix armed by a call that was already running is undone), browser steps and the wait for Chrome; cancel then waits a few seconds and
+  answers `stopped: true|false`; a start pressed right after a cancel waits for the old run to unwind instead of being refused. ONE repair may use up to `guard_agent_rounds` (2) Claude Code sessions: the second one starts from
+  history.txt (what the first one tried), knowledge.json (fixes already verified for the site) and its own fresh scan; a cause only the owner can remove (login / human check / limit / suspended) ends it at once with that cause
+  named (`give-up --root-cause`). A repair the owner pressed ignores the hourly session budget (`agent_repair_ignores_budget`). The advisor ALWAYS thinks through the bridge accounts (same rotation, messages per turn and min gap as the owner's own Claude Code: the router applies them to every request, advisor and test messages
+  included). Optional and OFF by default (`agent_own_fallback`): when no bridge account can think, its OWN Claude Code sign-in / agent_api_key takes over; that traffic is outside these rules. The task text carries a playbook (what to look at, in which order, when giving up is allowed).
+
 CLAUDE CODE AS THE REPAIR AGENT (7.89) + ITS OWN BRAIN AND FINDINGS (7.90)
   7.90: `agent_backend` (auto | bridge | own) decides which MODEL the advisor's Claude Code thinks with. bridge = the accounts connected to this bridge (internal key `advisor`, no separate sign-in, nothing
   shared with the owner's own Claude Code); own = its own sign-in / agent_api_key; auto = own when it has one and it did not just fail, otherwise bridge. The agent's own traffic never starts a repair
@@ -206,7 +215,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.93"
+VERSION = "7.95"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -944,8 +953,8 @@ class Config:
         "advisor_enabled": True,             # 7.83: use the connected model (on ANOTHER free account) to understand a stuck page instead of guessing; the built-in rules are only the fallback
         "advisor_budget_per_hour": 0,        # 7.91: IGNORED - the advisor follows the same rotation / turn size / gap rules as every other request (kept only so old config files load)
         "advisor_timeout_seconds": 75,       # 7.83: how long one advisor question may take before the built-in rules take over
-        "guard_enabled": True,               # 7.88: the repairs start by themselves. 7.89: set by `advisor_engine` (manual = False); colours, skipping a failed account and the manual buttons never depend on it
-        "advisor_engine": "auto",            # 7.89: which brain understands a problem: auto (Claude Code, then another account's model, then built-in rules) | agent | model | manual (no automatic repair start)
+        "guard_enabled": False,              # 7.95: IGNORED. A repair never starts by itself any more (not after a failure, not after a restart, not on a timer): only the owner's button starts one. Kept so old config files load
+        "advisor_engine": "auto",            # 7.89: which brain understands a problem: auto (Claude Code, then another account's model, then built-in rules) | agent | model | manual (7.95: same brain as auto; no repair ever starts by itself, whatever this says)
         "agent_enabled": True,               # 7.89: the owner's Claude Code CLI may be used as a brain at all
         "agent_backend": "auto",             # 7.90: which MODEL the advisor's Claude Code thinks with: bridge = through the accounts connected to this bridge (no sign-in needed) | own = its own sign-in / agent_api_key | auto = own when it has one, else bridge
         "agent_cli": "",                     # 7.89: full path of the `claude` command when it is not in PATH / the usual install folders
@@ -960,9 +969,12 @@ class Config:
         "guard_quarantine": True,            # 7.87: no request goes to such an account until the test passed
         "guard_repair_attempts": 3,          # 7.87: scan -> diagnose -> fix -> two-message test, at most this many rounds
         "guard_ok_flash_seconds": 6,         # 7.87: how long a row stays green after a good answer
-        "guard_red_hold_seconds": 3,         # 7.87: how long the red mark is shown before the automatic repair starts
+        "guard_red_hold_seconds": 3,         # 7.87: how long a failed account may still be rescued by the router's own immediate retry before it is skipped (red) and waits for the owner's button
         "guard_test_timeout_seconds": 120,   # 7.87: one test message
-        "guard_auto_retry_minutes": 30,      # 7.87: an unsolved account is tried again after this long (0 = only by hand)
+        "guard_auto_retry_minutes": 0,       # 7.95: IGNORED (an unsolved account is never retried by itself; kept so old config files load)
+        "guard_agent_rounds": 2,             # 7.95: Claude Code sessions ONE repair may use (a second one starts from what the first learned and could not do) 1..3
+        "agent_own_fallback": False,         # 7.95: OFF by default. ON = when NO bridge account can think, the advisor uses its own Claude Code sign-in / agent_api_key. That traffic does NOT go through the bridge, so rotation / turn size / gap do not apply to it
+        "agent_repair_ignores_budget": True, # 7.95: a repair the owner pressed is never refused because of the hourly session budget (it is still counted)
         "guard_workers": 3,                  # 7.88: repairs that may run in parallel (a paused repair does not take a place)
         "pc_autostart_profiles": True,       # 7.87: open the owner's Chrome profile by itself when an account needs it
         "account_strategy": "round_robin",   # 7.82: how the next account is chosen: round_robin (default) | least_loaded | least_recently_used | random | primary_first | health_weighted
@@ -2374,7 +2386,7 @@ def build_evidence(probes: List[Dict[str, Any]], storage: Dict[str, Any], secret
 # The user's own Chrome is the browser. A Manifest-V3 extension (embedded below, extracted at run time) executes commands that the bridge sends over an
 # authenticated loopback channel; a small Playwright-shaped compatibility layer (PCContext / PCPage / PCLocator / PCCdpSession) keeps every existing call site working.
 # ============================================================================
-PC_VERSION = "1.5.0"
+PC_VERSION = "1.6.0"
 PC_DASH_PORT = [0]                      # 7.81: the dashboard port baked into the extension (auto-pair is accepted ONLY from this exact origin)
 
 PC_BACKGROUND_JS = r"""'use strict';
@@ -2384,6 +2396,7 @@ const BLOCKED_METHODS = new Set(['Network.getAllCookies', 'Network.clearBrowserC
 const SID = Date.now().toString(36) + Math.random().toString(36).slice(2);   // changes whenever the worker restarts: the bridge then re-validates its tabs
 const POLL_MS = 20000, FLUSH_MS = 120, MAX_BATCH = 400, RESULT_CACHE = 300;
 let cfg = null;                          // {port, token, clientId}
+let authFails = 0;                       // consecutive 'wrong token' answers: a single refusal must never make the extension ask for a code again
 let identity = null;                     // stable per Chrome profile, isolated by chrome.storage.local
 let cmdCache = new Map();                // command id -> result (duplicate-command protection: a re-delivered command is never executed twice)
 let attached = new Map();                // tabId -> {owned, sinceMs}
@@ -2424,7 +2437,15 @@ async function api(path, body, signal) {
   const c = await loadCfg(); if (!c) throw new Error('not paired');
   const payload = Object.assign({}, body || {}, {client_id: c.clientId});
   const r = await fetch('http://127.0.0.1:' + c.port + path, {method: 'POST', headers: {'Content-Type': 'application/json', 'X-Bridge-PC-Token': c.token}, body: JSON.stringify(payload), signal});
-  if (r.status === 401 || r.status === 403) { cfg = null; await chrome.storage.local.remove('token'); throw new Error('rejected by the bridge (pair again)'); }
+  if (r.status === 401) {
+    let why = ''; try { why = String((await r.json()).reason || ''); } catch (e) {}
+    authFails++;
+    // Only a profile that was really removed in the dashboard, or a token that stays wrong several times in a row, makes the extension forget its pairing.
+    // 'not_paired' / 'origin' (bridge restarting, pairing file being rewritten) and any 403 are transient: keep the token and retry.
+    if (why === 'profile_removed' || (why === 'wrong_token' && authFails >= 4)) { authFails = 0; cfg = null; await chrome.storage.local.remove('token'); throw new Error('rejected by the bridge (pair again)'); }
+    throw new Error('bridge not ready (' + (why || 'unauthorized') + ')');
+  }
+  authFails = 0;
   if (!r.ok) throw new Error('bridge http ' + r.status);
   return r.json();
 }
@@ -2544,6 +2565,18 @@ async function autoOpenLogins() {
 }
 (function autoOpenTick() { autoOpenLogins().catch(() => {}).then(() => setTimeout(autoOpenTick, 3000)); })();
 
+const HUB_PORT = Number('__HUB_PORT__') || 18765;
+async function tryAutoPair() {                       // the owner pressed "open chrome://extensions" in the dashboard: the loaded extension pairs itself, no code and no profile choice
+  if (await loadCfg()) return;
+  const ident = await getIdentity();
+  const r = await fetch('http://127.0.0.1:' + HUB_PORT + '/pc/pair', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({auto: true, client_id: ident.clientId, client_name: ident.profileName})});
+  if (!r.ok) return;
+  const j = await r.json(); if (!j.token) return;
+  const nm = j.name ? String(j.name).slice(0, 80) : ''; if (nm) identity = Object.assign(ident, {profileName: nm});
+  await chrome.storage.local.set(Object.assign({port: HUB_PORT, token: j.token}, nm ? {profileName: nm} : {})); cfg = null; pollLoop();
+}
+(function autoPairTick() { tryAutoPair().catch(() => {}).then(() => setTimeout(autoPairTick, 3000)); })();
+
 chrome.runtime.onMessage.addListener((msg, sender, send) => {
   if (sender.id !== chrome.runtime.id) return false;
   (async () => {
@@ -2571,7 +2604,12 @@ chrome.runtime.onMessage.addListener((msg, sender, send) => {
         const r = await api('/pc/register-tab', {tab: active.id, url: active.url, title: active.title || ''});
         const c = await consented(); c.add(active.id); await setConsent(c);
         await chrome.storage.local.set({loginAccountId: r.account_id, loginTabId: active.id}); watchLogin(r.account_id, active.id, r.host);
-        send({ok: true, accountId: r.account_id, label: r.label});
+        let confirmed = false;                                       // 1.6: the owner is already on the AI site: confirm at once unless this page is a sign-in step (then the login watcher confirms after sign-in)
+        try {
+          const u = new URL(active.url);
+          if (!LOGINISH.test(u.pathname) && !LOGINISH.test(u.hostname.split('.')[0])) { await confirmFor(r.account_id, active.id); confirmed = true; if (loginWatch && loginWatch.timer) clearTimeout(loginWatch.timer); loginWatch = null; }
+        } catch (e) { lastError = String(e.message || e); }
+        send({ok: true, accountId: r.account_id, label: r.label, confirmed});
       } catch (e) { send({ok: false, error: String(e.message || e)}); }
     } else if (msg.type === 'claim_login') {
       try {
@@ -2618,15 +2656,14 @@ PC_POPUP_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><
 <div class="metrics"><div><b id="tab-count">0</b><span data-i="tabs_shared">tabs shared</span></div><div><b id="port-value">—</b><span data-i="local_port">local port</span></div></div></section>
 <section id="pairbox" class="panel" hidden><h2 data-i="pair_title">Connect to your bridge</h2><p class="muted" data-i="pair_hint">Enter the one-time code shown in the Bridge dashboard.</p>
 <label class="field"><span data-i="profile_label">Chrome profile name</span><input id="profile-name" maxlength="80" placeholder="Work, personal…"></label><label class="field"><span data-i="port_label">Port</span><input id="port" inputmode="numeric" value="18765" maxlength="5"></label><label class="field"><span data-i="code_label">One-time code</span><input id="code" autocomplete="one-time-code" maxlength="8" placeholder="8 characters"></label><button id="pair" class="primary" data-i="connect">Connect securely</button><p id="pair-error" class="error" hidden></p></section>
-<section id="tabbox" class="panel" hidden><div class="section-heading"><h2 data-i="this_tab">This tab</h2><span id="tab-badge" class="tag"></span></div><p id="tab-title" class="tab-title"></p><p id="tab-host" class="muted ltr"></p><p id="tab-note" class="muted note"></p>
+<section id="loginbox" class="panel" hidden><button id="register-tab" class="primary">Add this site to the dashboard</button><p id="register-hint" class="muted note"></p><p id="login-note" class="muted note"></p><details class="more"><summary data-i="more_opts">Profile name and login requests</summary><div class="section-heading"><h2 data-i="login_requests">Accounts waiting for login</h2><span id="profile-tag" class="tag"></span></div><label class="field"><span data-i="profile_label">Chrome profile name</span><input id="profile-name-active" maxlength="80"></label><button id="profile-save" class="secondary" data-i="save_profile">Save profile name</button><div id="login-list"></div><button id="login-confirm" class="primary" data-i="confirm_login" disabled>I'm signed in — confirm</button></details></section><section id="tabbox" class="panel" hidden><div class="section-heading"><h2 data-i="this_tab">This tab</h2><span id="tab-badge" class="tag"></span></div><p id="tab-title" class="tab-title"></p><p id="tab-host" class="muted ltr"></p><p id="tab-note" class="muted note"></p>
 <button id="allow" class="primary" data-i="allow">Allow this tab</button><button id="revoke" class="secondary" data-i="revoke">Stop sharing</button></section>
-<section id="loginbox" class="panel" hidden><div class="section-heading"><h2 data-i="login_requests">Accounts waiting for login</h2><span id="profile-tag" class="tag"></span></div><label class="field"><span data-i="profile_label">Chrome profile name</span><input id="profile-name-active" maxlength="80"></label><button id="profile-save" class="secondary" data-i="save_profile">Save profile name</button><button id="register-tab" class="primary">Add this site from current tab</button><p id="register-hint" class="muted note">Open the AI site in this Chrome profile. This tab is added to Bridge without opening another browser window.</p><div id="login-list"></div><button id="login-confirm" class="primary" data-i="confirm_login" disabled>I'm signed in — confirm</button><p id="login-note" class="muted note"></p></section>
 <details class="privacy"><summary data-i="privacy_title">A small privacy promise</summary><p data-i="privacy_body">Only tabs opened by Bridge or tabs you allow here can be inspected. The link stays on this computer. Chrome shows its own notice while a tab is being inspected.</p></details>
 <footer><span class="local-mark"><i></i><span data-i="local_only">Private · this computer only</span></span><button id="unpair" class="link-button" data-i="disconnect" hidden>Disconnect</button></footer><script src="popup.js"></script></body></html>"""
 
 PC_POPUP_JS = r"""const $ = id => document.getElementById(id);
 const send = m => new Promise((resolve, reject) => chrome.runtime.sendMessage(m, r => { if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message)); else resolve(r || {}); }));
-const words = {en:{tagline:'Your browser, with permission.',tabs_shared:'tabs shared',local_port:'local port',pair_title:'Connect to your bridge',pair_hint:'Enter the one-time code shown in the Bridge dashboard.',profile_label:'Chrome profile name',save_profile:'Save profile name',login_requests:'Accounts waiting for login',login_open:'Open login page',confirm_login:"I'm signed in — confirm",login_none:'No account is waiting for this profile.',login_done:'Login confirmed. Bridge is saving this account.',login_claimed:'Assigned to this Chrome profile',port_label:'Port',code_label:'One-time code',connect:'Connect securely',this_tab:'This tab',allow:'Allow this tab',revoke:'Stop sharing',privacy_title:'A small privacy promise',privacy_body:'Only tabs opened by Bridge or tabs you allow here can be inspected. The link stays on this computer. Chrome shows its own notice while a tab is being inspected.',local_only:'Private · this computer only',disconnect:'Disconnect',checking:'Checking connection…',not_paired:'Not connected yet',connect_hint:'Use the one-time code from the Bridge dashboard.',connected:'Connected',waiting:'Bridge is reconnecting',waiting_hint:'Keep the Bridge app running on this computer.',tab_owned:'Bridge opened this tab',tab_allowed:'You allowed this tab',tab_not_shared:'Only you can see this tab',internal:'Chrome does not allow extensions to inspect this page.',tab_hint:'Bridge can use this tab only after you allow it.',allow_done:'This tab is shared with Bridge.',revoke_done:'Bridge no longer has access to this tab.',bad_pair:'Could not connect: ',pair_ok:'Connected securely.',pair_invalid:'Enter a valid port and 8-character code.',disconnect_confirm:'Disconnect this browser from Bridge?',disconnected:'Disconnected.',error:'Something went wrong. Try again.'},fa:{tagline:'مرورگر خودت، با اجازه‌ی خودت.',tabs_shared:'زبانه‌ی در دسترس',local_port:'درگاه محلی',pair_title:'اتصال به Bridge',pair_hint:'کد یک‌بارمصرف را از داشبورد Bridge وارد کن.',profile_label:'نام این پروفایل Chrome',save_profile:'ذخیره‌ی نام پروفایل',login_requests:'حساب‌های منتظر ورود',login_open:'باز کردن صفحه‌ی ورود',confirm_login:'وارد شدم — تأیید',login_none:'حسابی برای این پروفایل منتظر ورود نیست.',login_done:'ورود تأیید شد؛ Bridge در حال ذخیره‌ی حساب است.',login_claimed:'به این پروفایل Chrome اختصاص دارد',port_label:'درگاه',code_label:'کد یک‌بارمصرف',connect:'اتصال امن',this_tab:'این زبانه',allow:'اجازه‌ی دسترسی',revoke:'قطع دسترسی',privacy_title:'قول کوچک حریم خصوصی',privacy_body:'فقط زبانه‌هایی که Bridge باز کرده یا خودت اجازه داده‌ای قابل بررسی‌اند. ارتباط فقط روی همین کامپیوتر است. هنگام بررسی زبانه، Chrome اعلان خودش را نشان می‌دهد.',local_only:'خصوصی · فقط همین کامپیوتر',disconnect:'قطع اتصال',checking:'در حال بررسی اتصال…',not_paired:'هنوز متصل نشده',connect_hint:'کد یک‌بارمصرف را از داشبورد Bridge بردار.',connected:'متصل است',waiting:'Bridge در حال اتصال دوباره است',waiting_hint:'برنامه‌ی Bridge را روی همین کامپیوتر باز نگه دار.',tab_owned:'Bridge این زبانه را باز کرده',tab_allowed:'خودت اجازه داده‌ای',tab_not_shared:'فقط خودت به این زبانه دسترسی داری',internal:'افزونه‌ها اجازه‌ی بررسی این صفحه‌ی داخلی Chrome را ندارند.',tab_hint:'Bridge فقط پس از اجازه‌ی تو می‌تواند از این زبانه استفاده کند.',allow_done:'این زبانه با Bridge به‌اشتراک گذاشته شد.',revoke_done:'دسترسی Bridge به این زبانه قطع شد.',bad_pair:'اتصال برقرار نشد: ',pair_ok:'اتصال امن برقرار شد.',pair_invalid:'درگاه معتبر و کد ۸ حرفی را وارد کن.',disconnect_confirm:'اتصال این مرورگر با Bridge قطع شود؟',disconnected:'اتصال قطع شد.',error:'مشکلی پیش آمد. دوباره تلاش کن.'}};
+const words = {en:{more_opts:'Profile name and login requests',tagline:'Your browser, with permission.',tabs_shared:'tabs shared',local_port:'local port',pair_title:'Connect to your bridge',pair_hint:'Enter the one-time code shown in the Bridge dashboard.',profile_label:'Chrome profile name',save_profile:'Save profile name',login_requests:'Accounts waiting for login',login_open:'Open login page',confirm_login:"I'm signed in — confirm",login_none:'No account is waiting for this profile.',login_done:'Login confirmed. Bridge is saving this account.',login_claimed:'Assigned to this Chrome profile',port_label:'Port',code_label:'One-time code',connect:'Connect securely',this_tab:'This tab',allow:'Allow this tab',revoke:'Stop sharing',privacy_title:'A small privacy promise',privacy_body:'Only tabs opened by Bridge or tabs you allow here can be inspected. The link stays on this computer. Chrome shows its own notice while a tab is being inspected.',local_only:'Private · this computer only',disconnect:'Disconnect',checking:'Checking connection…',not_paired:'Not connected yet',connect_hint:'Use the one-time code from the Bridge dashboard.',connected:'Connected',waiting:'Bridge is reconnecting',waiting_hint:'Keep the Bridge app running on this computer.',tab_owned:'Bridge opened this tab',tab_allowed:'You allowed this tab',tab_not_shared:'Only you can see this tab',internal:'Chrome does not allow extensions to inspect this page.',tab_hint:'Bridge can use this tab only after you allow it.',allow_done:'This tab is shared with Bridge.',revoke_done:'Bridge no longer has access to this tab.',bad_pair:'Could not connect: ',pair_ok:'Connected securely.',pair_invalid:'Enter a valid port and 8-character code.',disconnect_confirm:'Disconnect this browser from Bridge?',disconnected:'Disconnected.',error:'Something went wrong. Try again.'},fa:{more_opts:'نام پروفایل و ورودهای در انتظار',tagline:'مرورگر خودت، با اجازه‌ی خودت.',tabs_shared:'زبانه‌ی در دسترس',local_port:'درگاه محلی',pair_title:'اتصال به Bridge',pair_hint:'کد یک‌بارمصرف را از داشبورد Bridge وارد کن.',profile_label:'نام این پروفایل Chrome',save_profile:'ذخیره‌ی نام پروفایل',login_requests:'حساب‌های منتظر ورود',login_open:'باز کردن صفحه‌ی ورود',confirm_login:'وارد شدم — تأیید',login_none:'حسابی برای این پروفایل منتظر ورود نیست.',login_done:'ورود تأیید شد؛ Bridge در حال ذخیره‌ی حساب است.',login_claimed:'به این پروفایل Chrome اختصاص دارد',port_label:'درگاه',code_label:'کد یک‌بارمصرف',connect:'اتصال امن',this_tab:'این زبانه',allow:'اجازه‌ی دسترسی',revoke:'قطع دسترسی',privacy_title:'قول کوچک حریم خصوصی',privacy_body:'فقط زبانه‌هایی که Bridge باز کرده یا خودت اجازه داده‌ای قابل بررسی‌اند. ارتباط فقط روی همین کامپیوتر است. هنگام بررسی زبانه، Chrome اعلان خودش را نشان می‌دهد.',local_only:'خصوصی · فقط همین کامپیوتر',disconnect:'قطع اتصال',checking:'در حال بررسی اتصال…',not_paired:'هنوز متصل نشده',connect_hint:'کد یک‌بارمصرف را از داشبورد Bridge بردار.',connected:'متصل است',waiting:'Bridge در حال اتصال دوباره است',waiting_hint:'برنامه‌ی Bridge را روی همین کامپیوتر باز نگه دار.',tab_owned:'Bridge این زبانه را باز کرده',tab_allowed:'خودت اجازه داده‌ای',tab_not_shared:'فقط خودت به این زبانه دسترسی داری',internal:'افزونه‌ها اجازه‌ی بررسی این صفحه‌ی داخلی Chrome را ندارند.',tab_hint:'Bridge فقط پس از اجازه‌ی تو می‌تواند از این زبانه استفاده کند.',allow_done:'این زبانه با Bridge به‌اشتراک گذاشته شد.',revoke_done:'دسترسی Bridge به این زبانه قطع شد.',bad_pair:'اتصال برقرار نشد: ',pair_ok:'اتصال امن برقرار شد.',pair_invalid:'درگاه معتبر و کد ۸ حرفی را وارد کن.',disconnect_confirm:'اتصال این مرورگر با Bridge قطع شود؟',disconnected:'اتصال قطع شد.',error:'مشکلی پیش آمد. دوباره تلاش کن.'}};
 const lang=(navigator.language||'en').toLowerCase().startsWith('fa')?'fa':'en', t=k=>(words[lang]||words.en)[k]||words.en[k]||k;
 document.documentElement.lang=lang;document.documentElement.dir=lang==='fa'?'rtl':'ltr';document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));
 let currentTab=null, busy=false;const isInternal=url=>/^(chrome|edge|about|devtools|chrome-extension):/.test(url||'')||/chromewebstore\.google\.com/.test(url||'');
@@ -2641,7 +2678,7 @@ async function refresh(){if(busy)return;try{const [s]=await Promise.all([send({t
   $('tab-note').textContent=internal?t('internal'):(owned||allowed?'':t('tab_hint'));
   $('allow').hidden=internal||owned||allowed;$('revoke').hidden=internal||(!allowed&&!attached);$('allow').disabled=!id;$('revoke').disabled=!id;
    $('loginbox').hidden=!paired;$('profile-tag').textContent=s.profileName||('Chrome '+String(s.clientId||'').slice(0,8));
-   $('register-tab').textContent=lang==='fa'?'افزودن حساب از زبانه‌ی فعلی':'Add this site from current tab';$('register-hint').textContent=lang==='fa'?'سایت هوش مصنوعی را در همین پروفایل باز کن؛ بدون بازکردن پنجره‌ی دیگر به Bridge اضافه می‌شود.':'Open the AI site in this Chrome profile. This tab is added to Bridge without opening another browser window.';
+   $('register-tab').textContent=lang==='fa'?'افزودن این سایت به داشبورد':'Add this site to the dashboard';$('register-hint').textContent=lang==='fa'?'سایت هوش مصنوعی را در همین پروفایل باز کن و فقط همین دکمه را بزن؛ حساب خودکار اضافه و تأیید می‌شود.':'Open the AI site in this Chrome profile and press this one button; the account is added and confirmed for you.';
    $('register-tab').disabled=!currentTab||internal||!/^https?:\/\//i.test(url);
   const pn=$('profile-name-active');if(document.activeElement!==pn)pn.value=s.profileName||'';
   $('login-confirm').disabled=!s.hasLogin||!currentTab||currentTab.id!==s.loginTabId;$('login-note').textContent=s.hasLogin?(currentTab&&currentTab.id===s.loginTabId?t('login_done'):(lang==='fa'?'برای تأیید، به همان زبانه‌ی حساب برگرد.':'Return to this account’s site tab to confirm.')):'';
@@ -2653,10 +2690,10 @@ $('code').addEventListener('input',()=>{$('code').value=$('code').value.toUpperC
 $('allow').onclick=async()=>{if(currentTab)await send({type:'allow_tab',tab:currentTab.id});await refresh()};$('revoke').onclick=async()=>{if(currentTab)await send({type:'revoke_tab',tab:currentTab.id});await refresh()};
 function renderLoginRequests(rows){const box=$('login-list');box.textContent='';if(!rows.length){const p=document.createElement('p');p.className='muted';p.textContent=t('login_none');box.appendChild(p);return}for(const row of rows){const card=document.createElement('div');card.className='request-row';const text=document.createElement('div'),name=document.createElement('strong'),host=document.createElement('p'),btn=document.createElement('button');name.textContent=row.label||row.host;host.className='muted ltr';host.textContent=row.host||'';btn.className='secondary';btn.textContent=row.claimed?t('login_claimed'):t('login_open');btn.disabled=!!row.claimed;if(!row.claimed)btn.onclick=async()=>{btn.disabled=true;try{const r=await send({type:'claim_login',accountId:row.id});if(!r.ok)throw new Error(r.error||t('error'));window.close()}catch(e){$('login-note').textContent=e.message;btn.disabled=false;await refresh()}};text.append(name,host);card.append(text,btn);box.appendChild(card)}}
 $('profile-save').onclick=async()=>{const r=await send({type:'profile_name',name:$('profile-name-active').value});if(r.ok){$('profile-tag').textContent=r.profileName||'Chrome';$('login-note').textContent=t('save_profile')}};
- $('register-tab').onclick=async()=>{const b=$('register-tab');if(!currentTab)return;b.disabled=true;try{const r=await send({type:'register_active_tab',tabId:currentTab.id});if(!r.ok)throw new Error(r.error||t('error'));$('login-note').textContent=lang==='fa'?`حساب ${r.label||''} اضافه شد. اگر وارد نشده‌ای، در همین زبانه وارد شو؛ بعد تأیید ورود را بزن.`:`${r.label||'Account'} added. Sign in on this tab if needed, then confirm.`;await refresh()}catch(e){$('login-note').textContent=e.message;await refresh()}};
+$('register-tab').onclick=async()=>{const b=$('register-tab');if(!currentTab)return;b.disabled=true;try{const r=await send({type:'register_active_tab',tabId:currentTab.id});if(!r.ok)throw new Error(r.error||t('error'));$('login-note').textContent=r.confirmed?(lang==='fa'?`✓ ${r.label||''} به داشبورد اضافه شد.`:`✓ ${r.label||'Account'} added to the dashboard.`):(lang==='fa'?`${r.label||''} اضافه شد. در همین زبانه وارد شو؛ خودکار تأیید می‌شود.`:`${r.label||'Account'} added. Sign in on this tab; it confirms by itself.`);if(r.confirmed){b.textContent='✓';setTimeout(()=>window.close(),1200);return}await refresh()}catch(e){$('login-note').textContent=e.message;await refresh()}};
 $('login-confirm').onclick=async()=>{const b=$('login-confirm');b.disabled=true;try{const r=await send({type:'confirm_login'});if(!r.ok)throw new Error(r.error||t('error'));$('login-note').textContent=t('login_done');await refresh()}catch(e){$('login-note').textContent=e.message;await refresh()}};
 $('unpair').onclick=async()=>{if(!confirm(t('disconnect_confirm')))return;await send({type:'unpair'});$('state-detail').textContent=t('disconnected');await refresh()};
-refresh();setInterval(refresh,2500);"""
+refresh();setInterval(refresh,2500);setTimeout(()=>{try{$('register-tab').focus()}catch(e){}},150);"""
 
 PC_OPTIONS_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="stylesheet" href="ext.css"><title>AI Web Bridge</title></head><body class="options">
 <main><header class="brand large"><img src="icons/icon48.png" alt=""><div><h1>AI Web Bridge</h1><p data-i="settings_subtitle">A private connection between your browser and your bridge.</p></div></header>
@@ -2672,7 +2709,7 @@ const T={en:{settings_subtitle:'A private connection between your browser and yo
 async function refresh(){try{const s=await send({type:'status'}),ok=!!s.paired&&!!s.lastOk&&Date.now()-s.lastOk<45000;$('dot').className='dot '+(ok?'good':s.paired?'warm':'');$('status-title').textContent=s.paired?(ok?tr('connected'):tr('waiting')):tr('unpaired');$('status-detail').textContent=s.paired?(ok?'':tr('wait_note')):tr('unpaired_note');$('port').textContent=s.paired?s.port:'—';$('attached').textContent=(s.attached||[]).length;$('disconnect').hidden=!s.paired;$('connection-note').textContent=s.lastError||'';$('version').textContent=chrome.runtime.getManifest().version}catch(e){$('status-title').textContent=tr('unpaired')}}
 $('disconnect').onclick=async()=>{if(!confirm(tr('confirm')))return;await send({type:'unpair'});refresh()};refresh();setInterval(refresh,3000);"""
 
-PC_CSS = """*{box-sizing:border-box}body{--bg:#fbf9ff;--panel:#fff;--ink:#28253a;--muted:#77738a;--line:#eee9f5;--purple:#7867e8;--pink:#ed86b7;--green:#3aab7a;--amber:#e5a446;margin:0;background:var(--bg);color:var(--ink);font:13px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif}body.popup{width:360px;padding:15px}.brand{display:flex;align-items:center;gap:11px;position:relative;margin:0 0 13px}.brand img{width:42px;height:42px;border-radius:13px;box-shadow:0 4px 12px #8e74d62a}.brand h1{font-size:16px;line-height:1.1;margin:0;font-weight:750;letter-spacing:-.3px}.brand p{margin:4px 0 0;color:var(--muted);font-size:11px}.sparkle{margin-inline-start:auto;color:var(--pink);font-size:22px;transform:rotate(12deg)}.status-card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:13px;margin:10px 0;box-shadow:0 4px 14px #43387808}.status-line{display:flex;gap:10px;align-items:center}.status-line strong{font-size:13px}.status-line p{margin:2px 0 0}.dot{width:10px;height:10px;border-radius:50%;background:#c8c3d1;box-shadow:0 0 0 4px #f0edf4;flex:0 0 auto}.dot.good{background:var(--green);box-shadow:0 0 0 4px #e6f7ef}.dot.warm{background:var(--amber);box-shadow:0 0 0 4px #fff5e4}.muted{color:var(--muted);font-size:11px}.metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;border-top:1px solid var(--line);margin-top:12px;padding-top:10px}.metrics div{display:flex;align-items:baseline;gap:5px}.metrics b{font-size:16px;color:var(--purple);font-variant-numeric:tabular-nums}.metrics span{font-size:10px;color:var(--muted)}h2{font-size:12px;margin:0 0 7px;font-weight:700}.panel>p{margin:4px 0}.field{display:block;margin:10px 0 0}.field span{display:block;color:var(--muted);font-size:10px;margin-bottom:4px}.field input{width:100%;height:36px;border:1px solid var(--line);border-radius:10px;background:#fdfcff;color:var(--ink);padding:0 10px;font:inherit;outline:none}.field input:focus{border-color:var(--purple);box-shadow:0 0 0 3px #7867e81c}.ltr{direction:ltr;text-align:left;unicode-bidi:plaintext}.primary,.secondary,.link-button{font:inherit;border-radius:10px;cursor:pointer;transition:transform .12s,box-shadow .12s,background .12s}.primary{width:100%;border:0;background:linear-gradient(135deg,#796ae9,#9c7eea);color:#fff;font-weight:650;padding:9px 12px;margin-top:10px;box-shadow:0 5px 12px #806be62e}.primary:hover{box-shadow:0 7px 16px #806be645;transform:translateY(-1px)}.primary:disabled{opacity:.6;cursor:wait}.secondary{border:1px solid var(--line);background:#fff;color:var(--muted);padding:7px 10px}.secondary:hover{border-color:#f0bad3;color:#bd5788}.error{padding:8px 9px!important;border-radius:9px;background:#fff0f4;color:#a33b61!important}.section-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}.section-heading h2{margin:0}.tag{font-size:9px;color:var(--muted);background:#f4f1f8;padding:3px 7px;border-radius:99px;max-width:175px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tag.tag-on{color:#348763;background:#eaf8f0}.tab-title{font-size:12px;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:9px!important}.note{margin-top:8px!important}.privacy{padding:3px 2px;color:var(--muted);font-size:10px}.privacy summary{cursor:pointer;list-style:none}.privacy summary::-webkit-details-marker{display:none}.privacy summary:before{content:'✦';color:var(--pink);margin-inline-end:6px}.privacy p{padding:0 7px;margin:7px 0 3px}.popup footer{display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--line);padding-top:10px;margin-top:8px}.local-mark{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:10px}.local-mark i{width:7px;height:7px;border-radius:50%;background:var(--green)}.link-button{border:0;background:none;color:var(--muted);font-size:10px;padding:4px}.link-button:hover{color:#bd5788}.options{min-height:100vh;padding:32px 18px}.options main{max-width:560px;margin:auto}.brand.large{margin-bottom:20px}.brand.large img{width:54px;height:54px;border-radius:17px}.brand.large h1{font-size:20px}.options .status-card,.options .panel{padding:18px;margin:13px 0;border-radius:18px}.options .metrics{margin-top:16px;padding-top:13px}.promise{display:flex;gap:9px;align-items:flex-start;background:#fff7fb;border:1px solid #f7eaf1;border-radius:12px;padding:10px;margin-top:12px}.promise span{color:var(--pink)}.promise p{margin:0;font-size:11px}.options-footer{display:flex;align-items:center;gap:7px;padding:12px 4px;color:var(--muted);font-size:10px}.options-footer img{width:16px;height:16px}.spacer{flex:1}[hidden]{display:none!important}@media(prefers-color-scheme:dark){body{--bg:#171522;--panel:#211e2e;--ink:#f2effb;--muted:#aaa4bb;--line:#383347;--purple:#a99aff;--pink:#f09bc5;--green:#69d2a2;--amber:#f4c26d}.field input{background:#191724;color:var(--ink)}.secondary{background:#272334;color:var(--muted)}.tag{background:#302b3c}.tag.tag-on{background:#20372e;color:#8fe0b8}.error{background:#3a202d;color:#ffb3ca!important}.promise{background:#2b2230;border-color:#403044}}"""
+PC_CSS = """*{box-sizing:border-box}body{--bg:#fbf9ff;--panel:#fff;--ink:#28253a;--muted:#77738a;--line:#eee9f5;--purple:#7867e8;--pink:#ed86b7;--green:#3aab7a;--amber:#e5a446;margin:0;background:var(--bg);color:var(--ink);font:13px/1.5 system-ui,-apple-system,'Segoe UI',sans-serif}body.popup{width:360px;padding:15px}.brand{display:flex;align-items:center;gap:11px;position:relative;margin:0 0 13px}.brand img{width:42px;height:42px;border-radius:13px;box-shadow:0 4px 12px #8e74d62a}.brand h1{font-size:16px;line-height:1.1;margin:0;font-weight:750;letter-spacing:-.3px}.brand p{margin:4px 0 0;color:var(--muted);font-size:11px}.sparkle{margin-inline-start:auto;color:var(--pink);font-size:22px;transform:rotate(12deg)}.status-card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:13px;margin:10px 0;box-shadow:0 4px 14px #43387808}.status-line{display:flex;gap:10px;align-items:center}.status-line strong{font-size:13px}.status-line p{margin:2px 0 0}.dot{width:10px;height:10px;border-radius:50%;background:#c8c3d1;box-shadow:0 0 0 4px #f0edf4;flex:0 0 auto}.dot.good{background:var(--green);box-shadow:0 0 0 4px #e6f7ef}.dot.warm{background:var(--amber);box-shadow:0 0 0 4px #fff5e4}.muted{color:var(--muted);font-size:11px}.metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;border-top:1px solid var(--line);margin-top:12px;padding-top:10px}.metrics div{display:flex;align-items:baseline;gap:5px}.metrics b{font-size:16px;color:var(--purple);font-variant-numeric:tabular-nums}.metrics span{font-size:10px;color:var(--muted)}h2{font-size:12px;margin:0 0 7px;font-weight:700}.panel>p{margin:4px 0}.field{display:block;margin:10px 0 0}.field span{display:block;color:var(--muted);font-size:10px;margin-bottom:4px}.field input{width:100%;height:36px;border:1px solid var(--line);border-radius:10px;background:#fdfcff;color:var(--ink);padding:0 10px;font:inherit;outline:none}.field input:focus{border-color:var(--purple);box-shadow:0 0 0 3px #7867e81c}.ltr{direction:ltr;text-align:left;unicode-bidi:plaintext}.primary,.secondary,.link-button{font:inherit;border-radius:10px;cursor:pointer;transition:transform .12s,box-shadow .12s,background .12s}.primary{width:100%;border:0;background:linear-gradient(135deg,#796ae9,#9c7eea);color:#fff;font-weight:650;padding:9px 12px;margin-top:10px;box-shadow:0 5px 12px #806be62e}.primary:hover{box-shadow:0 7px 16px #806be645;transform:translateY(-1px)}.primary:disabled{opacity:.6;cursor:wait}.secondary{border:1px solid var(--line);background:#fff;color:var(--muted);padding:7px 10px}.secondary:hover{border-color:#f0bad3;color:#bd5788}.error{padding:8px 9px!important;border-radius:9px;background:#fff0f4;color:#a33b61!important}.section-heading{display:flex;align-items:center;justify-content:space-between;gap:8px}.section-heading h2{margin:0}.tag{font-size:9px;color:var(--muted);background:#f4f1f8;padding:3px 7px;border-radius:99px;max-width:175px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tag.tag-on{color:#348763;background:#eaf8f0}.tab-title{font-size:12px;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:9px!important}.note{margin-top:8px!important}.privacy{padding:3px 2px;color:var(--muted);font-size:10px}.privacy summary{cursor:pointer;list-style:none}.privacy summary::-webkit-details-marker{display:none}.more summary{cursor:pointer;color:var(--muted);font-size:11px;margin-top:10px}.more[open] summary{margin-bottom:8px}.privacy summary:before{content:'✦';color:var(--pink);margin-inline-end:6px}.privacy p{padding:0 7px;margin:7px 0 3px}.popup footer{display:flex;align-items:center;justify-content:space-between;border-top:1px solid var(--line);padding-top:10px;margin-top:8px}.local-mark{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:10px}.local-mark i{width:7px;height:7px;border-radius:50%;background:var(--green)}.link-button{border:0;background:none;color:var(--muted);font-size:10px;padding:4px}.link-button:hover{color:#bd5788}.options{min-height:100vh;padding:32px 18px}.options main{max-width:560px;margin:auto}.brand.large{margin-bottom:20px}.brand.large img{width:54px;height:54px;border-radius:17px}.brand.large h1{font-size:20px}.options .status-card,.options .panel{padding:18px;margin:13px 0;border-radius:18px}.options .metrics{margin-top:16px;padding-top:13px}.promise{display:flex;gap:9px;align-items:flex-start;background:#fff7fb;border:1px solid #f7eaf1;border-radius:12px;padding:10px;margin-top:12px}.promise span{color:var(--pink)}.promise p{margin:0;font-size:11px}.options-footer{display:flex;align-items:center;gap:7px;padding:12px 4px;color:var(--muted);font-size:10px}.options-footer img{width:16px;height:16px}.spacer{flex:1}[hidden]{display:none!important}@media(prefers-color-scheme:dark){body{--bg:#171522;--panel:#211e2e;--ink:#f2effb;--muted:#aaa4bb;--line:#383347;--purple:#a99aff;--pink:#f09bc5;--green:#69d2a2;--amber:#f4c26d}.field input{background:#191724;color:var(--ink)}.secondary{background:#272334;color:var(--muted)}.tag{background:#302b3c}.tag.tag-on{background:#20372e;color:#8fe0b8}.error{background:#3a202d;color:#ffb3ca!important}.promise{background:#2b2230;border-color:#403044}}"""
 
 
 def pc_manifest() -> Dict[str, Any]:
@@ -2770,7 +2807,7 @@ PC_PAIR_JS = r"""(() => {
 def pc_assets() -> Dict[str, Any]:
     """The embedded extension assets; nothing is shipped as a separate file."""
     port_ = str(int(PC_DASH_PORT[0] or 0))
-    return {"manifest.json": json.dumps(pc_manifest(), indent=2), "background.js": PC_BACKGROUND_JS.replace("__DASH_PORT__", port_), "pair.js": PC_PAIR_JS.replace("__DASH_PORT__", port_),
+    return {"manifest.json": json.dumps(pc_manifest(), indent=2), "background.js": PC_BACKGROUND_JS.replace("__DASH_PORT__", port_).replace("__HUB_PORT__", str(int(os.environ.get("BRIDGE_PC_PORT") or PC_DEFAULT_PORT))), "pair.js": PC_PAIR_JS.replace("__DASH_PORT__", port_),
             "popup.html": PC_POPUP_HTML, "popup.js": PC_POPUP_JS,
             "options.html": PC_OPTIONS_HTML, "options.js": PC_OPTIONS_JS, "ext.css": PC_CSS,
             **{f"icons/icon{s}.png": pc_icon_png(s) for s in (16, 32, 48, 128)}}
@@ -2864,10 +2901,12 @@ class PCHub:
         self.grace = PC_CONNECT_GRACE
         self.listeners: List[Callable[[Dict[str, Any]], None]] = []
         self.pair_code, self.pair_until, self.pair_fails = "", 0.0, 0
+        self.auto_until = 0.0                                                          # while open, the first extension that asks is paired without a code
         self.login_requests_provider: Optional[Callable[[str], List[Dict[str, Any]]]] = None
         self.login_claim_handler: Optional[Callable[[str, Dict[str, Any]], Tuple[int, Dict[str, Any]]]] = None
         self.login_confirm_handler: Optional[Callable[[str, Dict[str, Any]], Tuple[int, Dict[str, Any]]]] = None
         self.register_tab_handler: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None
+        self._names_at = 0.0
         self.state = self._load()
         self.stats = {"events": 0, "commands": 0, "rejected": 0, "dupe_results": 0}
 
@@ -2915,6 +2954,11 @@ class PCHub:
             self.pair_until, self.pair_fails = time.time() + 600, 0
             return self.pair_code                                                    # the previous pairing stays valid until a new one succeeds
 
+    def open_auto_pair(self, seconds: float = 900.0) -> None:
+        """The owner just opened chrome://extensions from the dashboard: for a few minutes the extension that gets loaded pairs itself (no code, no profile choice)."""
+        with self.lock:
+            self.auto_until = time.time() + float(seconds)
+
     def paired(self) -> bool:
         return bool(self.state.get("origin") and (self.state.get("clients") or self.state.get("token_sha256")))
 
@@ -2942,19 +2986,63 @@ class PCHub:
             return "legacy"
         return next(iter(clients), "legacy")
 
+    def _ext_id(self) -> str:
+        o = str(self.state.get("origin") or "")
+        return o[len("chrome-extension://"):].strip("/") if o.startswith("chrome-extension://") else ""
+
+    def _sync_names(self, force: bool = False) -> None:
+        """A paired profile carries the name Chrome itself shows for it (Local State), unless the owner renamed it. Also finds the Chrome folder of a profile
+        from the extension's presence in that folder's preferences when the pairing did not know it."""
+        if not force and time.time() - self._names_at < 10:
+            return
+        self._names_at = time.time()
+        try:
+            info = {p["dir"]: p["name"] for p in pc_chrome_profiles()}
+        except Exception:
+            return
+        clients = self.state.get("clients") or {}
+        if not info or not clients:
+            return
+        changed = False
+        taken = {str(r.get("chrome_dir")) for r in clients.values() if r.get("chrome_dir")}
+        for cid, rec in clients.items():
+            d = str(rec.get("chrome_dir") or "")
+            if not d:
+                d = pc_profile_for_extension(self._ext_id(), taken) or (next(iter(info)) if len(info) == 1 else "")
+                if d:
+                    rec["chrome_dir"] = d
+                    taken.add(d)
+                    changed = True
+            if d in info and not rec.get("name_custom") and rec.get("name") != info[d]:
+                rec["name"] = info[d]
+                changed = True
+        if changed:
+            try:
+                self._save()
+            except Exception as e:
+                log(f"personal chrome: profile names could not be saved ({type(e).__name__})", "warn")
+
     def profiles(self) -> List[Dict[str, Any]]:
         with self.lock:
+            self._sync_names()
             return [{"id": cid, "name": str(rec.get("name") or "Chrome profile")[:80], "paired": True, "connected": self.connected(cid),
                      "last_seen": round(self._last_poll_by_client.get(cid, 0), 3) or None}
                     for cid, rec in (self.state.get("clients") or {}).items()]
 
     def rename_profile(self, client_id: str, name: str) -> Dict[str, Any]:
-        clean = re.sub(r"[\x00-\x1f\x7f]", "", str(name or "")).strip()[:80] or "Chrome profile"
+        clean = re.sub(r"[\x00-\x1f\x7f]", "", str(name or "")).strip()[:80]
         with self.lock:
             clients = dict(self.state.get("clients") or {})
             if client_id not in clients:
                 raise BridgeError("Chrome profile is not paired", "client", 404)
-            clients[client_id] = {**clients[client_id], "name": clean}
+            rec = dict(clients[client_id])
+            if clean:
+                rec["name_custom"] = True                                     # the owner chose this name: it no longer follows Chrome's own profile name
+            else:
+                rec["name_custom"] = False                                    # empty = back to the real Chrome profile name
+                real = next((p_["name"] for p_ in pc_chrome_profiles() if p_["dir"] == rec.get("chrome_dir")), "")
+                clean = real or str(rec.get("name") or "Chrome profile")
+            clients[client_id] = {**rec, "name": clean}
             self.state["clients"] = clients
             self._save()
         return {"ok": True, "client_id": client_id, "name": clean}
@@ -2999,7 +3087,7 @@ class PCHub:
             log(f"personal Chrome tab registration failed: {type(e).__name__}", "warn")
             return 500, {"error": "this tab could not be registered"}
 
-    def unpair(self, client_id: str) -> bool:
+    def unpair(self, client_id: str, source: str = "the extension (its Disconnect button or a reset)") -> bool:
         with self.cv:
             clients = dict(self.state.get("clients") or {})
             if client_id not in clients:
@@ -3015,10 +3103,22 @@ class PCHub:
                     c.ev.set()
             self.cv.notify_all()
         # 7.76: this is the ONLY code path that makes a paired bridge answer 'not paired yet' without a restart, so it must never be silent
-        log(f"personal Chrome: profile {client_id[:12]} was unpaired by the extension (its Disconnect button or a reset); "
+        log(f"personal Chrome: profile {client_id[:12]} was unpaired by {source}; "
             + ("no profile is paired any more - pair again" if not clients else f"{len(clients)} other profile(s) stay paired"), "warn")
         self._fire({"k": "profile_unpaired", "client_id": client_id})
         return True
+
+    def remove_profile(self, client_id: str) -> bool:
+        """The owner deleted this profile in the dashboard: forget the pairing and every trace of it (queued commands, poll state)."""
+        existed = self.unpair(client_id, "the owner (deleted in the dashboard)")
+        with self.cv:
+            self._sid_by_client.pop(client_id, None)
+            self._last_poll_by_client.pop(client_id, None)
+            for k_ in [k for k, c in self.cmds.items() if c.client_id == client_id]:
+                self.cmds.pop(k_, None)
+            self.queue = deque(c for c in self.queue if c.client_id != client_id)
+            self.cv.notify_all()
+        return existed
 
     def status(self) -> Dict[str, Any]:
         with self.lock:
@@ -3098,7 +3198,7 @@ class PCHub:
                         why_ = hub._auth_why(origin, tok)
                         log_every("pc:auth:" + why_, 60, f"personal chrome channel: extension request rejected - {why_} (the extension must be paired again: python bridge.py --pc-pair)", "warn")
                         time.sleep(0.2)
-                        return self._reply(401, {"error": "unauthorized"})
+                        return self._reply(401, {"error": "unauthorized", "reason": hub._auth_reason(origin, body)})
                     client_id = hub.client_for_token(origin, tok)
                     if not client_id:
                         return self._reply(401, {"error": "unauthorized"})
@@ -3176,6 +3276,17 @@ class PCHub:
     def _auth(self, origin: str, token: str) -> bool:
         return bool(self.client_for_token(origin, token))
 
+    def _auth_reason(self, origin: str, body: Dict[str, Any]) -> str:
+        """Machine-readable refusal reason for the extension (it only forgets its pairing for 'profile_removed' or a repeated 'wrong_token')."""
+        if not self.paired():
+            return "not_paired"
+        if not origin or origin != self.state.get("origin"):
+            return "origin"
+        cid = re.sub(r"[^a-zA-Z0-9_-]", "", str((body or {}).get("client_id") or ""))[:64]
+        if cid and cid not in (self.state.get("clients") or {}):
+            return "profile_removed"
+        return "wrong_token"
+
     def _auth_why(self, origin: str, token: str) -> str:
         """The reason a request was refused, for the log (never the token itself)."""
         st = self.state
@@ -3192,10 +3303,17 @@ class PCHub:
             if not origin.startswith("chrome-extension://") or len(origin) > 80:
                 log("personal chrome pairing refused: the request did not come from a Chrome extension", "warn")
                 return 403, {"error": "pairing is only accepted from the extension"}
-            if not self.pair_code or time.time() > self.pair_until or self.pair_fails >= 5:
+            auto_ = bool(body.get("auto")) and time.time() < self.auto_until
+            if not auto_ and body.get("auto"):
+                return 403, {"error": "no auto-pairing window open"}                     # silent: the extension asks every few seconds until the owner presses the button
+            cid_ = re.sub(r"[^a-zA-Z0-9_-]", "", str(body.get("client_id") or ""))[:64]
+            if not auto_ and not self.pair_code and cid_ and cid_ in (self.state.get("clients") or {}) and origin == self.state.get("origin"):
+                log("personal chrome: extension asked to pair again but is already paired (ignored)", "debug")
+                return 409, {"error": "already paired"}
+            if not auto_ and (not self.pair_code or time.time() > self.pair_until or self.pair_fails >= 5):
                 log("personal chrome pairing refused: no active code (expired, used, or 5 wrong tries) - run `python bridge.py --pc-pair` or press the pair button in the dashboard", "warn")
                 return 403, {"error": "no active pairing code (ask the bridge for a new one)"}
-            if not hmac.compare_digest(str(body.get("code") or "").strip().upper(), self.pair_code):
+            if not auto_ and not hmac.compare_digest(str(body.get("code") or "").strip().upper(), self.pair_code):
                 self.pair_fails += 1
                 log(f"personal chrome pairing refused: wrong code (try {self.pair_fails} of 5)", "warn")
                 if self.pair_fails >= 5:
@@ -3204,21 +3322,43 @@ class PCHub:
                 return 403, {"error": "wrong code"}
             client_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(body.get("client_id") or "legacy"))[:64] or "legacy"
             name = re.sub(r"[\x00-\x1f\x7f]", "", str(body.get("client_name") or "Chrome profile")).strip()[:80] or "Chrome profile"
+            if auto_ and PC_PENDING_DIR[0][0] and time.time() - PC_PENDING_DIR[0][1] < 1800:      # the profile Chrome was opened in is known from the dashboard click: use its own name
+                name = next((p_["name"] for p_ in pc_chrome_profiles() if p_["dir"] == PC_PENDING_DIR[0][0]), name)
             if self.state.get("origin") and self.state["origin"] != origin:
                 return 403, {"error": "extension id differs from the paired extension"}
             clients = dict(self.state.get("clients") or {})
             if client_id not in clients and len(clients) >= 100:
                 return 429, {"error": "profile limit reached (100)"}
+            old_rec = clients.get(client_id) or {}
+            taken_ = {str(r_.get("chrome_dir")) for c_, r_ in clients.items() if c_ != client_id and r_.get("chrome_dir")}
+            pend_ = PC_PENDING_DIR[0][0] if PC_PENDING_DIR[0][0] and time.time() - PC_PENDING_DIR[0][1] < 1800 else ""
+            cdir_ = pend_ or pc_profile_for_extension(origin[len("chrome-extension://"):].strip("/"), taken_) or str(old_rec.get("chrome_dir") or "")
+            if not cdir_:
+                dirs_ = [p_["dir"] for p_ in pc_chrome_profiles()]
+                cdir_ = dirs_[0] if len(dirs_) == 1 else ""
+            real_ = next((p_["name"] for p_ in pc_chrome_profiles() if p_["dir"] == cdir_), "") if cdir_ else ""
+            generic_ = bool(re.fullmatch(r"Chrome( profile)?|Chrome [0-9a-fA-F-]{8}|Chrome \d+", name))
+            custom_ = bool(old_rec.get("name_custom"))
+            if custom_:
+                name = str(old_rec.get("name") or name)                                  # a name the owner chose is never overwritten by a re-pair
+            elif real_ and (generic_ or name == real_):
+                name = real_                                                             # the dashboard shows the real Chrome profile name
+            elif real_:
+                custom_ = True                                                           # the owner typed a different name in the extension popup
+            elif client_id not in clients and generic_:
+                name = f"Chrome {len(clients) + 1}"
             token = secrets.token_urlsafe(32)
             clients[client_id] = {"token_sha256": hashlib.sha256(token.encode("utf-8")).hexdigest(), "name": name,
                                   "paired_at": (clients.get(client_id) or {}).get("paired_at") or time.time(), "last_repaired_at": time.time(),
-                                  "chrome_dir": (PC_PENDING_DIR[0][0] if PC_PENDING_DIR[0][0] and time.time() - PC_PENDING_DIR[0][1] < 900 else (clients.get(client_id) or {}).get("chrome_dir", ""))}
+                                  "chrome_dir": cdir_, "name_custom": custom_}
             self.state = {"clients": clients, "origin": origin, "paired_at": self.state.get("paired_at") or time.time(), "version": PC_VERSION}
             self.pair_code = ""
+            if not auto_:
+                self.auto_until = 0.0                                                  # 1.6: an auto-pair window stays open until it expires, so several Chrome profiles can join one after another
             PC_PENDING_DIR[0] = ("", 0.0)
             self._save()
         log("personal Chrome extension paired", "ok")
-        return 200, {"token": token}
+        return 200, {"token": token, "name": name}
 
     def _poll(self, wait: float, sid: str = "", client_id: str = "legacy") -> List[Dict[str, Any]]:
         end = time.time() + wait
@@ -5366,7 +5506,7 @@ _UI_CLICK_IDX_JS = r"""() => {
 
 
 UI_HOST_ANSWER_SELECTORS = (                                   # 7.94: data, not branches: (host suffix, CSS selector list of ONE assistant answer). The page-text fallback covers a markup change.
-    ("chatgpt.com", '[data-message-author-role="assistant"]'),
+    ("chatgpt.com", '[data-message-author-role="assistant"], [data-turn="assistant"]'),
     ("deepseek.com", '.ds-assistant-message-main-content.ds-markdown, [data-message-author-role="assistant"], [data-role="assistant"]'),
     ("claude.ai", '.font-claude-response, [data-testid="ai-message"], [data-testid="message-assistant"], .assistant-message'),
 )
@@ -5430,11 +5570,14 @@ class Advisor:
         timer = threading.Timer(float(self.app.cfg.get("advisor_timeout_seconds", 75) or 75), cancel.set)
         timer.daemon = True
         timer.start()
+        owner_ = str(getattr(_GUARD_TLS, "owner", "") or "")
+        GUARD.track(owner_, cancel)                                 # 7.95: the owner's cancel of this account's repair abandons this question at once
         try:
             # 7.91: pinned = "" -> the SAME rotation as every client request (round robin, turn size per account, min gap, soft limit, disabled profiles, cooldowns)
             out = self.app.router.handle(req, buf.append, "", cancel, scope="advisor", avoid=tuple(getattr(_ADV_TLS, "avoid", ()) or ()))
         finally:
             timer.cancel()
+            GUARD.untrack(owner_, cancel)
         return "".join(buf) or str(getattr(out, "text", "") or "")
 
     def _send_agent(self, prompt: str) -> str:
@@ -6181,20 +6324,69 @@ def ui_diff_lines(body: str, before: Set[str], prompt: str) -> List[str]:
 
 
 _UI_LABEL_RE = re.compile(r"^(?!you\b)[\w .\-]{1,30}\s(?:said|responded|replied)\s*:?$", re.I)
-_UI_FOOT_RE = re.compile(r"can make mistakes|check important info|^latest response$|^response complete$|^ai-generated|^(?:copy|share|regenerate|read aloud|good response|bad response|retry)$", re.I)
+_UI_FOOT_RE = re.compile(r"do you like this personality|is this conversation helpful|you'?re giving feedback on a new version|which response do you prefer|^(?:recents|library|scheduled|plugins|explore|images|new chat|search|skip to content)$|can make mistakes|check important info|^latest response$|^response complete$|^ai-generated|^(?:copy|share|regenerate|read aloud|good response|bad response|retry)$", re.I)
 _UI_THINK_RE = re.compile(r"^(?:think(?:ing)?|reasoning|searching(?: the web)?|loading profile|free offer)\b.{0,24}$", re.I)
+
+
+def ui_after_prompt(body: str, prompt: str) -> str:
+    """Only the page text AFTER our own (last) message, so older messages of the same chat never leak into the answer. Not found = unchanged."""
+    try:
+        _zw = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"))
+        b = str(body or "").translate(_zw)
+        words = str(prompt or "").translate(_zw).split()
+        if len(words) < 3:
+            return b
+        pat = r"\s+".join(re.escape(w) for w in words[-10:])
+        last = None
+        for last in re.finditer(pat, b):
+            pass
+        return b[last.end():] if last else b
+    except Exception:
+        return str(body or "")
+
+
+UI_MAIN_TEXT_JS = r"""() => {
+  const main = document.querySelector('main, [role="main"]') || document.body;
+  const c = main.cloneNode(true);
+  c.querySelectorAll('nav,aside,header,footer,[role="navigation"],[role="banner"],script,style,svg,.sr-only,[class*="left-panel"],[data-app-shell-left-panel-appearance]').forEach(x => x.remove());
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed;left:-99999px;top:0;width:1000px;white-space:normal;pointer-events:none;';
+  box.appendChild(c);
+  document.body.appendChild(box);
+  try { return c.innerText; } finally { box.remove(); }
+}"""
+
+
+def ui_main_text(pg: Any) -> str:
+    """Text of the conversation area only (no sidebar, top bar, hidden labels); the whole body when the page does not allow it."""
+    try:
+        t = pg.evaluate(UI_MAIN_TEXT_JS)
+        if isinstance(t, str) and t.strip():
+            return t
+    except Exception:
+        pass
+    return pg.inner_text("body")
 
 
 def ui_fallback_answer(body: str, before: Set[str], prompt: str) -> str:
     """7.94: the answer text taken from the page TEXT when the configured answer selector matches no element at all (the site changed its markup).
     New lines only (the request echo is removed), from the last "<Name> said:" label on, up to the footer ('... can make mistakes', 'Response complete' ...); thinking indicators are skipped."""
-    lines = ui_diff_lines(body, before, prompt)
+    lines = ui_diff_lines(ui_after_prompt(body, prompt), before, prompt)
     last = -1
     for k, ln in enumerate(lines):
         if _UI_LABEL_RE.match(ln.strip()):
             last = k
     if last >= 0:
         lines = lines[last + 1:]
+    # The page shows our own (long) message first, split into many short lines ("# Harness", "[USER]", "CronList" ...). Short lines of the request survive ui_diff_lines
+    # (it only drops lines of 10+ characters), and used to be returned as the "answer". The echo is a leading run of lines that all occur in the request: drop it.
+    _n = lambda x: re.sub(r"\s+", " ", str(x or "")).strip().lower()
+    req_lines = {_n(x) for x in str(prompt or "").splitlines() if _n(x)}
+    if req_lines:
+        k = 0
+        while k < len(lines) and (not _n(lines[k]) or _n(lines[k]) in req_lines):
+            k += 1
+        lines = lines[k:]
     out: List[str] = []
     for ln in lines:
         s = ln.strip()
@@ -6479,6 +6671,13 @@ class UIBackend:
                 self.select_model(pg, str(model))
                 conv["model"] = model
             try:
+                _prev_len = -1
+                for _ in range(8):                                  # let the old messages of a continued chat finish rendering
+                    _cur_len = len(pg.inner_text("body"))
+                    if _cur_len == _prev_len:
+                        break
+                    _prev_len = _cur_len
+                    pg.wait_for_timeout(350)
                 before.update(l.strip() for l in pg.inner_text("body").splitlines() if l.strip())      # 7.94: also kept for the page-text fallback below
             except Exception:
                 pass
@@ -6516,7 +6715,7 @@ class UIBackend:
             if time.monotonic() - t_empty < UI_SELECTOR_GRACE_S:
                 return res
             pg = _page(self.ab, ctx, base, self.recipe.get("entry"))
-            fb = ui_fallback_answer(pg.inner_text("body"), before, prompt)
+            fb = ui_fallback_answer(ui_main_text(pg), before, prompt)
             if not fb:
                 return res
             if not state.get("fb_logged"):
@@ -20534,7 +20733,13 @@ def build_prompt(req: NormReq, cfg: Config, fenced: bool, delta_from: Optional[i
             _D = _DSML
             _hint = (f' Skeleton: <{_D}DSML{_D}function_calls><{_D}DSML{_D}invoke name="TOOL"><{_D}DSML{_D}parameter name="ARG" string="true">VALUE</{_D}DSML{_D}parameter>'
                      f'</{_D}DSML{_D}invoke></{_D}DSML{_D}function_calls> - every opened tag must be closed, in that order.')
-        tail = (("\n\n(Continue as the assistant. To call a tool use ONLY the " + {"fenced": "```tool_call fenced JSON block", "dsml": "DSML function_calls format"}.get(fmt, "tag format") +
+        try:
+            _tn = [str(getattr(t_, "name", None) or (t_.get("name") if isinstance(t_, dict) else "") or "") for t_ in (req.tools or [])]
+            _tn = [x_ for x_ in _tn if x_][:12]
+        except Exception:
+            _tn = []
+        _tools_note = (" You DO have tools in this chat (" + ", ".join(_tn) + "): never say you cannot access local files - call a tool instead.") if _tn else ""
+        tail = (("\n\n(Continue as the assistant." + _tools_note + " To call a tool use ONLY the " + {"fenced": "```tool_call fenced JSON block", "dsml": "DSML function_calls format"}.get(fmt, "tag format") +
                  " exactly as defined at the start of this chat" + ("" if fmt == "dsml" else " - never XML/DSML/<invoke>") + "." + _hint +
                  (f" End the reply with the line {_mk}." if _mk else "") + ")") if req.tools else "")
         upd, shown_now = "", None
@@ -21560,7 +21765,7 @@ def validate_policy_data(data: Any, accounts: Callable[[], List[Dict[str, Any]]]
 #   * a verified fix is stored per host (<data>/site_modules/<host>/guard/knowledge.json) and used first the next time ANY profile of that site hits the same problem.
 #   * every verified fix (and every unsolved problem) becomes one record under <data>/logs/guard/problems/ and is folded into <data>/logs/guard/NEXT_PATCH_PROMPT.md:
 #     a complete prompt the owner hands to an AI together with bridge.py to make the fix permanent in the code.
-#   * nothing here may break serving: every hook swallows its own errors, and the guard does nothing when it is switched off (guard_enabled=false).
+#   * nothing here may break serving: every hook swallows its own errors. 7.95: the guard NEVER starts a repair by itself (guard_enabled is ignored); only the owner's button does.
 # ============================================================================
 #   7.88: the owner is in control. TWO buttons per browser account: [start | pause | resume] and [cancel]. Start = manual advisor repair (also on an account that looks healthy);
 #     while it runs the same button pauses (at the next safe step, never while a page change is armed for testing) and, when paused, resumes; cancel stops it and undoes any untested change.
@@ -21574,6 +21779,7 @@ GUARD_SKIP_NOW = ("empty_response", "malformed_response", "stream_interrupted", 
 GUARD_ACTIONS = ("dismiss", "click", "new_chat", "reload", "wait", "scroll_bottom", "focus_input", "none")
 GUARD_ROOT_CAUSES = ("overlay_blocks_page", "send_button_not_found", "input_not_found", "answer_not_detected", "page_not_loaded", "site_updated_layout", "login_needed", "captcha",
                      "rate_limited", "account_suspended", "chat_state_broken", "site_error", "transient", "unknown")
+GUARD_EXTERNAL_CAUSES = ("login_needed", "captcha", "rate_limited", "account_suspended")        # 7.95: not a page bug: a second agent session cannot fix these, the owner has to (sign in / solve the check / wait / use another account)
 GUARD_WHERE = {
     "overlay_blocks_page": ["ui_type_and_send", "UIBackend.ask (inner function start)", "guard_prepare_page"],
     "send_button_not_found": ["ui_click_send", "ui_type_and_send"],
@@ -22003,6 +22209,36 @@ class ClaudeAgent:
         self.bridge_failed_at = 0.0                                # the bridge's accounts could not answer the advisor just now (no usable account)
         self.proc_lock = threading.Lock()
         self.procs: Set[Any] = set()
+        self.owner_of: Dict[Any, str] = {}                         # 7.95: process -> the account whose repair started it ("" = nobody's: a status check, an investigation)
+
+    def register(self, proc: Any, owner: str = "") -> None:
+        with self.proc_lock:
+            self.procs.add(proc)
+            self.owner_of[proc] = str(owner or "")
+
+    def unregister(self, proc: Any) -> None:
+        with self.proc_lock:
+            self.procs.discard(proc)
+            self.owner_of.pop(proc, None)
+
+    def stop_owner(self, owner: str) -> int:
+        """Kill every Claude Code process (and what it started) that belongs to this account's repair. Returns how many were stopped. Never raises."""
+        if not owner:
+            return 0
+        with self.proc_lock:
+            mine = [p for p, o in self.owner_of.items() if o == owner]
+        for p in mine:
+            agent_kill_tree(p)
+        return len(mine)
+
+    def owner_cancelled(self) -> bool:
+        """True when the repair this thread works for was cancelled by the owner."""
+        try:
+            owner = str(getattr(_GUARD_TLS, "owner", "") or "")
+            c = GUARD.ctl.get(owner) if owner else None
+            return bool(c and c["cancel"].is_set())
+        except Exception:
+            return False
 
     def bind(self, app: Any) -> None:
         self.app = app
@@ -22048,11 +22284,24 @@ class ClaudeAgent:
         # the owner set for Claude Code apply to it too. (agent_backend / agent_api_key are still read from old config files but no longer change the route.)
         # AGENT_OWN_BACKEND_TEST is switched on only by the self-test that exercises the old own-sign-in code path.
         if not AGENT_OWN_BACKEND_TEST[0]:
+            # 7.95: ALWAYS through the bridge accounts, so the owner's rotation / turn size / min gap apply to the advisor exactly as to his own Claude Code. Only when the owner explicitly
+            # switched `agent_own_fallback` ON and NO bridge account can think does the advisor's own Claude Code sign-in (or agent_api_key) take over (that traffic is outside the bridge's rules).
+            if (self.app is not None and bool(self._c("agent_own_fallback", False)) and str(self._c("agent_backend", "auto") or "auto") != "bridge" and self.own_ready()
+                    and (not self._bridge_can_think() or time.time() - self.bridge_failed_at < 60.0)):
+                return "own"
             return "bridge"
         mode = str(self._c("agent_backend", "auto") or "auto")
         if mode in ("own", "bridge"):
             return mode
         return "bridge"                                  # 7.91: auto = through the bridge accounts, so the owner's rotation / quota / gap rules apply to the advisor too
+
+    def _bridge_can_think(self) -> bool:
+        """True when at least one bridge account could answer the advisor right now (usable, not resting, not held out by the guard)."""
+        try:
+            acc = self.app.acc
+            return any(acc.usable(a) and float(a.get("cooldown_until", 0) or 0) <= now() and not GUARD.blocked(a.get("id")) for a in list(acc.items))
+        except Exception:
+            return True                                              # unknown: keep the old behaviour (through the bridge)
 
     def bridge_key(self) -> str:
         """The bridge's own internal key for the advisor (id `advisor`). Created on first use. Requests with it never start a repair and never ask the advisor again (no loops)."""
@@ -22109,10 +22358,15 @@ class ClaudeAgent:
             st["reason"] = "the `claude` command was not found (install Claude Code, or set agent_cli)"
         else:
             try:
-                r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30, env=self.env(), stdin=subprocess.DEVNULL)
-                st["version"] = (r.stdout or r.stderr or "").strip().splitlines()[0][:80] if (r.stdout or r.stderr) else ""
-                if r.returncode != 0:
-                    st["reason"] = f"`claude --version` exited with {r.returncode}"
+                vout, verr, vrc = self._run_text([path, "--version"], "", 10.0)
+                vtxt = (vout or verr or "").strip()
+                if vrc == 0 and vtxt:
+                    st["version"] = vtxt.splitlines()[0][:80]
+                elif "no answer within" in (verr or ""):
+                    st["version"] = "?"                                   # the program exists but is slow to start: not a reason to refuse the repair, the real run has its own timeout
+                    log("advisor: `claude --version` did not answer within 10 s (the program was found; continuing)", "warn")
+                elif vrc != 0:
+                    st["reason"] = f"`claude --version` exited with {vrc}: {vtxt[:100]}"
             except Exception as e:
                 st["reason"] = f"{type(e).__name__}: {str(e)[:100]}"
             if check_login and not st["reason"]:
@@ -22186,6 +22440,9 @@ class ClaudeAgent:
             out, err, rc = self._run_text(argv, prompt, limit)
             if rc == 0 or not _AGENT_FLAG_ERR.search(err or ""):
                 break
+        if self.owner_cancelled():                                  # 7.95: stopped by the owner's cancel: not a failure of Claude Code, nothing is marked
+            self.last_error = ""
+            return ""
         text, is_err = agent_parse_result(out)
         if rc != 0 or is_err or not text.strip():
             self._mark_failed((err or text or f"exit code {rc}").strip()[:240])
@@ -22195,10 +22452,11 @@ class ClaudeAgent:
 
     def _run_text(self, argv: List[str], prompt: str, limit: float) -> Tuple[str, str, int]:
         proc = None
+        if self.owner_cancelled():
+            return "", "cancelled by the owner", -1
         try:
             proc = agent_popen(argv, str(self._scratch()), self.env())
-            with self.proc_lock:
-                self.procs.add(proc)
+            self.register(proc, str(getattr(_GUARD_TLS, "owner", "") or ""))
             holder: Dict[str, Any] = {}
 
             def talk() -> None:
@@ -22220,8 +22478,7 @@ class ClaudeAgent:
             return "", f"{type(e).__name__}: {str(e)[:120]}", -1
         finally:
             if proc is not None:
-                with self.proc_lock:
-                    self.procs.discard(proc)
+                self.unregister(proc)
                 agent_kill_tree(proc)
 
     def _scratch(self) -> Path:
@@ -22455,7 +22712,7 @@ def main():
     sub.add_parser("test"); sub.add_parser("disarm")
     p = sub.add_parser("note"); p.add_argument("text")
     p = sub.add_parser("finish"); p.add_argument("--file", required=True, help="JSON file with the final result (see TASK.md); runs the bridge's two-message gate")
-    p = sub.add_parser("give-up"); p.add_argument("--reason", required=True); p.add_argument("--code-change-note", default="")
+    p = sub.add_parser("give-up"); p.add_argument("--reason", required=True); p.add_argument("--code-change-note", default=""); p.add_argument("--root-cause", default="", help="login_needed | captcha | rate_limited | account_suspended | site_error | unknown")
     a = ap.parse_args()
     if not a.cmd or a.cmd == "help":
         ap.print_help(); return
@@ -22480,7 +22737,7 @@ def main():
     elif a.cmd == "note": call("note", {"text": a.text})
     elif a.cmd == "finish":
         with open(a.file, encoding="utf-8") as f: call("finish", json.load(f))
-    elif a.cmd == "give-up": call("give_up", {"reason": a.reason, "code_change_note": a.code_change_note})
+    elif a.cmd == "give-up": call("give_up", {"reason": a.reason, "code_change_note": a.code_change_note, "root_cause": a.root_cause})
 
 
 if __name__ == "__main__":
@@ -22513,8 +22770,8 @@ class AgentJob:
 def agent_task_text(job: AgentJob, seed: Dict[str, Any], history: List[str], version: str, script: str) -> str:
     where = "; ".join(f"{k}: {', '.join(v)}" for k, v in GUARD_WHERE.items())
     manual = str(seed.get("category") or "") in ("manual", "resumed", "")
-    what = ("The owner asked for a full check of this account (or an interrupted repair was resumed); the page may or may not have a problem."
-            if manual else f"A message through this account got NO valid answer (category `{seed.get('category') or '-'}`, kind `{seed.get('kind') or '-'}`, text: {seed.get('message') or '-'}).")
+    what = ("The owner pressed repair for this account (a full check); the page may or may not have a problem."
+            if manual else f"The owner pressed repair after a message through this account got NO valid answer (category `{seed.get('category') or '-'}`, kind `{seed.get('kind') or '-'}`, text: {seed.get('message') or '-'}).")
     return f"""# Repair job {job.id}: account "{job.label}" on {job.host}
 
 ## Situation
@@ -22525,6 +22782,20 @@ You cannot declare success yourself; `finish` runs that gate.
 ## Your goal
 Find the REAL root cause on the live page and make the bridge able to type, send and read answers again - for this site in general, not only this tab, because a verified fix is kept
 per site and every account of the site uses it first. Understand first (scan, screenshot, html), then change as little as possible. Do not guess: check every selector with `check`.
+
+## How to work (in this order)
+1. `status`, then `scan` and `shot` (open the PNG with your Read tool). Read `seed.json`, `history.txt` and `knowledge.json` (what already worked or failed on this site) BEFORE you act.
+2. Name the cause BEFORE changing anything. Typical causes and the smallest fix:
+   - a dialog / banner / overlay covers the chat (cookie, welcome, update, survey, "what's new")  -> `steps` (dismiss); when no control can close it -> `prepare_js`
+   - the bridge finds the box / send button / answer element but the wrong one (the site changed its markup) -> `selectors`; prefer data-* / aria-* / role over generated class names
+   - the page is blank, half loaded or the chat is stuck in an old state -> `reload` / `new-chat`, then look again
+   - the page only needs a moment (still generating, slow load) -> `wait`; the root cause is `transient` and the fix is empty
+   - NOT a page bug: the sign-in page, a "verify you are human" check, a rate / usage limit, a suspended account, a site outage. Do not try to work around these:
+     `give-up --root-cause login_needed|captcha|rate_limited|account_suspended|site_error --reason "<what the page says, one sentence>"` so the owner knows exactly what to do.
+3. Check every selector with `check` (and `html` when you need the markup), arm it with `try`, then `test`. A failed test tells you what to look at next: scan again, never repeat the same change.
+4. Only after `test` returned the token call `finish`. If `finish` fails, read what the gate saw and change something DIFFERENT.
+5. Do not give up early. Before `give-up` for a page problem you must have tried: a fresh `scan` + `shot`, `reload`, `new-chat`, dismissing every dialog, a selector fix and, if nothing else works, a `prepare_js`. Use the minutes you have.
+6. If the owner cancels, every call answers 409 / 410: stop at once, do not retry, do not start anything else.
 
 ## Toolkit (your working folder is the current directory)
 `python toolkit.py <command>` (use `python3` or `py` if `python` is missing). Every command prints JSON.
@@ -22540,7 +22811,7 @@ per site and every account of the site uses it first. Understand first (scan, sc
 - `disarm`                    undo the armed fix
 - `note TEXT`                 one short line for the owner's dashboard
 - `finish --file result.json` the final result; the bridge validates it, arms it and runs its two-message gate (max {AGENT_FINISH_MAX} tries)
-- `give-up --reason TEXT [--code-change-note TEXT]`   when it cannot be fixed without changing bridge.py
+- `give-up --reason TEXT [--root-cause CAUSE] [--code-change-note TEXT]`   when it cannot be fixed from the page (login / check / limit / suspended: say which) or needs a change in bridge.py
 
 ## What a fix may consist of (this is all the bridge can use, validated by it)
 - `selectors`: CSS for `input` (the box messages are typed into), `send` (the send button), `user_msg` (wraps exactly ONE user message), `assistant_msg` (wraps exactly ONE answer).
@@ -22563,7 +22834,7 @@ needs_bridge_code_change=true (still arm the best runtime fix you have). Functio
 - You have about {int((job.deadline - job.created) / 60)} minutes. Finish with `finish` or `give-up`; do not stop silently.
 
 ## Evidence in this folder
-`seed.json` (what the bridge saw fail), `history.txt` (earlier attempts in this repair), `scan.json` (a scan taken when the job started; the page may have changed - scan again).
+`seed.json` (what the bridge saw fail), `history.txt` (earlier attempts in this repair, including an earlier Claude Code session), `knowledge.json` (fixes already verified for this site), `scan.json` (a scan taken when the job started; the page may have changed - scan again).
 """
 
 
@@ -22786,7 +23057,17 @@ class AgentToolkit:
     def _arm(self, job: AgentJob, plan: Dict[str, Any]) -> List[str]:
         """Arm a fix for testing. The caller has just reverted any earlier armed change, so the backup `_activate_selectors` takes is the true original."""
         job.armed = True
-        return self.guard._apply(job.aid, plan, None)
+        try:
+            notes = self.guard._apply(job.aid, plan, None)
+        except GuardCancelled:
+            self.guard._revert(job.host)
+            job.armed = False
+            raise
+        if job.closed or self.guard._ctl(job.aid)["cancel"].is_set():          # 7.95: this call was already running when the owner cancelled: the change it just armed is undone here
+            self.guard._revert(job.host)
+            job.armed = False
+            raise GuardCancelled()
+        return notes
 
     def op_try(self, job: AgentJob, b: Dict[str, Any]) -> Dict[str, Any]:
         plan, errs = guard_validate_agent_plan({**b, "root_cause": b.get("root_cause") or "unknown"})
@@ -22815,8 +23096,9 @@ class AgentToolkit:
     def op_give_up(self, job: AgentJob, b: Dict[str, Any]) -> Dict[str, Any]:
         self.guard._revert(job.host)
         job.armed = False
+        rc_ = str(b.get("root_cause") or "").strip()
         job.result = {"passed": False, "gave_up": True, "reason": redact_evidence(b.get("reason"), 400), "code_change_note": redact_evidence(b.get("code_change_note"), 600),
-                      "patch": self._patch_text(job)}
+                      "root_cause": rc_ if rc_ in GUARD_ROOT_CAUSES else "unknown", "patch": self._patch_text(job)}
         return {"ok": True, "note": "recorded; the owner will see why"}
 
     def _patch_text(self, job: AgentJob) -> str:
@@ -23222,7 +23504,7 @@ def _agent_session_impl(guard: "AccountGuard", aid: str, host: str, label: str, 
     if not AGENT.usable():
         out["reason"] = "Claude Code is not available (" + (AGENT.status().get("reason") or "disabled") + ")"
         return out
-    if not AGENT.budget_ok("session"):
+    if not AGENT.budget_ok("session") and not bool(app.cfg.get("agent_repair_ignores_budget", True)):
         out["reason"] = "the hourly budget for Claude Code repair sessions is used up"
         return out
     cli = AGENT.cli()
@@ -23238,6 +23520,10 @@ def _agent_session_impl(guard: "AccountGuard", aid: str, host: str, label: str, 
         (job.dir / "toolkit.py").write_text(AGENT_TOOLKIT_PY, "utf-8")
         (job.dir / "seed.json").write_text(json.dumps(agent_clean(seed), ensure_ascii=False, indent=1), "utf-8")
         (job.dir / "history.txt").write_text("\n".join(agent_clean(history[-6:])) or "none", "utf-8")
+        try:
+            (job.dir / "knowledge.json").write_text(json.dumps(agent_clean(guard_knowledge_read(app.store, host)), ensure_ascii=False, indent=1)[:40000], "utf-8")        # 7.95: fixes already verified for this site
+        except Exception:
+            pass
         if scan0:
             (job.dir / "scan.json").write_text(json.dumps(agent_clean(scan0), ensure_ascii=False, indent=1)[:60000], "utf-8")
         task = agent_task_text(job, seed, history, VERSION, str(SCRIPT))
@@ -23274,8 +23560,7 @@ def _agent_session_impl(guard: "AccountGuard", aid: str, host: str, label: str, 
     try:
         for vi, argv in enumerate(variants):
             proc = agent_popen(argv, str(job.dir), AGENT.env())
-            with AGENT.proc_lock:
-                AGENT.procs.add(proc)
+            AGENT.register(proc, aid)
             try:
                 proc.stdin.write(prompt.encode("utf-8"))
                 proc.stdin.close()
@@ -23331,6 +23616,8 @@ def _agent_session_impl(guard: "AccountGuard", aid: str, host: str, label: str, 
                     if time.time() > grace_until:
                         break
                 time.sleep(0.4)
+            if ctl["cancel"].is_set():
+                raise GuardCancelled()                              # 7.95: the owner's cancel killed the process from outside: that is a cancel, not a crash of Claude Code
             agent_kill_tree(proc)
             for t in ths:
                 t.join(3)
@@ -23350,8 +23637,7 @@ def _agent_session_impl(guard: "AccountGuard", aid: str, host: str, label: str, 
         job.closed = True
         agent_kill_tree(proc)
         if proc is not None:
-            with AGENT.proc_lock:
-                AGENT.procs.discard(proc)
+            AGENT.unregister(proc)
         with _AGENT_JOBS_LOCK:
             AGENT_JOBS.pop(job.id, None)
         out["turns"], out["ops"] = job.turns, job.ops
@@ -23361,7 +23647,7 @@ def _agent_session_impl(guard: "AccountGuard", aid: str, host: str, label: str, 
         out.update(passed=True, plan=res.get("plan"), test=res.get("test") or [])
     elif res.get("gave_up"):
         out["reason"] = "the agent gave up: " + str(res.get("reason") or "")
-        out["plan"] = {"needs_bridge_code_change": bool(res.get("code_change_note")), "code_change_note": str(res.get("code_change_note") or ""), "root_cause": "unknown", "summary": str(res.get("reason") or "")[:200]}
+        out["plan"] = {"needs_bridge_code_change": bool(res.get("code_change_note")), "code_change_note": str(res.get("code_change_note") or ""), "root_cause": str(res.get("root_cause") or "unknown"), "summary": str(res.get("reason") or "")[:200]}
     return out
 
 
@@ -23401,10 +23687,7 @@ class AccountGuard:
             self.base_workers = max(1, min(8, int(self._c("guard_workers", 3) or 3)))
             for _i in range(self.base_workers):
                 self._spawn_worker()
-        if keep:
-            tm = threading.Timer(25.0, self._resume)
-            tm.daemon = True
-            tm.start()
+        # 7.95: a restart never starts a repair. A red account stays red (view() restores the mark from the quarantine file) until the owner presses repair.
 
     def _c(self, key: str, default: Any) -> Any:
         try:
@@ -23413,8 +23696,8 @@ class AccountGuard:
             return default
 
     def _on(self) -> bool:
-        """7.88: the AUTOMATIC repair switch. Colours, skipping a failed account and the manual buttons do not depend on it."""
-        return self.app is not None and bool(self._c("guard_enabled", True))
+        """7.95: there is NO automatic repair any more, so this is always False. Colours, skipping a failed account and the owner's buttons never depended on it."""
+        return False
 
     def _spawn_worker(self) -> None:
         th = threading.Thread(target=self._work, daemon=True, name=f"guard-{len(self.workers)}")
@@ -23435,22 +23718,12 @@ class AccountGuard:
             log(f"guard: state not saved ({type(e).__name__})", "warn")
 
     def _resume(self) -> None:
-        if not self._on():
-            return
-        for aid in list(self.quar):
-            try:
-                if (self.quar.get(aid) or {}).get("held"):
-                    continue                                        # the owner cancelled this one: only the owner starts it again
-                self.request_repair(aid, manual=False, resumed=True)
-            except Exception:
-                pass
+        """7.95: kept as a no-op so nothing that still calls it can start a repair. Only `request_repair` from the owner's button starts one."""
+        return None
 
     def resume_auto(self) -> None:
-        """The owner switched the automatic repair ON: accounts that are red and waiting get their repair now."""
-        try:
-            self._resume()
-        except Exception:
-            pass
+        """7.95: no-op (there is no automatic repair to switch on)."""
+        return None
 
     # ---- row state ---------------------------------------------------------------------------------------------------------------------------
     def _row(self, aid: str) -> Dict[str, Any]:
@@ -23567,8 +23840,7 @@ class AccountGuard:
                 self._set(r, "failed")
                 rev_ = r["rev"]
                 seed_ = dict(r["seed"])
-            auto = self._on()
-            log(f"guard: {acct.get('label')} got no answer ({cat or kind})" + (("; skipped, the advisor repairs it shortly" if auto else "; skipped, press repair to fix it") if repair else "; Chrome is not reachable"), "warn")
+            log(f"guard: {acct.get('label')} got no answer ({cat or kind})" + ("; skipped, press repair to fix it" if repair else "; Chrome is not reachable"), "warn")
             if repair:
                 if (cat in GUARD_SKIP_NOW or kind in GUARD_REPAIR_KINDS) and self._has_other_usable(aid):
                     self._hold_out(aid, seed_)                       # the page gave no answer and another account can serve: skip this one right now, nothing waits for it
@@ -23591,16 +23863,7 @@ class AccountGuard:
             r = self.rows.get(aid)
             if self.app is not app or r is None or r["state"] != "failed" or r["rev"] != rev:
                 return                                              # served OK meanwhile, a newer event happened, or another bridge instance owns the guard now
-        if self._on() and not seed.get("from_agent"):               # a failure seen by the agent's OWN traffic never starts another agent
-            self._safe_request(aid, seed)                           # automatic mode: the advisor repair starts
-        else:
-            self._hold_out(aid, seed)                               # manual mode: red + skipped, waiting for the owner's button
-
-    def _safe_request(self, aid: str, seed: Dict[str, Any]) -> None:
-        try:
-            self.request_repair(aid, manual=False, seed=seed)
-        except Exception as e:
-            log(f"guard: repair not started ({type(e).__name__}: {str(e)[:80]})", "warn")
+        self._hold_out(aid, seed)                                   # 7.95: red + skipped, waiting for the owner's button. Nothing ever starts the advisor by itself
 
     # ---- views / api ---------------------------------------------------------------------------------------------------------------------------
     def view(self) -> Dict[str, Any]:
@@ -23627,7 +23890,7 @@ class AccountGuard:
                              "steps": [{"k": s["k"], "s": s["s"]} for s in r["steps"]][-8:], "cur": r.get("cur", ""), "note": r.get("note", ""),
                              "can_fix": bool(r.get("can_fix")) and not running, "problem": r.get("problem_id", ""), "sig": f"{r['rev']}:{int(quar)}"}
             quar_n = len(self.quar)
-        return {"enabled": self._on(), "auto": self._on(), "engine": str(self._c("advisor_engine", "auto")), "rows": rows, "quarantined": quar_n, "stats": dict(self.stats), "prompt_pending": self._pending_count()}
+        return {"enabled": True, "auto": False, "engine": str(self._c("advisor_engine", "auto")), "rows": rows, "quarantined": quar_n, "stats": dict(self.stats), "prompt_pending": self._pending_count()}
 
     def _problems_dir(self) -> Path:
         return self.app.store.path("logs", GUARD_DIR, "problems")
@@ -23705,12 +23968,17 @@ class AccountGuard:
         if a.get("type") == "api":
             raise BridgeError("the guard repairs browser accounts; use the provider test for an API account", "client", 400)
         with self.lock:
+            c_old = self.ctl.get(aid)
+            cancelling_ = aid in self.active and bool(c_old and c_old["cancel"].is_set())
+        if cancelling_:
+            self._wait_unwound(aid, 8.0)                            # 7.95: the owner cancelled a moment ago and pressed start again: let the old run finish unwinding (it takes a second or two now)
+        with self.lock:
             if aid in self.active:
                 c0 = self.ctl.get(aid)
                 return {"ok": True, "already": True, "cancelling": bool(c0 and c0["cancel"].is_set())}
             was_bad = aid in self.quar or (self.rows.get(aid) or {}).get("state") == "failed"       # an account that looked healthy goes back to rotation when the owner cancels
             self.active.add(aid)
-            c = {"go": threading.Event(), "cancel": threading.Event(), "live": None, "was_bad": was_bad}
+            c = {"go": threading.Event(), "cancel": threading.Event(), "live": None, "was_bad": was_bad, "events": set()}
             c["go"].set()
             self.ctl[aid] = c
             r = self._row(aid)
@@ -23729,12 +23997,18 @@ class AccountGuard:
     def _work(self) -> None:
         while True:
             aid, deep, manual = self.q.get()
+            _GUARD_TLS.owner = aid                                  # 7.95: every child process / advisor question started by this thread belongs to this repair
             try:
                 self._repair(aid, deep, manual)
             except Exception as e:
                 log(f"guard: repair of {aid} crashed: {type(e).__name__}: {str(e)[:120]}", "error")
                 self._finish(aid, False, "the repair job crashed: " + type(e).__name__)
             finally:
+                try:
+                    self._stop_everything(aid)                      # 7.95: whatever is still running for this repair (Claude Code, a one-shot question) ends with it
+                except Exception:
+                    pass
+                _GUARD_TLS.owner = ""
                 with self.lock:
                     self.active.discard(aid)
                     self.ctl.pop(aid, None)
@@ -23748,7 +24022,7 @@ class AccountGuard:
         with self.lock:
             c = self.ctl.get(aid)
             if c is None:
-                c = self.ctl[aid] = {"go": threading.Event(), "cancel": threading.Event(), "live": None, "was_bad": True}
+                c = self.ctl[aid] = {"go": threading.Event(), "cancel": threading.Event(), "live": None, "was_bad": True, "events": set()}
                 c["go"].set()
             return c
 
@@ -23783,15 +24057,88 @@ class AccountGuard:
         return {"ok": True, "paused": False}
 
     def cancel_repair(self, aid: str) -> Dict[str, Any]:
+        """7.95: a COMPLETE cancel. Besides the flag the job polls, it stops what is running RIGHT NOW: the test message in flight, any advisor question in flight, the Claude Code
+        process (and everything it started), and the toolkit door of its job. Then it waits a few seconds until the worker has really unwound, so the answer says whether it is over."""
         c = self._running(aid)
         with self.lock:
             c["cancel"].set()
             c["go"].set()                                           # wakes a paused job so it can unwind
             live = c.get("live")
+            extra = list(c.get("events") or ())
         if live is not None:
             live.set()                                              # a test message that is in flight is abandoned
+        for ev in extra:
+            ev.set()                                                # an advisor question that is in flight is abandoned
+        self._stop_everything(aid)
         self._apply_cancel_state(aid)
-        return {"ok": True, "cancelled": True}
+        stopped = self._wait_unwound(aid, 6.0)
+        return {"ok": True, "cancelled": True, "stopped": stopped}
+
+    def _stop_everything(self, aid: str) -> None:
+        """Idempotent, never raises: close this account's agent job (its toolkit answers 410 from now on) and kill every process that belongs to its repair."""
+        try:
+            with _AGENT_JOBS_LOCK:
+                jobs = [j for j in AGENT_JOBS.values() if j.aid == aid]
+            for j in jobs:
+                j.closed = True
+            AGENT.stop_owner(aid)
+        except Exception:
+            pass
+
+    def _wait_unwound(self, aid: str, seconds: float) -> bool:
+        end = time.time() + max(0.0, float(seconds))
+        while True:
+            with self.lock:
+                if aid not in self.active:
+                    return True
+            if time.time() >= end:
+                return False
+            time.sleep(0.05)
+
+    def track(self, aid: str, ev: threading.Event) -> None:
+        """An in-flight request that belongs to the repair of `aid` registers its cancel event here: the owner's cancel sets it."""
+        if not aid:
+            return
+        with self.lock:
+            c = self.ctl.get(aid)
+            if c is None:
+                return
+            c.setdefault("events", set()).add(ev)
+            gone = c["cancel"].is_set()
+        if gone:
+            ev.set()
+
+    def untrack(self, aid: str, ev: threading.Event) -> None:
+        if not aid:
+            return
+        with self.lock:
+            c = self.ctl.get(aid)
+            if c is not None:
+                c.setdefault("events", set()).discard(ev)
+
+    def _io(self, aid: str, fn: Callable[[], Any], poll: float = 0.25) -> Any:
+        """7.95: run one BLOCKING call (a browser step that may take up to 120 s) in a helper thread and wait for it in small slices, so the owner's cancel is honoured within a fraction
+        of a second. The call itself finishes in the background and its result is dropped. Re-raises what the call raised."""
+        c = self._ctl(aid)
+        if c["cancel"].is_set():
+            raise GuardCancelled()
+        box: Dict[str, Any] = {}
+        done = threading.Event()
+
+        def runner() -> None:
+            try:
+                box["v"] = fn()
+            except BaseException as e_:                             # noqa: BLE001 - handed to the waiting thread
+                box["e"] = e_
+            finally:
+                done.set()
+        threading.Thread(target=runner, daemon=True, name="guard-io").start()
+        while not done.wait(poll):
+            if c["cancel"].is_set():
+                raise GuardCancelled()
+        if "e" in box:
+            raise box["e"]
+        return box.get("v")
 
     def _apply_cancel_state(self, aid: str) -> None:
         """Idempotent. An account that looked healthy before the owner started the repair goes back to rotation; one that was red stays red, skipped, and is not retried by itself."""
@@ -23814,6 +24161,7 @@ class AccountGuard:
         self._save_state()
 
     def _cancelled(self, aid: str, host: str) -> None:
+        self._stop_everything(aid)
         self._revert(host)                                          # an armed, untested page change must not stay behind
         with self.lock:
             self.cand.pop(host, None)
@@ -23886,7 +24234,9 @@ class AccountGuard:
                 out["facts"] = {}
             return out
         try:
-            return ab.run(fn, True, 120), ""
+            return self._io(aid, lambda: ab.run(fn, True, 120)), ""
+        except GuardCancelled:
+            raise                                                   # 7.95: the owner's cancel is never reported as "the page could not be scanned"
         except BridgeError as e:
             return None, str(e)[:160]
         except Exception as e:
@@ -23910,6 +24260,7 @@ class AccountGuard:
                     ("clickable controls (JSON)", json.dumps(controls, ensure_ascii=False)[:3600]),
                     ("candidate elements (JSON)", json.dumps(cands, ensure_ascii=False)[:4200])]
         adv = ADVISOR[0] if ADVISOR else None
+        self._checkpoint(aid, str((self.app.acc.get(aid) or {}).get("host") or "").lower())      # 7.95: a cancel never starts a new question
         d = adv.ask("guard_diag", sections, GUARD_DIAG_SCHEMA, GUARD_DIAG_INSTRUCTION, exclude=[aid]) if adv is not None else None
         plan = guard_validate_diag(d, scan) if d else None
         if plan is None:
@@ -23932,11 +24283,15 @@ class AccountGuard:
         if not plan.get("steps"):
             return notes
         ab = app.acc.browser(aid)
+        ctl_ = self._ctl(aid)
 
         def fn(ctx: Any) -> List[str]:
             pg = _page(ab, ctx, base, entry)
             out: List[str] = []
             for st in plan["steps"]:
+                if ctl_["cancel"].is_set():                         # 7.95: a cancel stops the clicking at the next step
+                    out.append("cancelled")
+                    break
                 do = st["do"]
                 try:
                     if do in ("dismiss", "click"):
@@ -23979,7 +24334,9 @@ class AccountGuard:
                     pass
             return out
         try:
-            notes += ab.run(fn, True, 120)
+            notes += self._io(aid, lambda: ab.run(fn, True, 120))
+        except GuardCancelled:
+            raise
         except Exception as e:
             notes.append(f"browser step failed: {type(e).__name__}")
         return notes
@@ -24108,8 +24465,11 @@ class AccountGuard:
             cid = str(a.get("pc_client_id") or "")
             if cid and pc_autostart_profile(self.app.pc_hub, cid, self.app.cfg, force=True):
                 end = time.time() + 40
+                c_ = self.ctl.get(aid)
                 while time.time() < end and not self.app.pc_hub.connected(cid):
-                    time.sleep(1.0)
+                    if c_ is not None and c_["cancel"].is_set():    # 7.95: do not keep waiting for Chrome after a cancel
+                        break
+                    time.sleep(0.4)
         except Exception:
             pass
 
@@ -24135,9 +24495,11 @@ class AccountGuard:
         rec: Dict[str, Any] = {"id": pid, "host": host, "account": label, "account_id": aid, "started": round(now(), 1), "trigger": "deep_check" if deep else ("manual" if manual else "request_failure"),
                                "symptom": {k: seed.get(k) for k in ("category", "scope", "kind", "message", "partial")}, "attempts": [], "outcome": "", "evidence": {}, "exported": False}
         self.stats["repairs"] += 1
+        log(f"guard: repair of {label} ({host}) started - scanning the page through its browser tab", "info")
         history: List[str] = []
         attempts = max(1, min(6, int(self._c("guard_repair_attempts", 3) or 3)))
-        agent_tried = False
+        agent_rounds, agent_max = 0, max(1, min(3, int(self._c("guard_agent_rounds", 2) or 2)))      # 7.95: a second session starts from what the first one learned and could not do
+        attempts = max(attempts, agent_max)
         with self._host_lock(host):
             know = guard_knowledge_read(app.store, host)
             fix0 = (know.get("fixes") or [None])[-1] if not deep else None
@@ -24159,6 +24521,7 @@ class AccountGuard:
                     scan, why = self._scan(aid)
                     if scan is None:
                         self._step(aid, "scan", "fail", why)
+                        log(f"guard: repair of {label}: the page could not be scanned ({why}) - attempt {n + 1} of {attempts}", "warn")
                         history.append(f"attempt {n + 1}: the page could not be scanned ({why})")
                         self._recover_browser(aid, why)
                         continue
@@ -24168,14 +24531,18 @@ class AccountGuard:
                         rec["evidence"] = {"url": scan.get("url"), "title": scan.get("title"), "hints": dp.get("hints") or {}, "overlays": (dp.get("overlays") or [])[:4], "counts": dp.get("counts") or {},
                                            "controls": [str(c.get("text") or c.get("label") or "")[:30] for c in ((scan.get("snap") or {}).get("controls") or [])[:14]]}
                     self._checkpoint(aid, host)
-                    if not agent_tried and AGENT.usable() and not (not history and guard_deterministic_plan(scan)):                  # 7.89 (7.94: not when the measured facts already name the cause): Claude Code looks at the real page first; the one-shot / rules path below is the fallback
-                        agent_tried = True
+                    if agent_rounds < agent_max and AGENT.usable() and not (not history and guard_deterministic_plan(scan)):                  # 7.89 (7.94: not when the measured facts already name the cause): Claude Code looks at the real page first; the one-shot / rules path below is the fallback
+                        agent_rounds += 1
                         verdict = self._agent_round(aid, host, label, rec, seed, history, scan, n)
                         if verdict == "passed":
                             return
                         self._revert(host)
                         if verdict == "failed":
-                            break                                           # an agent that really worked and could not fix it: the old fixed steps will not do better
+                            last_ = (rec.get("attempts") or [{}])[-1]
+                            external_ = str(last_.get("root_cause") or "") in GUARD_EXTERNAL_CAUSES
+                            if not external_ and agent_rounds < agent_max and n + 1 < attempts:
+                                continue                                    # 7.95: ONE more session, with the first one's findings in history.txt: the page may have been in a different state
+                            break                                           # an agent that really worked and could not fix it twice (or found a cause only the owner can remove): the old fixed steps will not do better
                     self._step(aid, "diag", "run")
                     plan = self._diagnose(aid, scan, seed, history)
                     source = str(plan.get("source") or source)                 # 7.89: the record says who really answered (agent / advisor / rules), not always "advisor"
@@ -24202,10 +24569,12 @@ class AccountGuard:
         """7.89: one Claude Code session. -> 'passed' (the bridge's own gate passed and the fix is saved) | 'failed' (it worked and could not fix it) | 'skipped' (it could not run / never
         used the toolkit: an infrastructure problem, the one-shot / rules path may still help)."""
         self._step(aid, "agent", "run", "Claude Code is working on the page")
+        log(f"guard: repair of {label}: starting Claude Code (details of this run: bridge_data\\agent\\jobs\\<latest>\\stderr.txt and transcript.jsonl)", "info")
         res = agent_session(self, aid, host, label, seed, history, scan)
         if not res.get("ran") or not res.get("ops"):
             why = str(res.get("reason") or "it never used the toolkit")
             self._step(aid, "agent", "fail", why[:80])
+            log(f"guard: repair of {label}: Claude Code did not do any work ({why[:200]})", "warn")
             history.append(f"attempt {n + 1}: Claude Code did not do any work ({why[:120]})")
             return "skipped"
         plan = res.get("plan") or {}
@@ -24221,7 +24590,8 @@ class AccountGuard:
             self._success(aid, host, label, rec, plan, "agent")
             return "passed"
         self._step(aid, "agent", "fail", str(res.get("reason") or "")[:80])
-        history.append(f"attempt {n + 1} (Claude Code, {res.get('turns')} turns): {str(res.get('reason') or 'the test did not pass')[:140]}")
+        history.append(f"attempt {n + 1} (Claude Code, {res.get('turns')} turns, cause {plan.get('root_cause') or 'unknown'}): {str(res.get('reason') or 'the test did not pass')[:140]}"
+                       + (f" | it reported: {str(plan.get('summary'))[:120]}" if plan.get("summary") and str(plan.get("summary")) not in str(res.get("reason") or "") else ""))
         return "failed"
 
     def _success(self, aid: str, host: str, label: str, rec: Dict[str, Any], plan: Dict[str, Any], source: str) -> None:
@@ -24285,22 +24655,8 @@ class AccountGuard:
             self._write_prompt_file()
         except Exception:
             pass
-        log(f"guard: {label} could NOT be repaired automatically; it stays out of rotation (press the wrench to try again)", "error")
+        log(f"guard: {label} could NOT be repaired; it stays out of rotation until you press the wrench again (nothing retries by itself)", "error")
         self._finish(aid, False, "; ".join(history[-1:])[:140])
-        mins = float(self._c("guard_auto_retry_minutes", 30) or 0)
-        if mins > 0:
-            tm = threading.Timer(mins * 60, lambda: self._retry_later(aid))
-            tm.daemon = True
-            tm.start()
-
-    def _retry_later(self, aid: str) -> None:
-        try:
-            with self.lock:
-                still = aid in self.quar and not (self.quar.get(aid) or {}).get("held")
-            if still and self._on():
-                self.request_repair(aid, manual=False, resumed=True)
-        except Exception:
-            pass
 
     def _finish(self, aid: str, ok: bool, note: str) -> None:
         with self.lock:
@@ -26780,6 +27136,31 @@ def pc_chrome_profiles() -> List[Dict[str, str]]:
     return sorted(rows, key=lambda r: (r["dir"] != "Default", r["dir"]))
 
 
+def pc_profile_for_extension(ext_id: str, exclude: Any = ()) -> str:
+    """The Chrome profile folder whose preferences list this extension id (so the pairing knows WHICH profile it belongs to). '' when unknown or ambiguous."""
+    if not ext_id:
+        return ""
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data"
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+    else:
+        base = Path.home() / ".config" / "google-chrome"
+    hits: List[str] = []
+    for p in pc_chrome_profiles():
+        if p["dir"] in set(exclude or ()):
+            continue
+        for fn in ("Secure Preferences", "Preferences"):
+            try:
+                data = json.loads((base / p["dir"] / fn).read_text("utf-8"))
+                if ext_id in ((data.get("extensions") or {}).get("settings") or {}):
+                    hits.append(p["dir"])
+                    break
+            except Exception:
+                continue
+    return hits[0] if len(hits) == 1 else ""
+
+
 def pc_find_chrome() -> str:
     cands: List[str] = []
     if os.name == "nt":
@@ -26813,41 +27194,67 @@ def pc_copy_to_clipboard(text: str) -> bool:
     return False
 
 
-def pc_open_extensions(home: Path, dash_port: int, admin_key: str, profile: str) -> Dict[str, Any]:
+def pc_last_used_profile() -> str:
+    """The Chrome profile folder Chrome itself opens by default (Local State: profile.last_used), else the only profile, else ''."""
+    try:
+        if os.name == "nt":
+            base = Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data"
+        elif sys.platform == "darwin":
+            base = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+        else:
+            base = Path.home() / ".config" / "google-chrome"
+        lu = str((json.loads((base / "Local State").read_text("utf-8")).get("profile") or {}).get("last_used") or "")
+        dirs = [p["dir"] for p in pc_chrome_profiles()]
+        if lu in dirs:
+            return lu
+        return dirs[0] if len(dirs) == 1 else ""
+    except Exception:
+        return ""
+
+
+def pc_open_extensions(home: Path, dash_port: int, admin_key: str, profile: str, pair: bool = False) -> Dict[str, Any]:
     """One click: (re)write the extension, make a one-time code, copy the extension folder path to the clipboard and open Chrome IN THE CHOSEN PROFILE on
     chrome://extensions plus the dashboard (which hands the code to the extension as soon as it is loaded). Chrome itself still requires the owner to switch on
     Developer mode and press 'Load unpacked' - extensions cannot be installed silently - so the path is already on the clipboard: paste it into the folder box."""
     known = {p["dir"]: p for p in pc_chrome_profiles()}
     if profile not in known:
-        raise BridgeError("choose one of the Chrome profiles from the list", "client", 400)
+        profile = pc_last_used_profile()                                          # no choice needed: the profile the owner is using; the extension reports itself once loaded
+    if profile and profile not in known:
+        profile = ""
+    known.setdefault(profile, {"dir": profile, "name": profile or "Chrome", "email": ""})
+    pf_args = [f"--profile-directory={profile}"] if profile else []
     chrome = pc_find_chrome()
     if not chrome:
         raise BridgeError("Google Chrome was not found on this computer; open chrome://extensions in your profile yourself and load the folder", "setup", 404)
     PC_DASH_PORT[0] = int(dash_port)
     hub = pc_hub(home)
     ext = pc_extract(hub.root)["path"]
-    code = hub.new_pairing()
-    clip = pc_copy_to_clipboard(str(ext))
-    dash = f"http://127.0.0.1:{int(dash_port)}/#k={urllib.parse.quote(admin_key, safe='')}&pair={hub.port}:{code}&pn={urllib.parse.quote(known[profile]['name'], safe='')}"
-    PC_PENDING_DIR[0] = (profile, time.time())
-    # chrome://extensions must be opened ALONE: when Chrome is already running, a command line that mixes a chrome:// URL with an http URL drops the chrome:// one
-    # and only the dashboard opens (a duplicate bridge tab). Open the extensions page first, then (after a short pause) the dashboard that carries the pairing code.
     _kw = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if os.name == "nt":
         _kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    opened_ext = False
-    try:
-        if sys.platform == "darwin":
-            subprocess.Popen(["open", "-a", "Google Chrome", "--args", f"--profile-directory={profile}", "--new-tab", "chrome://extensions/"], **_kw)
-        else:
-            subprocess.Popen([chrome, f"--profile-directory={profile}", "--new-tab", "chrome://extensions/"], **_kw)
-        opened_ext = True
-    except Exception as e:
-        log(f"personal chrome setup: could not open chrome://extensions ({type(e).__name__}); open it yourself", "warn")
-    time.sleep(1.5)
-    subprocess.Popen([chrome, f"--profile-directory={profile}", "--new-tab", dash], **_kw)
-    log(f"personal chrome setup: opened Chrome profile '{known[profile]['name']}' on chrome://extensions", "info")
-    return {"opened": True, "extension_dir": str(ext), "clipboard": clip, "profile": known[profile]["name"], "port": hub.port, "code": code}
+    if pair:
+        # STEP 2 (only after the extension was loaded): open the dashboard in that profile with the one-time code; the extension's content script hands it over.
+        code = hub.new_pairing()
+        clip = False
+        dash = f"http://127.0.0.1:{int(dash_port)}/#k={urllib.parse.quote(admin_key, safe='')}&pair={hub.port}:{code}&pn={urllib.parse.quote(known[profile]['name'], safe='')}"
+        PC_PENDING_DIR[0] = (profile, time.time())
+        subprocess.Popen([chrome, *pf_args, "--new-tab", dash], **_kw)
+        log(f"personal chrome setup: opened the dashboard in Chrome profile '{known[profile]['name']}' to pair", "info")
+    else:
+        # STEP 1: copy the folder path and open ONLY chrome://extensions in the chosen profile (no dashboard tab - it used to open instead of / next to it).
+        code = ""
+        hub.open_auto_pair(900.0)
+        PC_PENDING_DIR[0] = (profile, time.time())
+        clip = pc_copy_to_clipboard(str(ext))
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", "-a", "Google Chrome", "--args", *pf_args, "--new-tab", "chrome://extensions/"], **_kw)
+            else:
+                subprocess.Popen([chrome, *pf_args, "--new-tab", "chrome://extensions/"], **_kw)
+        except Exception as e:
+            log(f"personal chrome setup: could not open chrome://extensions ({type(e).__name__}); open it yourself", "warn")
+        log(f"personal chrome setup: opened Chrome profile '{known[profile]['name']}' on chrome://extensions", "info")
+    return {"opened": True, "extension_dir": str(ext), "clipboard": clip, "profile": known[profile]["name"], "port": hub.port, "code": code, "step": "pair" if pair else "extensions"}
 
 
 def pc_api_status() -> Dict[str, Any]:
@@ -26857,8 +27264,68 @@ def pc_api_status() -> Dict[str, Any]:
             "extension_dir": str(hub.root / "extension"), "extension_version": PC_VERSION}
 
 
+_WIN_FOLDER_PICKER_PS = r"""
+$ErrorActionPreference='Stop'
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class BridgeFolderPicker {
+  [ComImport, Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7")] class FileOpenDialogRCW {}
+  [ComImport, Guid("42f85136-db7e-439c-85f1-e4075d135fc8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IFileOpenDialog {
+    [PreserveSig] int Show(IntPtr hwnd);
+    void SetFileTypes(uint c, IntPtr t); void SetFileTypeIndex(uint i); void GetFileTypeIndex(out uint i);
+    void Advise(IntPtr e, out uint c); void Unadvise(uint c);
+    void SetOptions(uint o); void GetOptions(out uint o);
+    void SetDefaultFolder(IShellItem i); void SetFolder(IShellItem i); void GetFolder(out IShellItem i); void GetCurrentSelection(out IShellItem i);
+    void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string n); void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string n);
+    void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string t); void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string t); void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string t);
+    void GetResult(out IShellItem i);
+  }
+  [ComImport, Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IShellItem { void BindToHandler(IntPtr p, ref Guid b, ref Guid r, out IntPtr o); void GetParent(out IShellItem i);
+    void GetDisplayName(uint n, [MarshalAs(UnmanagedType.LPWStr)] out string s); void GetAttributes(uint m, out uint a); void Compare(IShellItem i, uint h, out int o); }
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  public static string Pick(string title) {
+    var d = (IFileOpenDialog)new FileOpenDialogRCW();
+    uint o; d.GetOptions(out o); d.SetOptions(o | 0x20 | 0x40 | 0x800);   // PICKFOLDERS | FORCEFILESYSTEM | PATHMUSTEXIST
+    d.SetTitle(title);
+    int hr = d.Show(GetForegroundWindow());
+    if (hr == unchecked((int)0x800704C7)) return "";                        // cancelled
+    if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+    IShellItem it; d.GetResult(out it); string path; it.GetDisplayName(0x80058000, out path); return path;
+  }
+}
+'@
+[Console]::OutputEncoding=[System.Text.Encoding]::UTF8
+[Console]::Out.Write([BridgeFolderPicker]::Pick('Choose a Claude Code workspace'))
+"""
+
+
+def _pick_workspace_directory_windows() -> Optional[str]:
+    """The modern Windows 'Select Folder' dialog (the same one Explorer/Office use). None = it could not be opened (the caller falls back to Tk); '' = cancelled."""
+    ps = shutil.which("powershell") or shutil.which("pwsh")
+    if not ps:
+        return None
+    enc = base64.b64encode(_WIN_FOLDER_PICKER_PS.encode("utf-16-le")).decode("ascii")
+    try:
+        r = subprocess.run([ps, "-NoProfile", "-NonInteractive", "-STA", "-WindowStyle", "Hidden", "-EncodedCommand", enc], capture_output=True, timeout=600,
+                           stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception as e:
+        log(f"folder picker: native dialog failed ({type(e).__name__}); using the fallback", "warn")
+        return None
+    if r.returncode != 0:
+        log("folder picker: native dialog failed; using the fallback", "warn")
+        return None
+    out = r.stdout.decode("utf-8", "replace").strip().lstrip("\ufeff")
+    return str(Path(out).resolve()) if out and Path(out).is_dir() else ""
+
+
 def pick_workspace_directory() -> str:
     """Open the native folder picker on the local machine running the bridge."""
+    if os.name == "nt":
+        got = _pick_workspace_directory_windows()
+        if got is not None:
+            return got
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -27496,12 +27963,63 @@ class Handler(BaseHTTPRequestHandler):
                                     "profile_order": [g_["key"] for g_ in groups_.values() if g_["key"]], "account_order": list(prio_ids_),
                                     "current_count": int(app.engine.acct_rr.get("count", 0) or 0), "advisor": app.advisor.view()["enabled"],
                                     "order": [{"id": a["id"], "label": a.get("label"), "state": a.get("state")} for a in list(acc.items)]})
+        if path.startswith("/api/personal-chrome/profiles/") and method in ("DELETE", "POST"):
+            rest_ = path[len("/api/personal-chrome/profiles/"):].strip("/").split("/")
+            pid_ = urllib.parse.unquote(rest_[0])[:64]
+            hub_ = app.pc_hub
+            if method == "POST" and rest_[1:] == ["name"]:                                  # rename a Chrome profile (double-click on its name); empty = Chrome's own name
+                raw_ = (self._body() or {}).get("name")
+                try:
+                    return self._json(200, hub_.rename_profile(pid_, raw_ if isinstance(raw_, str) else ""))
+                except BridgeError as e_:
+                    return self._json(e_.status, {"error": str(e_)})
+            if method == "DELETE" and len(rest_) == 1:                                      # delete the profile AND everything that belongs to it
+                self._body()
+                owned_ = [a_ for a_ in list(acc.items) if pid_ and pid_ in (str(a_.get("pc_client_id") or ""), str(a_.get("login_client_id") or ""))]
+                if pid_ not in {str(p_["id"]) for p_ in hub_.profiles()} and not owned_:
+                    return self._json(404, {"error": "unknown profile"})
+                removed_ = []
+                for a_ in owned_:
+                    aid_ = a_["id"]
+                    try:
+                        errs_ = app.engine.save_config(forget_account_routes(app.engine.config(), aid_))
+                        if errs_:
+                            log(f"profile delete: routing policies of account {aid_} could not be cleaned: {errs_}", "warn")
+                    except Exception as e_:
+                        log(f"profile delete: routing cleanup failed for {aid_} ({type(e_).__name__})", "warn")
+                    for key_ in cfg.data.get("keys", []):
+                        if key_.get("account") == aid_:
+                            key_["account"] = ""
+                    if cfg.data.get("default_account") == aid_:
+                        cfg.data["default_account"] = ""
+                    try:
+                        acc.remove(aid_)                                                    # browser, session, model catalog and the account's own browser folder
+                    except Exception as e_:
+                        log(f"profile delete: account {aid_} could not be fully removed ({type(e_).__name__})", "warn")
+                    removed_.append(aid_)
+                cfg.save()
+                cfg.set("profile_order", [x_ for x_ in _clean_order(cfg.get("profile_order")) if x_ != pid_])
+                cfg.set("disabled_profiles", [x_ for x_ in _clean_order(cfg.get("disabled_profiles")) if x_ != pid_])
+                cfg.set("account_order", [x_ for x_ in _clean_order(cfg.get("account_order")) if x_ not in removed_])
+                q_ = dict(cfg.get("account_quota") or {})
+                for x_ in removed_:
+                    q_.pop(x_, None)
+                cfg.set("account_quota", q_)
+                DISABLED_PROFILES.discard(pid_)
+                hub_.remove_profile(pid_)
+                if PC_PENDING_DIR[0][0]:
+                    PC_PENDING_DIR[0] = ("", 0.0)
+                log(f"profile {pid_[:12]} deleted with {len(removed_)} account(s)", "info")
+                return self._json(200, {"ok": True, "profile": pid_, "removed_accounts": removed_})
         if path == "/api/personal-chrome/profiles" and method == "GET":
             return self._json(200, {"profiles": pc_chrome_profiles()})
         if path == "/api/personal-chrome/extension-path" and method == "POST":           # 7.86: make sure the extension folder exists and tell where it is (nothing is launched)
             self._body()                                                                  # always drain the request body (keep-alive)
             hub_ = pc_hub(app.store.home)
             PC_DASH_PORT[0] = int(cfg["port"])
+            hub_.open_auto_pair(120.0)                                                    # 1.6: while the settings are open the dashboard re-arms this every 30 s: any extension that gets loaded joins by itself
+            if time.time() - PC_PENDING_DIR[0][1] > 120:
+                PC_PENDING_DIR[0] = ("", 0.0)
             return self._json(200, {"extension_dir": str(pc_extract(hub_.root)["path"])})
         if path == "/api/claude-shells" and method == "GET":
             return self._json(200, claude_shells_view())
@@ -27511,13 +28029,13 @@ class Handler(BaseHTTPRequestHandler):
             if not key_:
                 return self._json(404, {"error": "unknown API key"})
             try:
-                return self._json(200, launch_claude_terminal(str(b_.get("shell") or ""), int(cfg["port"]), str(key_["key"])))
+                return self._json(200, launch_claude_terminal(str(b_.get("shell") or ""), int(cfg["port"]), str(key_["key"]), str(b_.get("folder") or ""), bool(b_.get("auto"))))
             except BridgeError as e_:
                 return self._json(e_.status, {"error": str(e_)})
         if path == "/api/personal-chrome/open-extensions" and method == "POST":
             body_ = self._body()
             try:
-                return self._json(200, pc_open_extensions(app.store.home, int(cfg["port"]), str(cfg.get("admin_key") or ""), str((body_ or {}).get("profile") or "")))
+                return self._json(200, pc_open_extensions(app.store.home, int(cfg["port"]), str(cfg.get("admin_key") or ""), str((body_ or {}).get("profile") or ""), bool((body_ or {}).get("pair"))))
             except BridgeError as e_:
                 return self._json(e_.status, {"error": str(e_)})
         if path == "/api/personal-chrome/setup" and method == "POST":
@@ -27878,15 +28396,10 @@ class Handler(BaseHTTPRequestHandler):
                     if k.startswith("ui_quiet_") and not (isinstance(v, (int, float)) and not isinstance(v, bool) and 0.3 <= float(v) <= 300):
                         continue                                       # a bad number must never be stored: it would stall or cut every answer
                     cfg.data[k] = v
-            if "advisor_engine" in body_:
-                cfg.data["guard_enabled"] = str(body_["advisor_engine"]) != "manual"      # 7.89: the engine chip is the one place that decides whether repairs start by themselves
+            cfg.data["guard_enabled"] = False                                                 # 7.95: repairs never start by themselves, whatever was posted
             cfg.save()
             if any(k_ in body_ for k_ in ("agent_cli", "agent_enabled", "advisor_engine", "agent_backend", "agent_api_key")):
                 AGENT.bind(app)                                                           # forget the cached look at the `claude` command
-            if body_.get("guard_enabled") is True or body_.get("advisor_engine") in ("auto", "agent", "model"):                  # 7.88: switched ON -> red accounts that are waiting get their automatic repair now
-                tm_ = threading.Timer(1.0, GUARD.resume_auto)
-                tm_.daemon = True
-                tm_.start()
             return self._json(200, {"ok": True})
         if len(parts) == 2 and parts[0] in ("docs", "tool"):
             host = re.sub(r"[^A-Za-z0-9.\-]", "", parts[1])
@@ -28828,29 +29341,30 @@ def claude_shell_available(shell: str) -> bool:
     return bool(shutil.which(_CLAUDE_SHELL_EXE.get(shell, shell)))
 
 
-def claude_launch_argv(shell: str, env: Dict[str, str]) -> Tuple[List[str], bool]:
+def claude_launch_argv(shell: str, env: Dict[str, str], auto: bool = False) -> Tuple[List[str], bool]:
     """-> (argv, env_by_process). env_by_process True: the variables travel in the environment of the new process (Windows) or an `env` prefix (Unix);
     False (WSL): they are exported inside the command because Windows variables do not cross into WSL by themselves. No string from the browser is ever part of argv."""
     q = shlex.quote
+    cl = "claude --dangerously-skip-permissions" if auto else "claude"          # the owner's switch "fully automatic": Claude Code never asks for approval
     if shell == "cmd":
-        return ["cmd.exe", "/k", "claude"], True
+        return ["cmd.exe", "/k", cl], True
     if shell in ("powershell", "pwsh"):
-        return [shutil.which(shell) or (shell + (".exe" if os.name == "nt" else "")), "-NoLogo", "-NoExit", "-Command", "claude"], True
+        return [shutil.which(shell) or (shell + (".exe" if os.name == "nt" else "")), "-NoLogo", "-NoExit", "-Command", cl], True
     if shell == "gitbash":
-        return [_git_bash_path() or "bash.exe", "--login", "-i", "-c", "claude; exec bash --login -i"], True
+        return [_git_bash_path() or "bash.exe", "--login", "-i", "-c", cl + "; exec bash --login -i"], True
     if shell == "wsl":
         inline = "; ".join(f"export {k}={q(v)}" for k, v in env.items())
-        return [shutil.which("wsl") or "wsl.exe", "--", "bash", "-lc", inline + "; claude; exec bash -l"], False
+        return [shutil.which("wsl") or "wsl.exe", "--", "bash", "-lc", inline + "; " + cl + "; exec bash -l"], False
     if shell in ("bash", "zsh"):
-        return [shell, "-l", "-i", "-c", f"claude; exec {shell} -l -i"], True
+        return [shell, "-l", "-i", "-c", f"{cl}; exec {shell} -l -i"], True
     if shell == "fish":
-        return ["fish", "-i", "-C", "claude"], True
+        return ["fish", "-i", "-C", cl], True
     if shell in ("sh", "ksh"):
-        return [shell, "-c", f"claude; exec {shell}"], True
+        return [shell, "-c", f"{cl}; exec {shell}"], True
     if shell == "tcsh":
-        return ["tcsh", "-c", "claude; exec tcsh"], True
+        return ["tcsh", "-c", cl + "; exec tcsh"], True
     if shell == "nushell":
-        return ["nu", "-e", "claude"], True
+        return ["nu", "-e", cl], True
     raise BridgeError("unknown environment", "client", 400)
 
 
@@ -28863,7 +29377,7 @@ def _linux_terminal_prefix() -> List[str]:
     return []
 
 
-def launch_claude_terminal(shell: str, port: int, api_key: str) -> Dict[str, Any]:
+def launch_claude_terminal(shell: str, port: int, api_key: str, folder: str = "", auto: bool = False) -> Dict[str, Any]:
     """Open a NEW terminal window in the chosen environment with the bridge variables set and `claude` started. Every call opens one more window,
     so any number of Claude Code sessions can run side by side. The key never goes into the log."""
     if shell not in CLAUDE_SHELL_IDS:
@@ -28873,8 +29387,18 @@ def launch_claude_terminal(shell: str, port: int, api_key: str) -> Dict[str, Any
     if not claude_shell_available(shell):
         raise BridgeError(f"'{shell}' was not found on this computer; copy the command and use it where it exists", "setup", 404)
     env = claude_launch_env(f"http://127.0.0.1:{int(port)}", api_key)
-    argv, by_env = claude_launch_argv(shell, env)
+    argv, by_env = claude_launch_argv(shell, env, auto)
     home = str(Path.home())
+    folder = (folder or "").strip()
+    if folder:                                                  # the owner's own working folder for this Claude Code (empty = the home folder, as before)
+        wd_ = Path(folder).expanduser()
+        if not wd_.is_dir():
+            raise BridgeError("the working folder does not exist: " + folder[:200], "client", 400)
+        home = str(wd_.resolve())
+        if shell == "wsl":
+            argv = argv[:1] + ["--cd", home] + argv[1:]
+        elif shell == "gitbash":
+            env = dict(env, CHERE_INVOKING="1")                 # Git Bash login shells would otherwise jump to ~
     try:
         if os.name == "nt":
             penv = os.environ.copy()
@@ -28884,7 +29408,7 @@ def launch_claude_terminal(shell: str, port: int, api_key: str) -> Dict[str, Any
         else:
             full = (["env"] + [f"{k}={v}" for k, v in env.items()] if by_env else []) + argv
             if sys.platform == "darwin":
-                script = 'tell application "Terminal"\n activate\n do script "' + shlex.join(full).replace("\\", "\\\\").replace('"', '\\"') + '"\nend tell'
+                script = 'tell application "Terminal"\n activate\n do script "' + ("cd " + shlex.quote(home) + " && " + shlex.join(full)).replace("\\", "\\\\").replace('"', '\\"') + '"\nend tell'
                 proc = subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             else:
                 term = _linux_terminal_prefix()
@@ -28893,7 +29417,7 @@ def launch_claude_terminal(shell: str, port: int, api_key: str) -> Dict[str, Any
                 proc = subprocess.Popen(term + full, cwd=home, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     except OSError as e:
         raise BridgeError(f"could not start {shell}: {e}", "setup", 500)
-    log(f"Claude Code started in a new {shell} window", "info")
+    log(f"Claude Code started in a new {shell} window" + (f" (folder {home})" if folder else "") + (" - fully automatic (no approvals)" if auto else ""), "info")
     return {"ok": True, "shell": shell, "pid": int(proc.pid)}
 
 
@@ -28932,7 +29456,7 @@ svg.i{width:1.15em;height:1.15em;flex:none;stroke:currentColor;fill:none;stroke-
 svg.i.fl{fill:currentColor;stroke:none}
 [dir=rtl] svg.i.fx{transform:scaleX(-1)}
 .top{position:sticky;top:0;z-index:5;display:flex;align-items:center;flex-wrap:wrap;gap:.5rem .6rem;padding:.6rem max(1rem,env(safe-area-inset-right)) .6rem max(1rem,env(safe-area-inset-left));padding-top:max(.6rem,env(safe-area-inset-top));background:var(--bg);border-bottom:1px solid var(--ln)}
-@supports(background:color-mix(in srgb,red,blue)){.top{background:color-mix(in srgb,var(--bg) 90%,transparent);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}}
+@supports(background:color-mix(in srgb,red,blue)){.top{background:color-mix(in srgb,var(--bg) 96%,transparent)}}
 .brand{display:flex;align-items:center;gap:.6rem;font-weight:700;font-size:1.15rem;min-width:0}
 .brand .bn{white-space:nowrap}
 .logo{width:2.4rem;height:2.4rem;border-radius:.75rem;background:linear-gradient(135deg,var(--a1),var(--a2));display:grid;place-items:center;color:#fff;flex:none}
@@ -29089,6 +29613,35 @@ dialog.dr[open]{animation:drw .22s ease-out}
 .dh{display:flex;align-items:center;gap:.6rem;margin-bottom:.9rem;font-weight:700;font-size:1.1rem}
 .sec{display:grid;gap:.7rem;padding:1rem 0;border-top:1px solid var(--ln)}
 .sec h3{font-size:.93rem;color:var(--mu);font-weight:600;display:flex;align-items:center;gap:.5rem}
+
+dialog.dr{background:radial-gradient(130% 34% at 50% 0,rgba(124,92,255,.20),transparent 62%),var(--bg)}
+.dh{align-items:center;gap:.8rem;margin-bottom:1rem}
+.dh .hbadge{width:2.6rem;height:2.6rem;border-radius:.9rem;display:grid;place-items:center;color:#fff;font-size:1.15rem;background:linear-gradient(135deg,var(--a1),var(--a2));box-shadow:0 8px 22px -8px var(--a1)}
+.dh .htx{display:grid;line-height:1.35}.dh .htx b{font-size:1.15rem}.dh .htx small{font-weight:400;font-size:.8rem;color:var(--mu)}
+.helpcard{margin-bottom:.9rem}
+details.sec.card{display:block;padding:0;border:1px solid var(--ln);border-radius:1.15rem;background:var(--s1);margin-bottom:.7rem;transition:border-color .2s,box-shadow .2s}
+details.sec.card:hover{border-color:rgba(124,92,255,.45)}
+details.sec.card[open]{border-color:rgba(124,92,255,.5);box-shadow:0 14px 34px -22px var(--a1)}
+details.card>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:.8rem;padding:.8rem .9rem;border-radius:1.15rem;-webkit-user-select:none;user-select:none}
+details.card>summary::-webkit-details-marker{display:none}
+details.card>summary:focus-visible{outline:2px solid var(--a1);outline-offset:-2px}
+details.card>summary::after{content:"";flex:none;width:.5rem;height:.5rem;border:solid var(--mu);border-width:0 2px 2px 0;transform:rotate(45deg);transition:transform .2s;margin-inline:.3rem .2rem}
+details.card[open]>summary::after{transform:rotate(-135deg)}
+.sico{flex:none;width:2.4rem;height:2.4rem;border-radius:.8rem;display:grid;place-items:center;color:var(--a1);font-size:1.05rem;background:linear-gradient(135deg,rgba(124,92,255,.20),rgba(34,211,238,.14));border:1px solid rgba(124,92,255,.22)}
+.stx{flex:1;min-width:0;display:grid;line-height:1.4}.stx b{font-size:.98rem;font-weight:700;color:var(--tx)}.stx small{font-size:.8rem;color:var(--mu);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+details.card>.fb{display:grid;gap:.8rem;padding:.2rem .9rem 1rem}
+details.card[open]>.fb{animation:fbin .22s ease-out}@keyframes fbin{from{opacity:0;transform:translateY(-.35rem)}to{opacity:1;transform:none}}
+details.card input[type=text]{border-radius:.85rem;padding:.6rem .85rem;transition:border-color .15s,box-shadow .15s}
+details.card input[type=text]:focus{outline:0;border-color:var(--a1);box-shadow:0 0 0 3px rgba(124,92,255,.22)}
+.wdbox{display:grid;gap:.5rem;padding:.8rem;border-radius:.95rem;background:var(--s2);border:1px dashed var(--ln)}
+.wdrow{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}.wdrow input{flex:1 1 11rem}
+.autobox{display:flex;align-items:center;gap:.8rem;padding:.7rem .8rem;border-radius:.95rem;background:var(--s2);border:1px solid var(--ln);cursor:pointer}.autobox:has(input:checked){border-color:var(--wa);background:rgba(251,191,36,.08)}.autobox .atx{display:grid;line-height:1.5}.autobox .atx b{font-size:.93rem}.autobox .atx small{color:var(--mu);font-size:.8rem}
+.okline{min-height:1.2em;color:var(--ok);font-weight:600;word-break:break-all;direction:ltr;text-align:start}
+.compat{font-size:.78rem;line-height:1.7;opacity:.85;padding:.7rem .8rem;border-radius:.8rem;background:var(--s2);border:1px solid var(--ln);margin:0}
+.runrow .btn.p{box-shadow:0 10px 24px -12px var(--a1)}
+.btn.p:hover{filter:brightness(1.08)}
+.xsteps{padding:.2rem 0}.xsteps li{align-items:flex-start}
+@media(prefers-reduced-motion:reduce){details.card[open]>.fb,dialog.dr[open]{animation:none}}
 .sites{display:grid;grid-template-columns:repeat(auto-fill,minmax(7.2rem,1fr));gap:.6rem}
 .site{display:grid;justify-items:center;gap:.5rem;padding:.9rem .4rem;border-radius:.9rem;background:var(--s2);border:1px solid var(--ln);min-width:0}
 .site span{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -29168,6 +29721,19 @@ dialog.help[open]{display:flex;flex-direction:column;overflow:hidden}
 .ddp .sr input[type=text]{background:none;border:0;padding:.15rem 0;border-radius:0;width:auto;flex:1;outline:0;box-shadow:none}
 .ddp .sr input[type=text]:focus{outline:0}
 .ddp .sr:focus-within{border-color:var(--a1)}
+.xs{display:flex;gap:.7rem;align-items:flex-start}
+.xn{flex:none;width:1.7rem;height:1.7rem;border-radius:50%;background:linear-gradient(135deg,var(--a1),var(--a2));color:#fff;display:grid;place-items:center;font-weight:700;font-size:.85rem;margin-top:.05rem}
+.xb{flex:1;min-width:0;display:grid;gap:.45rem}.xb b{font-size:.95rem}.xb small{color:var(--mu);font-size:.82rem;line-height:1.75}
+.xlive{display:flex;align-items:center;gap:.6rem;padding:.65rem .85rem;border-radius:.95rem;background:var(--s2);border:1px dashed var(--ln);font-size:.9rem;line-height:1.6}
+.xlive .dot{background:var(--wa);animation:advp 1.2s ease-in-out infinite}
+.xlive.ok{border-style:solid;border-color:var(--ok);background:color-mix(in srgb,var(--ok) 10%,transparent)}
+.xlive.ok .dot{background:var(--ok);box-shadow:0 0 6px var(--ok);animation:none}
+.xopt>summary{cursor:pointer;color:var(--mu);font-size:.85rem}
+#chromeDir{white-space:normal;word-break:break-all;line-height:1.5;padding:.4rem 0;overflow-x:visible}
+/* smooth scrolling on weak PCs: nothing below changes how the page looks */
+html.scr *,html.scr *::before,html.scr *::after{transition:none!important}
+dialog.dr,.hbd{overscroll-behavior:contain}
+body:has(dialog[open]) :is(main,.top) *,body:has(dialog[open]) :is(main,.top) *::before,body:has(dialog[open]) :is(main,.top) *::after{animation-play-state:paused}
 </style></head><body>
 <header class="top"><div class="brand"><span class="logo" data-ic="bolt"></span><span class="bn">AI Web Bridge</span></div>
 <span class="chip" id="cChrome"><i></i><span></span></span><span class="chip hm" id="cReady"><i></i><span></span></span><span class="chip" id="cAdv"><i></i><span></span></span>
@@ -29188,21 +29754,26 @@ dialog.help[open]{display:flex;flex-direction:column;overflow:hidden}
 <div class="ctl" style="margin-bottom:.8rem"><span class="lbl" data-t="profile"></span><div id="ddAdd"></div></div>
 <div class="sites" id="sites"></div>
 <div class="ctl" style="margin-top:.9rem"><input type="text" class="ltr" id="addUrl" placeholder="https://…" style="flex:1 1 12rem"><button class="btn p" id="addGo" data-t="add"></button></div></dialog>
-<dialog id="dSet" class="dr"><div class="dh"><span data-ic="gear"></span><span data-t="settings"></span><span class="sp"></span><button class="ib sm" data-close data-ic="x" aria-label="Close"></button></div>
+<dialog id="dSet" class="dr"><div class="dh"><span class="hbadge" data-ic="gear"></span><span class="htx"><b data-t="settings"></b><small data-t="settings_sub"></small></span><span class="sp"></span><button class="ib sm" data-close data-ic="x" aria-label="Close"></button></div>
 <button class="helpcard" id="bHelp"><span class="hi" data-ic="book"></span><span class="ht"><b data-t="help"></b><small data-t="help_sub"></small></span><span data-ic="chevr"></span></button>
-<div class="sec"><h3><span data-ic="plug"></span><span data-t="connect"></span></h3>
+<details class="sec card" open><summary><span class="sico" data-ic="plug"></span><span class="stx"><b data-t="connect"></b><small data-t="connect_sub"></small></span></summary><div class="fb">
 <div class="ctl"><span class="lbl" data-t="key_l"></span><div id="ddKey"></div></div>
-<div class="code"><div class="ch"><span class="tt"><span data-ic="terminal"></span><span id="codeT"></span></span><button class="cp" id="codeCopy" type="button"></button></div><pre><code id="codeBody"></code></pre></div><p class="hin ltr" id="compatLine" style="font-size:.78rem;opacity:.8;margin:.4rem 0 0"></p>
+<div class="code"><div class="ch"><span class="tt"><span data-ic="terminal"></span><span id="codeT"></span></span><button class="cp" id="codeCopy" type="button"></button></div><pre><code id="codeBody"></code></pre></div>
+<div class="wdbox"><span class="lbl"><span data-ic="folder"></span><span data-t="wd_l"></span></span>
+<div class="wdrow"><input type="text" id="wdPath" class="ltr" dir="ltr" data-ph="wd_ph" autocomplete="off" spellcheck="false"><button class="btn sm" id="wdPick" type="button"><span data-ic="folder"></span><span data-t="wd_pick"></span></button><button class="btn sm p" id="wdSave" type="button"><span data-ic="check"></span><span data-t="wd_save"></span></button></div>
+<p class="hint okline" id="wdState"></p></div>
+<label class="autobox"><span class="sw"><input type="checkbox" id="autoOn"><i></i></span><span class="atx"><b data-t="auto_l"></b><small data-t="auto_h"></small></span></label>
 <div class="ctl runrow"><div id="ddEnv"></div><button class="btn p" id="runBtn" type="button"><span data-ic="play"></span><span data-t="run"></span></button></div>
-<p class="hint" id="envHint"></p></div>
-<div class="sec"><h3><span data-ic="package"></span><span data-t="chrome"></span></h3>
-<div class="ctl"><span class="lbl" data-t="profile"></span><div id="ddChrome"></div></div>
-<div class="pathbox"><code id="chromeDir" tabindex="0"></code><button class="cp" id="pathCopy" type="button"></button></div>
-<button class="btn p wide" id="chromeGo" type="button"><span data-ic="package"></span><span data-t="ext_btn"></span></button>
-<ol class="xsteps"><li data-t="ext_s1"></li><li data-t="ext_s2"></li></ol></div>
-<div class="sec"><h3><span data-ic="grid"></span><span data-t="layout"></span></h3><div class="lbl" data-t="cols_l"></div><div class="chips" id="colChips"></div><p class="hint" data-t="cols_hint"></p></div>
-<div class="sec"><h3><span data-ic="key"></span><span data-t="keys"></span></h3><div id="keys"></div><div class="ctl"><input type="text" id="keyLbl" style="flex:1 1 8rem" data-ph="key_name"><button class="btn sm" id="keyNew" data-t="create"></button></div></div>
-<div class="sec"><h3><span data-ic="sparkle"></span><span data-t="advisor"></span></h3><div class="lbl" data-t="adv_engine_l"></div><div class="chips" id="advChips"></div><p class="hint" id="advEngineHint"></p>
+<p class="hint" id="envHint"></p></div></details>
+<details class="sec card" id="chromeCard" open><summary><span class="sico" data-ic="package"></span><span class="stx"><b data-t="chrome"></b><small data-t="chrome_sub"></small></span></summary><div class="fb">
+<div class="xs"><span class="xn">1</span><div class="xb"><b data-t="x1_t"></b><div class="pathbox"><code id="extUrl">chrome://extensions</code><button class="cp" id="urlCopy" type="button"></button></div><small data-t="x1_h"></small></div></div>
+<div class="xs"><span class="xn">2</span><div class="xb"><b data-t="x2_t"></b><div class="pathbox"><code id="chromeDir" tabindex="0"></code><button class="cp" id="pathCopy" type="button"></button></div><small data-t="x2_h"></small></div></div>
+<div class="xlive" id="xLive" role="status"><i class="dot"></i><span id="xLiveT"></span></div>
+<p class="hint" data-t="x_more"></p>
+<details class="xopt"><summary data-t="x_auto"></summary><div class="ctl" style="margin-top:.6rem"><span class="lbl" data-t="profile"></span><div id="ddChrome"></div></div><button class="btn wide" id="chromeGo" type="button" style="margin-top:.6rem"><span data-ic="package"></span><span data-t="ext_btn"></span></button></details></div></details>
+<details class="sec card"><summary><span class="sico" data-ic="grid"></span><span class="stx"><b data-t="layout"></b><small data-t="layout_sub"></small></span></summary><div class="fb"><div class="lbl" data-t="cols_l"></div><div class="chips" id="colChips"></div><p class="hint" data-t="cols_hint"></p></div></details>
+<details class="sec card"><summary><span class="sico" data-ic="key"></span><span class="stx"><b data-t="keys"></b><small data-t="keys_sub"></small></span></summary><div class="fb"><div id="keys"></div><div class="ctl"><input type="text" id="keyLbl" style="flex:1 1 8rem" data-ph="key_name"><button class="btn sm" id="keyNew" data-t="create"></button></div></div></details>
+<details class="sec card"><summary><span class="sico" data-ic="sparkle"></span><span class="stx"><b data-t="advisor"></b><small data-t="advisor_sub"></small></span></summary><div class="fb"><div class="lbl" data-t="adv_engine_l"></div><div class="chips" id="advChips"></div><p class="hint" id="advEngineHint"></p>
 <div class="ctl"><span class="hint" id="agentInfo"></span><button class="btn sm" id="agentLogin" type="button" data-t="agent_signin" style="display:none"></button><button class="btn sm" id="agentChk" type="button" data-t="agent_check"></button></div>
 <p class="hint" data-t="agent_own" style="display:none"></p>
 <div class="lbl" data-t="bk_l" style="display:none"></div><div class="chips" id="agBackChips" style="display:none"></div><p class="hint" id="agBackHint" style="display:none"></p>
@@ -29211,8 +29782,9 @@ dialog.help[open]{display:flex;flex-direction:column;overflow:hidden}
 <label class="ctl"><span class="sw"><input type="checkbox" id="uiLearnOn"><i></i></span><span data-t="sites_on"></span></label>
 <label class="ctl"><span class="sw"><input type="checkbox" id="pcAutoOn"><i></i></span><span data-t="pcauto_on"></span></label>
 <div class="ctl"><button class="btn sm" id="gPrompt" data-t="g_prompt"></button><button class="btn sm" id="gApplied" data-t="g_applied"></button><span class="hint" id="gPromptN"></span></div>
-<h3 style="margin-top:.4rem"><span data-ic="globe"></span><span data-t="sites_l"></span></h3><div id="uiSites"></div></div>
-<div class="sec"><h3><span data-ic="wrench"></span><span data-t="more"></span></h3><div class="ctl"><button class="btn sm" id="logCopy" data-t="copy_log"></button><a class="btn sm" href="/classic" id="classic" data-t="classic"></a></div></div></dialog>
+<h3 style="margin-top:.4rem"><span data-ic="globe"></span><span data-t="sites_l"></span></h3><div id="uiSites"></div></div></details>
+<details class="sec card"><summary><span class="sico" data-ic="wrench"></span><span class="stx"><b data-t="more"></b><small data-t="more_sub"></small></span></summary><div class="fb"><div class="ctl"><button class="btn sm" id="logCopy" data-t="copy_log"></button><a class="btn sm" href="/classic" id="classic" data-t="classic"></a></div>
+<div class="lbl" data-t="compat_l"></div><p class="hint ltr compat" id="compatLine"></p></div></details></dialog>
 <dialog id="dHelp" class="help" aria-labelledby="hTitle"><div class="hhd"><span class="hi" data-ic="book"></span><span id="hTitle" data-t="help_title"></span><span class="sp"></span><button class="ib sm" data-close data-ic="x" aria-label="Close"></button></div><div class="hbd" id="hBody"></div></dialog>
 <div id="toast" role="status" aria-live="polite"></div>
 <script>
@@ -29225,7 +29797,7 @@ const api=async(p,m,b)=>{const o={method:m||'GET',headers:{'x-admin-key':K,'cont
 /* ---------- icons ---------- */
 const IC={bolt:'<path d="M13 2 3 14h8l-1 8 10-12h-8z"/>',gear:'<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
 contrast:'<circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/>',book:'<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V3H6.5A2.5 2.5 0 0 0 4 5.5z"/><path d="M20 17v4H6.5A2.5 2.5 0 0 1 4 18.5"/>',
-plug:'<path d="M12 22v-5M9 8V2M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8z"/>',package:'<path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="m3 8 9 5 9-5M12 13v8"/>',
+folder:'<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',plug:'<path d="M12 22v-5M9 8V2M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8z"/>',package:'<path d="M21 8 12 3 3 8v8l9 5 9-5z"/><path d="m3 8 9 5 9-5M12 13v8"/>',
 copy:'<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',check:'<path d="M20 6 9 17l-5-5"/>',play:'<path d="M7 4v16l13-8z"/>',
 terminal:'<path d="m4 17 6-6-6-6M12 19h8"/>',plus:'<path d="M12 5v14M5 12h14"/>',x:'<path d="M18 6 6 18M6 6l12 12"/>',chev:'<path d="m6 9 6 6 6-6"/>',chevr:'<path d="m9 18 6-6-6-6"/>',
 search:'<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>',link:'<path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-1.7 1.7"/><path d="M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l1.7-1.7"/>',
@@ -29242,41 +29814,41 @@ function icons(root){for(const el of (root||document).querySelectorAll('[data-ic
 /* ---------- text ---------- */
 const HELP={fa:[
 {h:'این برنامه چه کار می‌کند؟',b:'<p><b>AI Web Bridge</b> سایت‌های چت هوش مصنوعی را که در Chrome واردشان شده‌ای به یک آدرس محلی تبدیل می‌کند تا <b>Claude Code</b> (و برنامه‌هایی مثل Cursor) بتوانند از آن‌ها استفاده کنند. همه‌چیز روی همین کامپیوتر می‌ماند.</p>'},
-{h:'اتصال Chrome (فقط یک‌بار)',b:'<ul><li>روی ⚙ (تنظیمات) بزن و به بخش «افزونه Chrome» برو.</li><li>پروفایل Chrome مورد نظرت را انتخاب کن و دکمهٔ «کپی آدرس و باز کردن افزونه‌ها» را بزن.</li><li>در صفحهٔ افزونه‌ها «Developer mode» را روشن کن، «Load unpacked» را بزن، آدرس کپی‌شده را Paste و تأیید کن.</li><li>چند ثانیه بعد نقطهٔ کنار نام پروفایل سبز می‌شود؛ یعنی وصل است.</li></ul>'},
-{h:'افزودن اکانت',b:'<ul><li>روی دکمهٔ + در کارت پروفایل بزن و سایت مورد نظر را انتخاب کن.</li><li>Chrome خودش صفحهٔ ورود را باز می‌کند؛ وارد حسابت شو.</li><li>بعد از ورود معمولاً برنامه خودش ادامه می‌دهد. اگر دکمه‌ای مثل «وارد شدم» دیدی، فقط همان را یک‌بار بزن.</li></ul>'},
+{h:'اتصال Chrome (فقط یک‌بار)',b:'<ul><li>روی ⚙ (تنظیمات) بزن؛ بخش «افزونه Chrome» باز است.</li><li>آدرس <code>chrome://extensions</code> را با دکمهٔ کپی بردار و در یک تب جدید Chrome بچسبان.</li><li>«Developer mode» را روشن کن، «Load unpacked» را بزن، آدرس پوشه را (کپی دوم) Paste کن و OK بزن.</li><li>چند ثانیه بعد خودکار وصل می‌شود و پروفایل در داشبورد ظاهر می‌شود. برای هر پروفایل دیگر هم تکرار کن.</li></ul>'},
+{h:'افزودن اکانت',b:'<ul><li><b>سریع‌ترین راه:</b> سایت هوش مصنوعی را در Chrome باز کن و وارد حسابت باش، روی آیکون افزونه بزن و «افزودن این سایت به داشبورد» را بزن. همین تب در همان پروفایل ثبت و تأیید می‌شود.</li><li>یا روی دکمهٔ + در کارت پروفایل بزن و سایت را انتخاب کن؛ Chrome خودش صفحهٔ ورود را باز می‌کند.</li></ul>'},
 {h:'استفاده در Claude Code',b:'<ul><li>در ⚙ بخش «اتصال Claude Code» یک کلید و محیط ترمینال خودت (مثلاً cmd) را انتخاب کن.</li><li>دکمهٔ «اجرا» یک پنجرهٔ ترمینال تازه با Claude Code باز می‌کند؛ هر چندبار بزنی یک نشست جدا و هم‌زمان خواهی داشت.</li><li>یا آیکون کپی گوشهٔ کادر را بزن و دستور را خودت در ترمینال Paste کن.</li></ul>'},
 {h:'چرخش بین اکانت‌ها',b:'<ul><li><b>روش</b> مشخص می‌کند پیام بعدی به کدام اکانت برود؛ <b>پیام در هر نوبت</b> یعنی هر اکانت پشت‌سرهم چند پیام بگیرد؛ <b>فاصله</b> مکث بین دو پیام یک اکانت است.</li><li>هر اکانت یا از قانون کلی پیروی می‌کند (آیکون زنجیر)، یا با زدن روی آن عدد مخصوص خودش را می‌گیرد. دکمهٔ ↺ دوباره به قانون کلی برمی‌گرداند.</li></ul>'},
 {h:'کنترل‌های روزمره',b:'<ul><li><b>سوییچ کنار اکانت:</b> فقط همان اکانت را خاموش/روشن می‌کند.</li><li><b>سوییچ بالای کارت:</b> کل پروفایل را خاموش/روشن می‌کند. با روشن‌کردن دوباره، همهٔ تنظیمات اکانت‌ها همان‌طور که بود برمی‌گردد.</li><li><b>تغییر نام:</b> روی نام اکانت دابل‌کلیک کن؛ Enter یا کلیک بیرون = ثبت، Esc = لغو. (در گوشی: منوی ⋯ ← تغییر نام)</li><li><b>ترتیب:</b> نقطه‌های کنار اکانت یا آیکون چهارجهتهٔ پروفایل را بکش.</li><li><b>چیدمان:</b> تعداد کارت در هر ردیف را از ⚙ ← چیدمان انتخاب کن.</li></ul>'},
 {h:'وضعیت‌ها و رفع مشکل',b:'<ul><li><b>آماده:</b> همه‌چیز درست است. <b>استراحت:</b> سایت موقتاً محدود کرده و خودش برمی‌گردد.</li><li><b>نیاز به ورود:</b> از منوی ⋯ «ورود دوباره» را بزن. <b>نیاز به تأیید:</b> تأیید انسانی (کپچا) را در خود سایت انجام بده.</li><li>اگر چیزی درست نشد: ⚙ ← بیشتر ← «کپی گزارش خطا».</li></ul>'}],
 en:[
 {h:'What does this app do?',b:'<p><b>AI Web Bridge</b> turns the AI chat websites you are signed in to (in Chrome) into one local address, so <b>Claude Code</b> (and tools like Cursor) can use them. Everything stays on this computer.</p>'},
-{h:'Connect Chrome (once)',b:'<ul><li>Press ⚙ (Settings) and find the “Chrome extension” section.</li><li>Pick your Chrome profile and press “Copy path &amp; open extensions”.</li><li>On the extensions page turn on “Developer mode”, press “Load unpacked”, paste the copied path and confirm.</li><li>A few seconds later the dot next to the profile name turns green: you are connected.</li></ul>'},
-{h:'Add an account',b:'<ul><li>Press the + button on a profile card and pick a site.</li><li>Chrome opens the login page by itself; sign in.</li><li>After signing in the app usually continues by itself. If you see a button like “I’m logged in”, press it once.</li></ul>'},
+{h:'Connect Chrome (once)',b:'<ul><li>Press ⚙ (Settings); the “Chrome extension” section is open.</li><li>Copy <code>chrome://extensions</code> with its copy button and paste it into a new Chrome tab.</li><li>Turn on “Developer mode”, press “Load unpacked”, paste the folder path (second copy button) and press OK.</li><li>A few seconds later it connects by itself and the profile appears in the dashboard. Repeat for every other profile.</li></ul>'},
+{h:'Add an account',b:'<ul><li><b>Fastest:</b> open the AI site in Chrome and sign in, click the extension icon and press “Add this site to the dashboard”. That tab is registered and confirmed in that profile.</li><li>Or press + on a profile card and pick a site; Chrome opens the login page by itself.</li></ul>'},
 {h:'Use it in Claude Code',b:'<ul><li>In ⚙ “Connect Claude Code” pick a key and your terminal (for example cmd).</li><li>“Run” opens a fresh terminal window with Claude Code; press it again for another, separate, parallel session.</li><li>Or press the copy icon in the code box and paste the command into a terminal yourself.</li></ul>'},
 {h:'Rotating between accounts',b:'<ul><li><b>Method</b> decides which account gets the next message; <b>Messages per turn</b> is how many in a row one account takes; <b>Gap</b> is the pause between two messages of one account.</li><li>Each account either follows the global rule (chain icon) or, when you press it, gets its own number. The ↺ button returns it to the global rule.</li></ul>'},
 {h:'Everyday controls',b:'<ul><li><b>Switch next to an account:</b> turns only that account on/off.</li><li><b>Switch on top of a card:</b> turns the whole profile on/off. Turn it back on and every account setting is exactly as it was.</li><li><b>Rename:</b> double-click an account name; Enter or clicking elsewhere saves, Esc cancels. (On a phone: ⋯ menu → Rename)</li><li><b>Order:</b> drag the dots next to an account or the four-arrow icon of a profile.</li><li><b>Layout:</b> choose cards per row in ⚙ → Layout.</li></ul>'},
 {h:'Statuses and fixes',b:'<ul><li><b>Ready:</b> all good. <b>Resting:</b> the site limited it for a moment; it returns by itself.</li><li><b>Needs login:</b> use ⋯ → “Log in again”. <b>Needs check:</b> complete the human check on the site.</li><li>If something is wrong: ⚙ → More → “Copy error report”.</li></ul>'}]};
-const L={fa:{method:'روش',adv_engine_l:'مغز مشاور',adv_eng_auto:'خودکار',adv_eng_agent:'فقط Claude Code',adv_eng_model:'فقط اکانت دیگر',adv_eng_manual:'دستی',adv_hint_auto:'اول Claude Code خودت صفحه را بررسی و درست می‌کند، اگر نبود از اکانت دیگر می‌پرسد و آخرش قوانین ساده. تعمیر خودکار شروع می‌شود.',adv_hint_agent:'فقط Claude Code، مستقل از اکانت‌های بریج. تعمیر خودکار شروع می‌شود.',adv_hint_model:'فقط مدل یک اکانت سالم دیگر (روش قدیمی). تعمیر خودکار شروع می‌شود.',adv_hint_manual:'هیچ تعمیری خودش شروع نمی‌شود، فقط دکمه‌های هر اکانت. مغز مثل حالت خودکار است.',agent_check:'بررسی Claude Code',agent_ok:'Claude Code پیدا شد',agent_none:'Claude Code پیدا نشد (نصب کن یا مسیرش را بده)',agent_login_ok:'پاسخ می‌دهد',agent_login_failed:'پاسخ نمی‌دهد',agent_login_unknown:'هنوز آزمایش نشده',agent_key:'کلید API مخصوص خودش',agent_signin:'ورود مشاور',bk_l:'مغزِ ایجنت (با کدام مدل فکر کند)',bk_auto:'خودکار',bk_bridge:'اکانت‌های بریج',bk_own:'ورود مستقل',bk_hint_auto:'اگر ایجنت ورود/کلید مستقل خودش را دارد با همان، وگرنه با اکانت‌های وصل‌شده به بریج فکر می‌کند.',bk_hint_bridge:'ایجنت از همین اکانت‌های وصل‌شده به بریج برای فکر کردن استفاده می‌کند؛ نیازی به ورود جدا نیست و به Claude Code شخصی شما ربطی ندارد.',bk_hint_own:'ایجنت فقط با ورود/کلید مستقل خودش فکر می‌کند (جدا از Claude Code شما).',inv_l:'بررسی مشکل (هر بخشی از برنامه)',inv_ph:'مشکل را بنویسید؛ مثلاً: چرا اکانت X جواب نمی‌دهد؟ یا: خطای Y در لاگ چیست؟',inv_go:'شروع بررسی',inv_list:'یافته‌های ذخیره‌شده',inv_started:'بررسی شروع شد:',inv_running:'در حال بررسی',inv_done:'پایان:',inv_none:'هنوز یافته‌ای ذخیره نشده',agent_opened:'آنجا با /login وارد شو، بعد دکمه‌ی بررسی را بزن',agent_own:'مشاور Claude Code و ورود مخصوص خودش را دارد. Claude Code خودت (ورود، تنظیمات، تاریخچه، پروژه‌ها) هرگز خوانده یا تغییر داده نمی‌شود و مثل قبل کار می‌کند.',gs_agent:'Claude Code روی صفحه کار می‌کند',gs_gate:'پیام‌های آزمایشی واقعی',g_paused:'متوقف شد · برای ادامه بزن',g_cancelled:'لغو شد · قرمز تا اصلاح',ga_start:'شروع اصلاح با مشاور',ga_pause:'توقف',ga_resume:'ادامه',ga_cancel:'لغو اصلاح',g_t_pause:'متوقف شد',g_t_resume:'ادامه پیدا کرد',g_t_cancel:'لغو شد',g_t_wait:'لغو در حال انجام است، چند لحظه صبر کن',g_sending:'در حال ارسال پیام…',g_ok:'پاسخ درست دریافت شد',g_failed:'پاسخی نرسید',g_repairing:'مشاور در حال بررسی…',g_quar:'قرنطینه تا تست دو پیامی',fix_tip:'اصلاح با مشاور هوشمند',fix_started:'مشاور شروع کرد',m_deep:'بررسی کامل سایت با مشاور',deep_started:'بررسی کامل شروع شد',gs_know:'دانش ذخیره‌شده',gs_scan:'اسکن صفحه',gs_diag:'تشخیص',gs_fix:'اصلاح',gs_test1:'تست ۱ از ۲',gs_test2:'تست ۲ از ۲',gs_save:'ذخیره',pcauto_on:'پروفایل Chrome خودش باز شود',g_prompt:'کپی پرامپت وصله',g_applied:'اعمال شد',g_pending:'مورد در انتظار',m_profile:'پروفایل به پروفایل',m_spread:'پخش بین پروفایل‌ها',turn:'پیام در هر نوبت',gap:'فاصله (ثانیه)',add:'افزودن اکانت',profile:'پروفایل',settings:'تنظیمات',connect:'اتصال Claude Code',chrome:'افزونه Chrome',keys:'کلیدها',create:'ساخت',key_name:'نام کلید',advisor:'مشاور هوشمند',more:'بیشتر',copy:'کپی',copied:'کپی شد',copy_log:'کپی گزارش خطا',classic:'ابزارهای پیشرفته',empty:'اولین پروفایل Chrome را وصل کن',setup_chrome:'وصل کردن Chrome',
+const L={fa:{method:'روش',adv_engine_l:'مغز مشاور',adv_eng_auto:'خودکار',adv_eng_agent:'فقط Claude Code',adv_eng_model:'فقط اکانت دیگر',adv_eng_manual:'دستی',adv_hint_auto:'اول Claude Code خودت صفحه را بررسی و درست می‌کند، اگر نبود از اکانت دیگر می‌پرسد و آخرش قوانین ساده. تعمیر فقط با دکمهٔ تعمیر همان اکانت شروع می‌شود، هرگز خودش.',adv_hint_agent:'فقط Claude Code، مستقل از اکانت‌های بریج. تعمیر فقط با دکمهٔ تعمیر همان اکانت شروع می‌شود، هرگز خودش.',adv_hint_model:'فقط مدل یک اکانت سالم دیگر (روش قدیمی). تعمیر فقط با دکمهٔ تعمیر همان اکانت شروع می‌شود، هرگز خودش.',adv_hint_manual:'مغز دقیقاً مثل حالت خودکار است (در هیچ حالتی تعمیر خودش شروع نمی‌شود، فقط با دکمهٔ هر اکانت).',agent_check:'بررسی Claude Code',agent_ok:'Claude Code پیدا شد',agent_none:'Claude Code پیدا نشد (نصب کن یا مسیرش را بده)',agent_login_ok:'پاسخ می‌دهد',agent_login_failed:'پاسخ نمی‌دهد',agent_login_unknown:'هنوز آزمایش نشده',agent_key:'کلید API مخصوص خودش',agent_signin:'ورود مشاور',bk_l:'مغزِ ایجنت (با کدام مدل فکر کند)',bk_auto:'خودکار',bk_bridge:'اکانت‌های بریج',bk_own:'ورود مستقل',bk_hint_auto:'اگر ایجنت ورود/کلید مستقل خودش را دارد با همان، وگرنه با اکانت‌های وصل‌شده به بریج فکر می‌کند.',bk_hint_bridge:'ایجنت از همین اکانت‌های وصل‌شده به بریج برای فکر کردن استفاده می‌کند؛ نیازی به ورود جدا نیست و به Claude Code شخصی شما ربطی ندارد.',bk_hint_own:'ایجنت فقط با ورود/کلید مستقل خودش فکر می‌کند (جدا از Claude Code شما).',inv_l:'بررسی مشکل (هر بخشی از برنامه)',inv_ph:'مشکل را بنویسید؛ مثلاً: چرا اکانت X جواب نمی‌دهد؟ یا: خطای Y در لاگ چیست؟',inv_go:'شروع بررسی',inv_list:'یافته‌های ذخیره‌شده',inv_started:'بررسی شروع شد:',inv_running:'در حال بررسی',inv_done:'پایان:',inv_none:'هنوز یافته‌ای ذخیره نشده',agent_opened:'آنجا با /login وارد شو، بعد دکمه‌ی بررسی را بزن',agent_own:'مشاور Claude Code و ورود مخصوص خودش را دارد. Claude Code خودت (ورود، تنظیمات، تاریخچه، پروژه‌ها) هرگز خوانده یا تغییر داده نمی‌شود و مثل قبل کار می‌کند.',gs_agent:'Claude Code روی صفحه کار می‌کند',gs_gate:'پیام‌های آزمایشی واقعی',g_paused:'متوقف شد · برای ادامه بزن',g_cancelled:'لغو شد · قرمز تا اصلاح',ga_start:'شروع اصلاح با مشاور',ga_pause:'توقف',ga_resume:'ادامه',ga_cancel:'لغو اصلاح',g_t_pause:'متوقف شد',g_t_resume:'ادامه پیدا کرد',g_t_cancel:'لغو شد',g_t_wait:'لغو در حال انجام است، چند لحظه صبر کن',g_sending:'در حال ارسال پیام…',g_ok:'پاسخ درست دریافت شد',g_failed:'پاسخی نرسید',g_repairing:'مشاور در حال بررسی…',g_quar:'قرنطینه تا تست دو پیامی',fix_tip:'اصلاح با مشاور هوشمند',fix_started:'مشاور شروع کرد',m_deep:'بررسی کامل سایت با مشاور',deep_started:'بررسی کامل شروع شد',gs_know:'دانش ذخیره‌شده',gs_scan:'اسکن صفحه',gs_diag:'تشخیص',gs_fix:'اصلاح',gs_test1:'تست ۱ از ۲',gs_test2:'تست ۲ از ۲',gs_save:'ذخیره',pcauto_on:'پروفایل Chrome خودش باز شود',g_prompt:'کپی پرامپت وصله',g_applied:'اعمال شد',g_pending:'مورد در انتظار',m_profile:'پروفایل به پروفایل',m_spread:'پخش بین پروفایل‌ها',turn:'پیام در هر نوبت',gap:'فاصله (ثانیه)',add:'افزودن اکانت',profile:'پروفایل',settings:'تنظیمات',connect:'اتصال Claude Code',chrome:'افزونه Chrome',keys:'کلیدها',create:'ساخت',key_name:'نام کلید',advisor:'مشاور هوشمند',more:'بیشتر',copy:'کپی',copied:'کپی شد',copy_log:'کپی گزارش خطا',classic:'ابزارهای پیشرفته',empty:'اولین پروفایل Chrome را وصل کن',setup_chrome:'وصل کردن Chrome',
 ok:'آماده',rest:'استراحت',login:'نیاز به ورود',check:'نیاز به تأیید',off:'خاموش',bad:'مشکل',learning:'در حال راه‌اندازی',none:'بدون پروفایل',accounts:'اکانت',ready:'آماده',chrome_n:'Chrome',adv_idle:'مشاور: بیکار',adv_work:'مشاور در حال کار',adv_off:'مشاور: خاموش',adv_k_ask:'تحلیل',adv_k_repair:'تعمیر اکانت',adv_k_investigate:'بررسی',
 test:'تست اتصال',relogin:'ورود دوباره',def:'اکانت اصلی',del:'حذف',done_login:'وارد شدم',done_first:'پیام فرستادم',done_check:'انجام شد',a_login:'در Chrome وارد شو',a_first:'یک پیام تستی در چت بفرست',a_check:'تأیید انسانی را در سایت انجام بده',a_wait:'Chrome خودش صفحهٔ ورود را باز می‌کند؛ اگر باز نشد روی آیکون افزونه بزن',
 rr:'چرخشی',po:'به ترتیب اولویت (بعدی فقط در صورت نیاز)',drag:'جابه‌جایی اکانت (بکش، یا با کلید جهت‌دار)',drag_p:'جابه‌جایی پروفایل (بکش، یا با کلید جهت‌دار)',saved:'ترتیب ذخیره شد',sites_l:'یادگیری سایت‌ها',sites_on:'مشاور ظاهر صفحهٔ هر سایت جدید را یک بار یاد بگیرد',sites_none:'هنوز سایتی یاد گرفته نشده',forget:'فراموش کن',st_learned:'یاد گرفته (منتظر تأیید)',st_verified:'تأیید شده',st_stale:'قدیمی شده',st_rejected:'نتیجه‌ای نداشت',ll:'کم‌کارترین',lru:'بیشترین استراحت',rnd:'تصادفی',pf:'اکانت اصلی اول',hw:'بهترین سلامت',ok_t:'عالی',fail_t:'ناموفق',sure:'مطمئنی؟',custom:'آدرس دلخواه',connected:'متصل',
 help:'راهنما',help_sub:'آموزش کامل و ساده استفادهٔ برنامه',help_title:'راهنمای استفاده',close:'بستن',key_l:'کلید',run:'اجرا',run_ok:'Claude Code در یک پنجرهٔ تازه باز شد',no_key:'اول یک کلید بساز',
 hint_run:'«اجرا» یک پنجرهٔ ترمینال تازه با Claude Code باز می‌کند؛ هر بار که بزنی یک نشست جدا و هم‌زمان می‌گیری.',hint_copy:'این گزینه فقط برای کپی است و اجرا ندارد.',hint_missing:'این محیط روی این کامپیوتر پیدا نشد؛ کپی کردن دستور همچنان کار می‌کند.',hint_wsl:'در WSL برای رسیدن به 127.0.0.1 ویندوز معمولاً باید شبکهٔ WSL روی حالت mirrored باشد.',
-g_win:'ویندوز',g_unix:'یونیکس / مک',g_other:'سایر شل‌ها',g_file:'فایل / تنظیمات',ext_btn:'کپی آدرس و باز کردن افزونه‌ها',ext_s1:'در صفحهٔ باز شده «Developer mode» را روشن کن تا دکمهٔ «Load unpacked» ظاهر شود.',ext_s2:'روی Load unpacked بزن، آدرس کپی‌شده را در پنجره Paste کن و تأیید (OK) را بزن تا افزونه نصب شود.',ext_copied:'آدرس کپی شد و Chrome باز شد',ext_noprof:'اول یک پروفایل Chrome انتخاب کن',
+g_win:'ویندوز',g_unix:'یونیکس / مک',g_other:'سایر شل‌ها',g_file:'فایل / تنظیمات',ext_btn:'باز کردن صفحهٔ افزونه‌ها (chrome://extensions)',ext_s1:'مسیر پوشه کپی می‌شود و فقط صفحهٔ افزونه‌ها باز می‌شود. «Developer mode» را روشن کن.',ext_s2:'روی «Load unpacked» بزن، مسیر کپی‌شده را Paste کن و OK بزن.',ext_s3:'بعد از نصب، دکمهٔ زیر را بزن تا اتصال خودکار انجام شود.',ext_pair:'افزونه نصب شد؛ اتصال خودکار',ext_paired:'داشبورد در Chrome باز شد؛ اتصال خودکار انجام می‌شود',wd_l:'پوشهٔ کار Claude Code',wd_ph:'مثلاً C:\\Projects\\my-app  (خالی = پوشهٔ خانه)',wd_pick:'انتخاب پوشه',wd_hint:'«اجرا» ترمینال را در همین پوشه باز می‌کند و دستور کپی‌شده هم با cd به آن شروع می‌شود.',wd_nopick:'پنجرهٔ انتخاب پوشه باز نشد؛ مسیر را دستی بنویس',ext_copied:'آدرس کپی شد و Chrome باز شد',ext_noprof:'اول یک پروفایل Chrome انتخاب کن',settings_sub:'اتصال، افزونه و ظاهر برنامه',auto_l:'حالت کاملاً خودکار',auto_h:'Claude Code هیچ تأییدی نمی‌خواهد (--dangerously-skip-permissions)؛ فقط روی پوشهٔ پروژه‌ات استفاده کن',connect_sub:'کلید، دستور و پوشهٔ پروژه',chrome_sub:'نصب افزونه و اتصال به پروفایل',layout_sub:'تعداد کارت در هر ردیف',keys_sub:'ساخت و مدیریت کلیدهای API',advisor_sub:'تعمیر خودکار و یادگیری سایت‌ها',more_sub:'گزارش خطا و سازگاری',compat_l:'سازگاری Claude Code',wd_save:'ثبت',wd_saved:'پوشه ثبت شد',wd_saved_l:'✓ ثبت‌شده:',wd_unsaved:'هنوز ثبت نشده',
 layout:'چیدمان کارت‌ها',cols_l:'تعداد کارت در هر ردیف',cols_auto:'خودکار',cols_hint:'روی صفحه‌های کوچک‌تر خودکار کمتر می‌شود تا چیزی به هم نریزد.',search:'جستجو…',no_results:'نتیجه‌ای نیست',
 poff:'پروفایل خاموش',prof_on:'پروفایل روشن شد',prof_off:'پروفایل خاموش شد',poff_note:'این پروفایل خاموش است؛ اکانت‌هایش از چرخش بیرون‌اند و تنظیماتشان سر جایش مانده.',prof_sw:'روشن / خاموش کردن کل پروفایل',
-rename:'تغییر نام',dbl_rename:'دابل‌کلیک برای تغییر نام',global_s:'کلی',follow_tip:'از قانون کلی پیروی می‌کند؛ بزن تا عدد مخصوص خودش را داشته باشد',back_global:'برگشت به قانون کلی',acc_sw:'روشن / خاموش',theme:'تم',lang:'زبان'},
-en:{method:'Method',adv_engine_l:'Repair brain',adv_eng_auto:'Auto',adv_eng_agent:'Claude Code only',adv_eng_model:'Other account only',adv_eng_manual:'Manual',adv_hint_auto:'Your own Claude Code looks at the page and fixes it first; if it is missing another account is asked; the simple built-in rules come last. Repairs start by themselves.',adv_hint_agent:'Claude Code only, independent of every bridge account. Repairs start by themselves.',adv_hint_model:'Only the model of another healthy account (the old way). Repairs start by themselves.',adv_hint_manual:'No repair starts by itself, only the per-account buttons. The brain is the same as in Auto.',agent_check:'Check Claude Code',agent_ok:'Claude Code found',agent_none:'Claude Code not found (install it or give its path)',agent_login_ok:'answers',agent_login_failed:'does not answer',agent_login_unknown:'not tested yet',agent_key:'API key of its own',agent_signin:'Sign in the advisor',bk_l:'Agent brain (which model it thinks with)',bk_auto:'Auto',bk_bridge:'Bridge accounts',bk_own:'Own sign-in',bk_hint_auto:'Its own sign-in / key when it has one, otherwise the accounts connected to this bridge.',bk_hint_bridge:'The agent thinks through the accounts connected to this bridge: no separate sign-in, and nothing to do with your own Claude Code.',bk_hint_own:'The agent thinks only with its own sign-in / key (separate from your Claude Code).',inv_l:'Investigate a problem (any part of the program)',inv_ph:'Describe the problem, e.g. why does account X not answer? what is error Y in the log?',inv_go:'Start investigation',inv_list:'Saved findings',inv_started:'Investigation started:',inv_running:'Investigating',inv_done:'Finished:',inv_none:'No findings saved yet',agent_opened:'Sign in there with /login, then press Check',agent_own:'The advisor uses its OWN Claude Code folder and sign-in. Your own Claude Code (login, settings, history, projects) is never read or changed and works as before.',gs_agent:'Claude Code is working on the page',gs_gate:'Real test messages',g_paused:'Paused · press to continue',g_cancelled:'Cancelled · red until repaired',ga_start:'Start repair with the advisor',ga_pause:'Pause',ga_resume:'Resume',ga_cancel:'Cancel repair',g_t_pause:'Paused',g_t_resume:'Resumed',g_t_cancel:'Cancelled',g_t_wait:'Cancelling, one moment',g_sending:'Sending message...',g_ok:'Answer received',g_failed:'No answer',g_repairing:'Advisor is checking...',g_quar:'Held until the 2-message test',fix_tip:'Repair with the smart advisor',fix_started:'Advisor started',m_deep:'Full site check (advisor)',deep_started:'Full check started',gs_know:'Saved knowledge',gs_scan:'Scan page',gs_diag:'Diagnose',gs_fix:'Fix',gs_test1:'Test 1 of 2',gs_test2:'Test 2 of 2',gs_save:'Save',pcauto_on:'Open the Chrome profile by itself',g_prompt:'Copy patch prompt',g_applied:'Applied',g_pending:'waiting',m_profile:'Profile by profile',m_spread:'Spread across profiles',turn:'Messages per turn',gap:'Gap (seconds)',add:'Add account',profile:'Profile',settings:'Settings',connect:'Connect Claude Code',chrome:'Chrome extension',keys:'Keys',create:'Create',key_name:'Key name',advisor:'Smart advisor',more:'More',copy:'Copy',copied:'Copied',copy_log:'Copy error report',classic:'Advanced tools',empty:'Connect your first Chrome profile',setup_chrome:'Connect Chrome',
+rename:'تغییر نام',prof_del:'حذف پروفایل',prof_del_q:'پروفایل «{n}» و تمام اکانت‌ها و اطلاعات مربوط به آن ({c} اکانت) برای همیشه حذف شود؟',prof_deleted:'پروفایل و متعلقاتش حذف شد',dbl_rename:'دابل‌کلیک برای تغییر نام',global_s:'کلی',follow_tip:'از قانون کلی پیروی می‌کند؛ بزن تا عدد مخصوص خودش را داشته باشد',back_global:'برگشت به قانون کلی',acc_sw:'روشن / خاموش',theme:'تم',lang:'زبان',x1_t:'آدرس صفحهٔ افزونه‌ها را کپی کن',x1_h:'وب‌سایت‌ها اجازهٔ باز کردن این صفحه را ندارند. یک تب جدید در Chrome باز کن، آدرس را در نوار آدرس بچسبان (Ctrl+V) و Enter بزن.',x2_t:'آدرس پوشهٔ افزونه را کپی کن',x2_h:'در همان صفحه «Developer mode» را روشن کن، «Load unpacked» را بزن، آدرس را Paste کن (Ctrl+V) و OK بزن. بقیهٔ کارها خودکار است.',x_wait:'منتظر نصب افزونه… بعد از Load unpacked خودکار وصل می‌شود',x_live_ok:'✓ متصل شد:',x_more:'برای هر پروفایل Chrome دیگر هم همین دو مرحله را تکرار کن؛ هر کدام خودکار در داشبورد اضافه می‌شود.',x_auto:'یا خودم برایت باز کنم (اختیاری)',ext_url_copied:'کپی شد؛ در تب جدید Chrome بچسبان',ext_path_copied:'آدرس پوشه کپی شد؛ در Load unpacked بچسبان',prof_new:'پروفایل جدید وصل شد:',},
+en:{method:'Method',adv_engine_l:'Repair brain',adv_eng_auto:'Auto',adv_eng_agent:'Claude Code only',adv_eng_model:'Other account only',adv_eng_manual:'Manual',adv_hint_auto:'Your own Claude Code looks at the page and fixes it first; if it is missing another account is asked; the simple built-in rules come last. A repair starts only when you press repair on that account, never by itself.',adv_hint_agent:'Claude Code only, independent of every bridge account. A repair starts only when you press repair on that account, never by itself.',adv_hint_model:'Only the model of another healthy account (the old way). A repair starts only when you press repair on that account, never by itself.',adv_hint_manual:'The brain is exactly the same as in Auto (no repair ever starts by itself, only the per-account buttons do).',agent_check:'Check Claude Code',agent_ok:'Claude Code found',agent_none:'Claude Code not found (install it or give its path)',agent_login_ok:'answers',agent_login_failed:'does not answer',agent_login_unknown:'not tested yet',agent_key:'API key of its own',agent_signin:'Sign in the advisor',bk_l:'Agent brain (which model it thinks with)',bk_auto:'Auto',bk_bridge:'Bridge accounts',bk_own:'Own sign-in',bk_hint_auto:'Its own sign-in / key when it has one, otherwise the accounts connected to this bridge.',bk_hint_bridge:'The agent thinks through the accounts connected to this bridge: no separate sign-in, and nothing to do with your own Claude Code.',bk_hint_own:'The agent thinks only with its own sign-in / key (separate from your Claude Code).',inv_l:'Investigate a problem (any part of the program)',inv_ph:'Describe the problem, e.g. why does account X not answer? what is error Y in the log?',inv_go:'Start investigation',inv_list:'Saved findings',inv_started:'Investigation started:',inv_running:'Investigating',inv_done:'Finished:',inv_none:'No findings saved yet',agent_opened:'Sign in there with /login, then press Check',agent_own:'The advisor uses its OWN Claude Code folder and sign-in. Your own Claude Code (login, settings, history, projects) is never read or changed and works as before.',gs_agent:'Claude Code is working on the page',gs_gate:'Real test messages',g_paused:'Paused · press to continue',g_cancelled:'Cancelled · red until repaired',ga_start:'Start repair with the advisor',ga_pause:'Pause',ga_resume:'Resume',ga_cancel:'Cancel repair',g_t_pause:'Paused',g_t_resume:'Resumed',g_t_cancel:'Cancelled',g_t_wait:'Cancelling, one moment',g_sending:'Sending message...',g_ok:'Answer received',g_failed:'No answer',g_repairing:'Advisor is checking...',g_quar:'Held until the 2-message test',fix_tip:'Repair with the smart advisor',fix_started:'Advisor started',m_deep:'Full site check (advisor)',deep_started:'Full check started',gs_know:'Saved knowledge',gs_scan:'Scan page',gs_diag:'Diagnose',gs_fix:'Fix',gs_test1:'Test 1 of 2',gs_test2:'Test 2 of 2',gs_save:'Save',pcauto_on:'Open the Chrome profile by itself',g_prompt:'Copy patch prompt',g_applied:'Applied',g_pending:'waiting',m_profile:'Profile by profile',m_spread:'Spread across profiles',turn:'Messages per turn',gap:'Gap (seconds)',add:'Add account',profile:'Profile',settings:'Settings',connect:'Connect Claude Code',chrome:'Chrome extension',keys:'Keys',create:'Create',key_name:'Key name',advisor:'Smart advisor',more:'More',copy:'Copy',copied:'Copied',copy_log:'Copy error report',classic:'Advanced tools',empty:'Connect your first Chrome profile',setup_chrome:'Connect Chrome',
 ok:'Ready',rest:'Resting',login:'Needs login',check:'Needs check',off:'Off',bad:'Problem',learning:'Setting up',none:'No profile',accounts:'accounts',ready:'ready',chrome_n:'Chrome',adv_idle:'Advisor: idle',adv_work:'Advisor working',adv_off:'Advisor: off',adv_k_ask:'analysing',adv_k_repair:'repairing account',adv_k_investigate:'investigating',
 test:'Test connection',relogin:'Log in again',def:'Main account',del:'Remove',done_login:"I'm logged in",done_first:'I sent it',done_check:'Done',a_login:'Log in inside Chrome',a_first:'Send a test message in the chat',a_check:'Complete the human check on the site',a_wait:'Chrome opens the login page by itself; if it does not, click the extension icon',
 rr:'Round robin',po:'By priority (next only if needed)',drag:'Move account (drag, or use arrow keys)',drag_p:'Move profile (drag, or use arrow keys)',saved:'Order saved',sites_l:'Learned sites',sites_on:"Let the advisor learn each new site's page once",sites_none:'No site learned yet',forget:'Forget',st_learned:'Learned (awaiting confirmation)',st_verified:'Verified',st_stale:'Stale',st_rejected:'Nothing learned',ll:'Least busy',lru:'Longest rested',rnd:'Random',pf:'Main account first',hw:'Best health',ok_t:'Great',fail_t:'Failed',sure:'Sure?',custom:'Custom URL',connected:'connected',
 help:'Help',help_sub:'A complete, simple guide to using the app',help_title:'How to use',close:'Close',key_l:'Key',run:'Run',run_ok:'Claude Code opened in a new window',no_key:'Create a key first',
 hint_run:'“Run” opens a fresh terminal window with Claude Code; every press gives you another separate, parallel session.',hint_copy:'This option is copy-only; it has no Run.',hint_missing:'This environment was not found on this computer; copying the command still works.',hint_wsl:'In WSL, reaching Windows 127.0.0.1 usually needs WSL networking in mirrored mode.',
-g_win:'Windows',g_unix:'Unix / Mac',g_other:'Other shells',g_file:'Files / settings',ext_btn:'Copy path & open extensions',ext_s1:'On the page that opens, turn on “Developer mode” so the “Load unpacked” button appears.',ext_s2:'Press Load unpacked, paste the copied path into the folder box and confirm (OK) to install the extension.',ext_copied:'Path copied and Chrome opened',ext_noprof:'Pick a Chrome profile first',
+g_win:'Windows',g_unix:'Unix / Mac',g_other:'Other shells',g_file:'Files / settings',ext_btn:'Open extensions page (chrome://extensions)',ext_s1:'The folder path is copied and only the extensions page opens. Turn on “Developer mode”.',ext_s2:'Press “Load unpacked”, paste the copied path and press OK.',ext_s3:'After it is installed, press the button below to connect automatically.',ext_pair:'Extension installed - connect automatically',ext_paired:'The dashboard opened in Chrome; connecting automatically',wd_l:'Claude Code working folder',wd_ph:'e.g. C:\\Projects\\my-app  (empty = home folder)',wd_pick:'Choose folder',wd_hint:'“Run” opens the terminal in this folder, and the copied command starts with a cd to it.',wd_nopick:'The folder picker could not open; type the path',ext_copied:'Path copied and Chrome opened',ext_noprof:'Pick a Chrome profile first',settings_sub:'Connection, extension and appearance',auto_l:'Fully automatic mode',auto_h:'Claude Code never asks for approval (--dangerously-skip-permissions); use it only on your own project folder',connect_sub:'Key, command and project folder',chrome_sub:'Install the extension and link a profile',layout_sub:'Cards per row',keys_sub:'Create and manage API keys',advisor_sub:'Auto-repair and site learning',more_sub:'Error report and compatibility',compat_l:'Claude Code compatibility',wd_save:'Save',wd_saved:'Folder saved',wd_saved_l:'✓ Saved:',wd_unsaved:'Not saved yet',
 layout:'Card layout',cols_l:'Cards per row',cols_auto:'Auto',cols_hint:'On smaller screens it automatically uses fewer so nothing breaks.',search:'Search…',no_results:'No results',
 poff:'Profile off',prof_on:'Profile turned on',prof_off:'Profile turned off',poff_note:'This profile is off; its accounts are out of rotation and all their settings are kept.',prof_sw:'Turn the whole profile on / off',
-rename:'Rename',dbl_rename:'Double-click to rename',global_s:'Global',follow_tip:'Follows the global rule; press to give it its own number',back_global:'Back to the global rule',acc_sw:'On / off',theme:'Theme',lang:'Language'}};
-let lang=localStorage.lang||'fa';const t=k=>(L[lang]||L.fa)[k]||L.fa[k]||k;
+rename:'Rename',prof_del:'Delete profile',prof_del_q:'Delete profile "{n}" and all of its accounts and data ({c} accounts) permanently?',prof_deleted:'Profile and everything belonging to it was deleted',dbl_rename:'Double-click to rename',global_s:'Global',follow_tip:'Follows the global rule; press to give it its own number',back_global:'Back to the global rule',acc_sw:'On / off',theme:'Theme',lang:'Language',x1_t:'Copy the extensions page address',x1_h:'Websites are not allowed to open this page. Open a new Chrome tab, paste the address into the address bar (Ctrl+V) and press Enter.',x2_t:'Copy the extension folder path',x2_h:'On that page turn on “Developer mode”, press “Load unpacked”, paste the path (Ctrl+V) and press OK. Everything else is automatic.',x_wait:'Waiting for the extension… it connects by itself after Load unpacked',x_live_ok:'✓ Connected:',x_more:'Repeat the same two steps in every other Chrome profile; each one is added to the dashboard automatically.',x_auto:'Or open it for me (optional)',ext_url_copied:'Copied; paste it in a new Chrome tab',ext_path_copied:'Folder path copied; paste it in Load unpacked',prof_new:'New profile connected:',}};
+L.fa.ext_btn='باز کردن صفحهٔ افزونه‌ها برای من';L.en.ext_btn='Open the extensions page for me';let lang=localStorage.lang||'fa';const t=k=>(L[lang]||L.fa)[k]||L.fa[k]||k;
 const STRATS=['round_robin','priority_order','least_loaded','least_recently_used','random','primary_first','health_weighted'],SK={round_robin:'rr',priority_order:'po',least_loaded:'ll',least_recently_used:'lru',random:'rnd',primary_first:'pf',health_weighted:'hw'};
 let S={accounts:[],pc_profiles:[],keys:[],jobs:[],presets:[],settings:{}},R={groups:[],sequence:[],current:'',strategy:'round_robin',rotate_every:1,account_min_gap_seconds:3,rotation_mode:'profile',disabled_profiles:[]};
 const Q={};let G={},GP=0;const accOf=id=>S.accounts.find(a=>a.id===id);
@@ -29319,7 +29891,7 @@ let boardSig='',rowSig={},first=true;
 function rowHTML(a,q,ix){const s=status(a),g=G[a.id]||{},gst=g.state||'',gc=(gst&&gst!=='idle'?' g-'+((g.quar&&gst==='repairing')?'failed':gst):'')+(gst==='repairing'?' g-work':'')+(g.quar?' g-quar':'');
 const qc=q.custom?`<span class="stp"><button data-q="-" aria-label="−">−</button><b>${q.quota}</b><button data-q="+" aria-label="+">+</button></span><button class="ib sm" data-qreset title="${E(t('back_global'))}" aria-label="${E(t('back_global'))}">${ic('undo')}</button>`:`<button class="qf" data-qfollow title="${E(t('follow_tip'))}" aria-label="${E(t('follow_tip'))}">${ic('link')}<span>${E(t('global_s'))}</span><small>×${q.quota}</small></button>`;
 return`<div class="row s-${s}${gc}" data-id="${E(a.id)}"><button class="grip" data-grip="row" aria-label="${E(t('drag'))}" title="${E(t('drag'))}"></button><span class="pri">${ix+1}</span>${av(a)}<div class="meta"><b class="nm" title="${E(t('dbl_rename'))}">${E(a.label)}</b><span class="st">${E(gtxt(g,s))}${s==='rest'?' '+a.cooling+'s':''}${R.current===a.id?`<span class="cur">${ic('play','fl')}</span>`:''}</span>${gsteps(g)}</div><div class="rc">${gctl(a,g)}<span class="qc">${qc}</span><label class="sw"><input type="checkbox" data-en aria-label="${E(t('acc_sw'))}" ${a.disabled?'':'checked'}><i></i></label><button class="ib sm" data-menu aria-label="menu">${ic('dots','fl')}</button></div></div>`}
-function cardHTML(g,i){return`<div class="pc" data-p="${E(g.key)}"><div class="ph">${g.key?`<div class="pl"><button class="grip mv" data-grip="card" aria-label="${E(t('drag_p'))}" title="${E(t('drag_p'))}">${ic('move')}</button><span class="pri">${i+1}</span><span class="dot"></span></div>`:''}<div class="pn"><b></b><span class="n"></span></div><div class="pa">${g.key?`<label class="sw" title="${E(t('prof_sw'))}"><input type="checkbox" data-pen aria-label="${E(t('prof_sw'))}"><i></i></label>`:''}<button class="ib sm" data-add="${E(g.key)}" aria-label="${E(t('add'))}">${ic('plus')}</button></div></div><div class="poffnote">${E(t('poff_note'))}</div><div class="rows">${g.accounts.map(q=>`<div data-slot="${E(q.id)}"></div>`).join('')}</div></div>`}
+function cardHTML(g,i){return`<div class="pc" data-p="${E(g.key)}"><div class="ph">${g.key?`<div class="pl"><button class="grip mv" data-grip="card" aria-label="${E(t('drag_p'))}" title="${E(t('drag_p'))}">${ic('move')}</button><span class="pri">${i+1}</span><span class="dot"></span></div>`:''}<div class="pn"><b title="${E(t('dbl_rename'))}"></b><span class="n"></span></div><div class="pa">${g.key?`<label class="sw" title="${E(t('prof_sw'))}"><input type="checkbox" data-pen aria-label="${E(t('prof_sw'))}"><i></i></label>`:''}<button class="ib sm" data-add="${E(g.key)}" aria-label="${E(t('add'))}">${ic('plus')}</button>${g.key?`<button class="ib sm" data-pdel="${E(g.key)}" aria-label="${E(t('prof_del'))}" title="${E(t('prof_del'))}">${ic('trash')}</button>`:''}</div></div><div class="poffnote">${E(t('poff_note'))}</div><div class="rows">${g.accounts.map(q=>`<div data-slot="${E(q.id)}"></div>`).join('')}</div></div>`}
 function renderBoard(){const groups=R.groups.map(g=>({...g,accounts:g.accounts.filter(q=>accOf(q.id))})),off=offSet();
 for(const p of S.pc_profiles)if(!groups.some(g=>g.key===p.id))groups.push({key:p.id,name:p.name,accounts:[]});
 for(const g of groups){g.disabled=!!g.key&&off.has(g.key);const p=S.pc_profiles.find(x=>x.id===g.key);g.connected=p?!!p.connected:!!g.connected}
@@ -29327,7 +29899,7 @@ const sig=groups.map(g=>g.key+':'+g.accounts.map(q=>q.id).join(',')).join('|')+'
 if(sig!==boardSig){boardSig=sig;rowSig={};$('board').innerHTML=groups.map((g,i)=>cardHTML(g,i)).join('')}
 $('board').querySelectorAll('.pc').forEach(card=>{const g=groups.find(x=>x.key===card.dataset.p);if(!g)return;const i=groups.indexOf(g);card.classList.toggle('poff',g.disabled);const sw=card.querySelector('[data-pen]');if(sw&&sw.checked===g.disabled)sw.checked=!g.disabled;
 const dot=card.querySelector('.dot');if(dot)dot.classList.toggle('on',!!g.connected);const pri=card.querySelector('.ph .pri');if(pri&&pri.textContent!==String(i+1))pri.textContent=i+1;
-const nm=card.querySelector('.pn b'),n=card.querySelector('.pn .n'),name=profName(g,i),cnt=g.accounts.length+' '+t('accounts');if(nm.textContent!==name)nm.textContent=name;if(n.textContent!==cnt)n.textContent=cnt});
+const nm=card.querySelector('.pn b'),n=card.querySelector('.pn .n'),name=profName(g,i),cnt=g.accounts.length+' '+t('accounts');if(nm&&nm.textContent!==name)nm.textContent=name;if(n&&n.textContent!==cnt)n.textContent=cnt});
 for(const g of groups)for(const [ix,q0] of g.accounts.entries()){const a=accOf(q0.id),st=Q[a.id]||{custom:!!q0.custom,v:q0.quota},h=rowHTML(a,{quota:st.v,custom:st.custom},ix);if(rowSig[a.id]===h)continue;rowSig[a.id]=h;
 const slot=$('board').querySelector(`[data-slot="${CSS.escape(a.id)}"],.row[data-id="${CSS.escape(a.id)}"]`);if(slot){const tmp=document.createElement('div');tmp.innerHTML=h;slot.replaceWith(tmp.firstElementChild)}}}
 function renderTrack(){const seq=R.sequence.filter(id=>{const a=accOf(id);return a&&!a.disabled&&!profOff(a)}),out=[];let prev=null;for(const id of seq){const a=accOf(id),k=a.pc_client_id||'';if(prev!==null&&k!==prev&&R.rotation_mode==='profile')out.push('<span class="sepr"></span>');prev=k;const g=R.groups.flatMap(x=>x.accounts).find(x=>x.id===id),n=Q[id]?Q[id].v:(g?g.quota:1),c=R.current===id;out.push(`<span class="tk ${c?'cur':''}" title="${E(a.label)}">${av(a)}<small>${c?(R.current_count||0)+'/':'×'}${n}</small></span>`)}
@@ -29352,7 +29924,7 @@ const gtxt=(g,s)=>{const st=g&&g.state;if(st==='sending')return t('g_sending');i
 const gctl=(a,g)=>{if(a.type==='api')return'';g=g||{};const pz=g.state==='paused',run=!!g.running,tip=t(pz?'ga_resume':run?'ga_pause':'ga_start'),cls=pz?' pz':run?' rn':(g.can_fix?' fx':''),ico=pz?ic('play','fl'):run?ic('pause','fl'):ic('wrench','fl');return`<span class="gctl"><button class="ib sm${cls}" data-gact aria-label="${E(tip)}" title="${E(tip)}">${ico}</button><button class="ib sm" data-gcancel aria-label="${E(t('ga_cancel'))}" title="${E(t('ga_cancel'))}"${run?'':' disabled'}>${ic('x')}</button></span>`};
 const gsteps=g=>{if(!g||!g.running||!g.steps||!g.steps.length)return'';const cur=g.steps.find(x=>x.s==='run')||g.steps[g.steps.length-1];return`<span class="gs">${g.steps.map(x=>`<i class="${x.s}"></i>`).join('')}<span>${E(t('gs_'+cur.k))}</span></span>`};
 let gBusy=false;
-async function guardTick(){if(gBusy||document.hidden)return false;gBusy=true;let any=false;try{const r=await api('guard'),n=r.rows||{};let ch=false;for(const id in n){if(['sending','ok','repairing'].includes(n[id].state))any=true;if(!G[id]||G[id].sig!==n[id].sig)ch=true}for(const id in G)if(!n[id])ch=true;G=n;GP=r.prompt_pending||0;if(ch&&!DND&&!dragBusy&&!EDIT){renderBoard();renderTrack()}}catch(e){}gBusy=false;return any}
+async function guardTick(){if(gBusy||document.hidden||Date.now()-LASTSCR<300)return false;gBusy=true;let any=false;try{const r=await api('guard'),n=r.rows||{};let ch=false;for(const id in n){if(['sending','ok','repairing'].includes(n[id].state))any=true;if(!G[id]||G[id].sig!==n[id].sig)ch=true}for(const id in G)if(!n[id])ch=true;G=n;GP=r.prompt_pending||0;if(ch&&!DND&&!dragBusy&&!EDIT){renderBoard();renderTrack()}}catch(e){}gBusy=false;return any}
 async function gloop(){let any=false;try{any=await guardTick()}catch(e){}setTimeout(gloop,any?700:1600)}
 setTimeout(gloop,1200);
 function gPromptInfo(){$('gPromptN').textContent=GP+' '+t('g_pending')}
@@ -29364,7 +29936,10 @@ function agentLine(s){if(!s||!s.checked_at)return'';if(!s.found)return t('agent_
 async function agentInfo(login){const el=$('agentInfo');try{el.textContent='…';const s=await api('advisor/agent','POST',{login:!!login});el.textContent=agentLine(s)+(s.reason&&s.login==='failed'?' ('+String(s.reason).slice(0,80)+')':'')}catch(x){el.textContent=String(x.message).slice(0,100)}}
 document.addEventListener('click',async e=>{const b=e.target.closest('[data-eng],#agentChk,#agentLogin');if(!b)return;if(b.id==='agentLogin'){try{const r=await api('advisor/agent/login','POST',{});if(r.opened)toast(t('agent_opened'));else{$('agentInfo').textContent=r.command;toast(String(r.reason||'').slice(0,100))}}catch(x){toast(String(x.message).slice(0,100))}return}if(b.id==='agentChk'){b.disabled=true;await agentInfo(true);b.disabled=false;return}const r=await post('settings',{advisor_engine:b.dataset.eng});if(r)advRender()});
 document.addEventListener('click',async e=>{const b=e.target.closest('#gPrompt,#gApplied');if(!b)return;try{if(b.id==='gPrompt'){const r=await api('guard/prompt');try{await navigator.clipboard.writeText(r.text)}catch(x){const ta=document.createElement('textarea');ta.value=r.text;document.body.appendChild(ta);ta.select();document.execCommand('copy');ta.remove()}toast(t('copied')+' ('+r.count+')')}else{if(!confirm(t('sure')))return;const r=await api('guard/prompt/applied','POST',{});toast(t('ok_t')+' ('+(r.marked||0)+')')}await guardTick();gPromptInfo()}catch(x){toast(x.message.slice(0,100))}});
-let busy=false,DND=null,dragBusy=false,EDIT=null;async function tick(){if(busy||document.hidden||DND||dragBusy||EDIT)return;busy=true;try{await Promise.all([loadS(),loadR()]);first=false;renderAll()}catch(e){}busy=false}
+let busy=false,DND=null,dragBusy=false,EDIT=null,LASTSCR=0,SCRT=0;
+/* while the page is being scrolled: no background polling/re-rendering and no hover transitions (they are what makes weak PCs stutter); everything catches up 0.3 s after the scroll stops */
+addEventListener('scroll',()=>{LASTSCR=Date.now();if(!SCRT)document.documentElement.classList.add('scr');clearTimeout(SCRT);SCRT=setTimeout(()=>{SCRT=0;document.documentElement.classList.remove('scr')},160)},{capture:true,passive:true});
+async function tick(){if(busy||document.hidden||DND||dragBusy||EDIT||Date.now()-LASTSCR<300)return;busy=true;try{await Promise.all([loadS(),loadR()]);first=false;renderAll();chromeLive()}catch(e){}busy=false}
 function toast(m){const x=$('toast');x.textContent=m;x.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>x.classList.remove('on'),2400)}
 const post=async(p,b,m)=>{try{const r=await api(p,m||'POST',b);await tick();return r}catch(e){toast(e.message.slice(0,120))}};
 /* per-account turn size: follows the global rule, or its own number (explicit, kept even when equal to the global one) */
@@ -29401,13 +29976,24 @@ function startRename(row){if(EDIT||!row)return;const id=row.dataset.id,a=accOf(i
 const inp=document.createElement('input');inp.type='text';inp.className='nmi';inp.value=a.label||'';inp.maxLength=60;inp.setAttribute('aria-label',t('rename'));let done=false;EDIT={id};b.replaceWith(inp);inp.focus();inp.select();
 const end=async save=>{if(done)return;done=true;EDIT=null;const v=inp.value.trim();if(save&&v&&v!==a.label){const old=a.label;a.label=v;rowSig[id]='';renderBoard();renderTrack();try{await api('accounts/'+id+'/label','POST',{label:v})}catch(e){a.label=old;toast(e.message.slice(0,120))}}else{rowSig[id]='';renderBoard()}tick()};
 inp.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();end(true)}else if(e.key==='Escape'){e.preventDefault();e.stopPropagation();end(false)}};inp.onblur=()=>end(true)}
-document.addEventListener('dblclick',e=>{const b=e.target.closest('.nm');if(b)startRename(b.closest('.row'))});
+document.addEventListener('dblclick',e=>{const pb=e.target.closest('.pn b,.pn input');if(pb&&!pb.matches('input'))return startProfRename(pb.closest('.pc'));const b=e.target.closest('.nm');if(b)startRename(b.closest('.row'))});
+/* ---------- Chrome profile: rename (double-click) and delete (with every account that belongs to it) ---------- */
+function startProfRename(card){if(EDIT||!card)return;const key=card.dataset.p,p=S.pc_profiles.find(x=>x.id===key),b=card.querySelector('.pn b');if(!key||!p||!b)return;
+const inp=document.createElement('input');inp.type='text';inp.className='nmi';inp.value=p.name||'';inp.maxLength=80;inp.setAttribute('aria-label',t('rename'));let done=false;EDIT={id:key};b.replaceWith(inp);inp.focus();inp.select();
+const end=async save=>{if(done)return;done=true;EDIT=null;const v=inp.value.trim(),nb=document.createElement('b');nb.textContent=p.name||'';inp.replaceWith(nb);
+if(save&&v!==(p.name||'')){try{const r=await api('personal-chrome/profiles/'+encodeURIComponent(key)+'/name','POST',{name:v});p.name=r.name||v;nb.textContent=p.name}catch(e){toast(e.message.slice(0,120))}}
+renderBoard();tick()};
+inp.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();end(true)}else if(e.key==='Escape'){e.preventDefault();e.stopPropagation();end(false)}};inp.onblur=()=>end(true)}
+async function delProfile(key){const p=S.pc_profiles.find(x=>x.id===key),n=S.accounts.filter(a=>a.pc_client_id===key).length;
+if(!confirm(t('prof_del_q').replace('{n}',p?p.name:key).replace('{c}',n)))return;
+try{await api('personal-chrome/profiles/'+encodeURIComponent(key),'DELETE');S.pc_profiles=S.pc_profiles.filter(x=>x.id!==key);S.accounts=S.accounts.filter(a=>a.pc_client_id!==key);toast(t('prof_deleted'));renderBoard();tick()}catch(e){toast(e.message.slice(0,120))}}
 /* ---------- clipboard ---------- */
 async function copyText(s){try{await navigator.clipboard.writeText(s);return true}catch(e){try{const ta=document.createElement('textarea');ta.value=s;ta.style.cssText='position:fixed;opacity:0;top:0;left:0';(document.querySelector('dialog[open]')||document.body).appendChild(ta);ta.select();const ok=document.execCommand('copy');ta.remove();return ok}catch(x){return false}}}
 function flash(btn){btn.classList.add('ok');btn.innerHTML=ic('check');clearTimeout(btn._t);btn._t=setTimeout(()=>{btn.classList.remove('ok');btn.innerHTML=ic('copy')},1600)}
 /* ---------- events ---------- */
 document.addEventListener('click',async e=>{const b=e.target.closest('button,a');const menu=$('menu');if(!e.target.closest('.menu,[data-menu]'))menu.classList.remove('on');if(!b)return;
 if(b.dataset.close!==undefined)return b.closest('dialog').close();
+if(b.dataset.pdel)return delProfile(b.dataset.pdel);
 if(b.dataset.q){const id=b.closest('.row').dataset.id;return setQuota(id,true,qNow(id).v+(b.dataset.q==='+'?1:-1),`[data-q="${b.dataset.q}"]`)}
 if(b.dataset.qfollow!==undefined){const id=b.closest('.row').dataset.id;return setQuota(id,true,R.rotate_every,'[data-q="+"]')}
 if(b.dataset.qreset!==undefined){const id=b.closest('.row').dataset.id;return setQuota(id,false,R.rotate_every,'[data-qfollow]')}
@@ -29416,7 +30002,7 @@ if(b.dataset.mode)return post('strategy',{rotation_mode:b.dataset.mode});
 if(b.dataset.add!==undefined)return openAdd(b.dataset.add);
 if(b.dataset.att){const[k,id]=b.dataset.att.split(':');return post(k==='job'?'jobs/'+id+'/done':'accounts/'+id+'/human-done',{})}
 if(b.dataset.gact!==undefined||b.dataset.gcancel!==undefined){const id=b.closest('.row').dataset.id,g=G[id]||{},cancel=b.dataset.gcancel!==undefined;if(b.disabled)return;b.disabled=true;
-try{if(cancel){await api('accounts/'+id+'/repair/cancel','POST',{});toast(t('g_t_cancel'))}else if(g.state==='paused'){await api('accounts/'+id+'/repair/resume','POST',{});toast(t('g_t_resume'))}else if(g.running){await api('accounts/'+id+'/repair/pause','POST',{});toast(t('g_t_pause'))}else{const r=await api('accounts/'+id+'/repair','POST',{});toast(t(r&&r.cancelling?'g_t_wait':'fix_started'))}}catch(x){toast(x.message.slice(0,100))}
+try{if(cancel){const rc=await api('accounts/'+id+'/repair/cancel','POST',{});toast(t(rc&&rc.stopped===false?'g_t_wait':'g_t_cancel'))}else if(g.state==='paused'){await api('accounts/'+id+'/repair/resume','POST',{});toast(t('g_t_resume'))}else if(g.running){await api('accounts/'+id+'/repair/pause','POST',{});toast(t('g_t_pause'))}else{const r=await api('accounts/'+id+'/repair','POST',{});toast(t(r&&r.cancelling?'g_t_wait':'fix_started'))}}catch(x){toast(x.message.slice(0,100))}
 b.disabled=false;gBusy=false;await guardTick();rowSig[id]='';return renderBoard()}
 if(b.dataset.menu!==undefined){const id=b.closest('.row').dataset.id,r=b.getBoundingClientRect();menu.dataset.id=id;
 menu.innerHTML=`<button data-m="test">${ic('plugc')}${E(t('test'))}</button><button data-m="deep-check">${ic('wrench')}${E(t('m_deep'))}</button><button data-m="relogin">${ic('key')}${E(t('relogin'))}</button><button data-m="rename">${ic('edit')}${E(t('rename'))}</button><button data-m="default">${ic('star')}${E(t('def'))}</button><button data-m="del" class="bd">${ic('trash')}${E(t('del'))}</button>`;
@@ -29462,7 +30048,7 @@ const curEnv=()=>ENVS.find(x=>x.id===ddEnv.get())||ENVS[0],curKey=()=>{const ks=
 const envAvail=e=>!e.run?false:(SH?!!(SH.shells.find(s=>s.id===e.id)||{}).available:true);
 function defEnv(){let v=localStorage.env;if(!ENVS.some(x=>x.id===v)){const o=SH&&SH.os;v=o==='macos'?'zsh':o==='linux'?'bash':'cmd'}return v}
 function envItems(){return ENVS.map(e=>({v:e.id,label:e.label,ltr:true,g:t('g_'+e.g),dim:!!e.run&&!envAvail(e),sub:!e.run?t('copy'):(envAvail(e)?'':'—'),k:e.id}))}
-function renderCode(){const e=curEnv(),k=curKey(),lines=snipLines(e.id,location.origin,k?k.key:'<your-key>');$('codeT').textContent=e.title||e.label;
+function renderCode(){const e=curEnv(),k=curKey(),lines=snipLines(e.id,location.origin,k?k.key:'<your-key>'),wd=($('wdPath')&&$('wdPath').value||'').trim();if($('autoOn')&&$('autoOn').checked){for(const l of lines){const x=l[l.length-1];if(x&&x[1]==='claude')x[1]='claude --dangerously-skip-permissions'}}if(wd&&e.id!=='wsl')lines.unshift([T('',(e.id==='cmd'?'cd /d "'+wd+'"':'cd "'+wd+'"'))]);$('codeT').textContent=e.title||e.label;
 $('codeBody').innerHTML=lines.map(l=>`<span class="ln">${l.map(([c,x])=>c?`<span class="${c}">${E(x)}</span>`:E(x)).join('')}</span>`).join('');CODE_TXT=lines.map(l=>l.map(x=>x[1]).join('')).join('\n');
 const can=envAvail(e);$('runBtn').disabled=!can;$('envHint').textContent=!e.run?t('hint_copy'):!can?t('hint_missing'):e.id==='wsl'?t('hint_wsl'):t('hint_run')}
 function renderKeys(){const ks=S.keys||[];ddKey.set(ks.map(k=>({v:k.id,label:k.label||k.id,sub:k.key.slice(0,6)+'…'+k.key.slice(-4),ltr:true})));
@@ -29471,16 +30057,27 @@ document.addEventListener('click',async e=>{const b=e.target.closest('[data-kcop
 $('keyNew').onclick=async()=>{await post('keys',{label:$('keyLbl').value.trim()||'key',account:''});$('keyLbl').value='';renderKeys()};
 $('codeCopy').onclick=async()=>{if(await copyText(CODE_TXT)){flash($('codeCopy'));toast(t('copied'))}else toast(t('fail_t'))};
 $('runBtn').onclick=async()=>{const e=curEnv(),k=curKey();if(!e.run||$('runBtn').disabled)return;if(!k)return toast(t('no_key'));$('runBtn').disabled=true;
-try{await api('launch-claude','POST',{shell:e.id,key:k.id});toast(t('run_ok'))}catch(x){toast(x.message.slice(0,140))}setTimeout(()=>{$('runBtn').disabled=!envAvail(curEnv())},700)};
-$('pathCopy').onclick=async()=>{if(EXTDIR&&await copyText(EXTDIR)){flash($('pathCopy'));toast(t('copied'))}};
-$('chromeGo').onclick=async()=>{const prof=ddChrome.get();if(!prof)return toast(t('ext_noprof'));localStorage.chromeProf=prof;if(EXTDIR){await copyText(EXTDIR);flash($('pathCopy'))}
-const r=await post('personal-chrome/open-extensions',{profile:prof});if(r){if(r.extension_dir){EXTDIR=r.extension_dir;$('chromeDir').textContent=EXTDIR}toast(t('ext_copied'));let n=0;const iv=setInterval(async()=>{await tick();if(++n>60||S.pc_profiles.some(p=>p.connected))clearInterval(iv)},3000)}};
+try{await api('launch-claude','POST',{shell:e.id,key:k.id,folder:($('wdPath').value||'').trim(),auto:$('autoOn').checked});toast(t('run_ok'))}catch(x){toast(x.message.slice(0,140))}setTimeout(()=>{$('runBtn').disabled=!envAvail(curEnv())},700)};
+function wdState(){const v=($('wdPath').value||'').trim();let sv='';try{sv=localStorage.workDir||''}catch(e){}$('wdState').textContent=v&&v===sv?t('wd_saved_l')+' '+sv:(v?t('wd_unsaved'):'');$('wdSave').disabled=!v||v===sv;$('wdState').style.color=v&&v===sv?'':'var(--wa)'}
+$('autoOn').onchange=()=>{try{localStorage.autoRun=$('autoOn').checked?'1':''}catch(e){}renderCode()};
+$('wdPath').oninput=()=>{wdState();renderCode()};$('wdPath').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();$('wdSave').click()}};
+$('wdSave').onclick=()=>{const v=$('wdPath').value.trim();try{localStorage.workDir=v}catch(e){}wdState();renderCode();toast(t('wd_saved'))};
+$('wdPick').onclick=async()=>{try{const r=await api('workspace/select','POST',{});if(r&&r.folder){$('wdPath').value=r.folder;try{localStorage.workDir=r.folder}catch(e){}wdState();renderCode()}}catch(x){toast(t('wd_nopick'))}};
+$('pathCopy').onclick=async()=>{if(EXTDIR&&await copyText(EXTDIR)){flash($('pathCopy'));toast(t('ext_path_copied'))}else toast(t('fail_t'))};
+$('urlCopy').onclick=async()=>{if(await copyText('chrome://extensions')){flash($('urlCopy'));toast(t('ext_url_copied'))}else toast(t('fail_t'))};
+$('chromeGo').onclick=async()=>{const prof=ddChrome.get()||'';if(prof)localStorage.chromeProf=prof;if(EXTDIR){await copyText(EXTDIR);flash($('pathCopy'))}
+const r=await post('personal-chrome/open-extensions',{profile:prof});if(r){if(r.extension_dir){EXTDIR=r.extension_dir;$('chromeDir').textContent=EXTDIR}toast(t('ext_copied'))}};
 $('logCopy').onclick=async()=>{try{const r=await api('logfile?level=info&tail=300&report=1');await copyText(typeof r==='string'?r:JSON.stringify(r));toast(t('copied'))}catch(x){toast(x.message.slice(0,80))}};
-$('bSet').onclick=async()=>{renderKeys();loadUiSites();advRender();bkRender();agentInfo(false);$('pcAutoOn').checked=!(S.settings&&S.settings.pc_autostart_profiles===false);gPromptInfo();api('compat').then(c=>{$('compatLine').textContent=c.line}).catch(()=>{});$('dSet').showModal();
+$('bSet').onclick=async()=>{try{$('wdPath').value=localStorage.workDir||'';$('autoOn').checked=localStorage.autoRun==='1'}catch(e){}wdState();renderKeys();loadUiSites();advRender();bkRender();agentInfo(false);$('pcAutoOn').checked=!(S.settings&&S.settings.pc_autostart_profiles===false);gPromptInfo();api('compat').then(c=>{$('compatLine').textContent=c.line}).catch(()=>{});$('dSet').showModal();
 try{const r=await api('personal-chrome/profiles'),ps=r.profiles||[];ddChrome.set(ps.map(p=>({v:p.dir,label:p.name,sub:p.email||'',k:p.dir})),ps.some(p=>p.dir===localStorage.chromeProf)?localStorage.chromeProf:undefined)}catch(e){}
-try{const r=await api('personal-chrome/extension-path','POST',{});EXTDIR=r.extension_dir||'';$('chromeDir').textContent=EXTDIR}catch(e){}
+armExt();clearInterval(ARM);ARM=setInterval(armExt,30000);
 try{SH=await api('claude-shells');ddEnv.set(envItems(),defEnv());renderCode()}catch(e){}};
 $('bEmpty').onclick=()=>$('bSet').onclick();
+/* extension setup: while the settings are open the bridge keeps a short auto-pair window open, so every extension that gets loaded joins by itself */
+let ARM=0;function armExt(){api('personal-chrome/extension-path','POST',{}).then(r=>{EXTDIR=r.extension_dir||EXTDIR;if(EXTDIR)$('chromeDir').textContent=EXTDIR}).catch(()=>{})}
+$('dSet').addEventListener('close',()=>clearInterval(ARM));
+let seenP=null;function chromeLive(render){const ps=S.pc_profiles||[];if(!render){if(seenP===null)seenP=new Set(ps.map(p=>p.id));else for(const p of ps)if(!seenP.has(p.id)){seenP.add(p.id);toast(t('prof_new')+' '+p.name)}}
+const el=$('xLive');if(!el)return;const on=ps.filter(p=>p.connected);el.classList.toggle('ok',on.length>0);$('xLiveT').textContent=on.length?t('x_live_ok')+' '+on.map(p=>p.name).join(' · '):t('x_wait')}
 $('bHelp').onclick=()=>{renderHelp();$('dHelp').showModal();$('hBody').scrollTop=0};
 function renderHelp(){$('hBody').innerHTML=(HELP[lang]||HELP.fa).map((s,i)=>`<section class="hstep"><span class="hn">${i+1}</span><h4>${s.h}</h4><div class="hc">${s.b}</div></section>`).join('')}
 /* ---------- layout (cards per row) ---------- */
@@ -29491,8 +30088,8 @@ function applyLang(){document.documentElement.lang=lang;document.documentElement
 for(const el of document.querySelectorAll('[data-t]'))el.textContent=t(el.dataset.t);for(const el of document.querySelectorAll('[data-ph]'))el.placeholder=t(el.dataset.ph);
 $('bLang').setAttribute('aria-label',t('lang'));$('bTheme').setAttribute('aria-label',t('theme'));$('bSet').setAttribute('aria-label',t('settings'));
 for(const b of document.querySelectorAll('[data-close]'))b.setAttribute('aria-label',t('close'));
-$('codeCopy').innerHTML=ic('copy');$('codeCopy').setAttribute('aria-label',t('copy'));$('codeCopy').title=t('copy');$('pathCopy').innerHTML=ic('copy');$('pathCopy').setAttribute('aria-label',t('copy'));$('pathCopy').title=t('copy');
-ddM.lang='';ddEnv.set(envItems());applyCols();renderCode();renderHelp();rowSig={};boardSig='';renderAll()}
+$('codeCopy').innerHTML=ic('copy');$('codeCopy').setAttribute('aria-label',t('copy'));$('codeCopy').title=t('copy');$('pathCopy').innerHTML=ic('copy');$('pathCopy').setAttribute('aria-label',t('copy'));$('pathCopy').title=t('copy');$('urlCopy').innerHTML=ic('copy');$('urlCopy').setAttribute('aria-label',t('copy'));$('urlCopy').title=t('copy');
+ddM.lang='';ddEnv.set(envItems());applyCols();renderCode();renderHelp();rowSig={};boardSig='';renderAll();try{chromeLive(true)}catch(e){}}
 $('bLang').onclick=()=>{lang=lang==='fa'?'en':'fa';localStorage.lang=lang;applyLang()};
 function applyTheme(){document.documentElement.dataset.theme=localStorage.theme||(matchMedia('(prefers-color-scheme:light)').matches?'light':'dark')}
 $('bTheme').onclick=()=>{localStorage.theme=document.documentElement.dataset.theme==='dark'?'light':'dark';applyTheme()};
@@ -29561,12 +30158,12 @@ header,nav,main{position:relative;z-index:1}
 header{border-bottom:0;padding:18px 22px}
 h1{font-size:21px;letter-spacing:.2px;display:flex;align-items:center;gap:12px}
 h1::before{content:"\26A1";width:44px;height:44px;border-radius:14px;background:linear-gradient(135deg,var(--acc),var(--acc2));display:grid;place-items:center;font-size:21px;box-shadow:0 8px 24px rgba(124,92,255,.45)}
-.pill{background:var(--card);border:1px solid var(--line);padding:6px 14px;font-size:12.5px;backdrop-filter:blur(10px)}
+.pill{background:var(--card);border:1px solid var(--line);padding:6px 14px;font-size:12.5px}
 nav{border-bottom:0;gap:6px;padding:0 20px 8px}
 nav button{border:1px solid transparent;border-radius:12px;padding:8px 16px;transition:.15s}
 nav button:hover{background:var(--card);border-color:var(--line)}
 nav button.on{background:linear-gradient(135deg,rgba(124,92,255,.28),rgba(34,211,238,.12));border-color:rgba(124,92,255,.5);color:var(--tx)}
-.card{border-radius:18px;backdrop-filter:blur(14px);background:color-mix(in srgb,var(--card) 82%,transparent);box-shadow:0 10px 40px rgba(0,0,0,.28)}
+.card{border-radius:18px;background:color-mix(in srgb,var(--card) 82%,transparent);box-shadow:0 10px 40px rgba(0,0,0,.28)}
 :root[data-theme="light"] .card{box-shadow:0 10px 30px rgba(40,50,120,.12)}
 h2{font-size:15px}
 button,input,select{border-radius:11px;transition:.15s}
@@ -29771,6 +30368,7 @@ function jobOf(a){const js=(S.jobs||[]).filter(j=>j.account===a.id);return js[js
 function stepper(j){const cur=Math.max(0,STAGES.indexOf(j.stage)),fin=j.done&&j.ok;
 return '<ol class="steps">'+STAGES.map((s,i)=>{let c=fin||i<cur?'done':(i==cur?(j.done?'bad':'cur'):'');return `<li class="${c}"><i>${c=='done'?'✓':(c=='bad'?'✕':i+1)}</i><div>${esc(t('st_'+s))}</div></li>`}).join('')+'</ol>'}
 function failHint(e){e=String(e||'');if(/verification step|human check|not completed in time/i.test(e))return t('h_check');if(/closed|TargetClosed/i.test(e))return t('h_closed');return t('h_generic')}
+async function delProfileOld(id){if(!confirm('حذف پروفایل و همه‌ی اکانت‌هایش؟ / Delete this profile and all its accounts?'))return;try{await api('personal-chrome/profiles/'+encodeURIComponent(id),'DELETE');location.reload()}catch(e){alert(e.message)}}
 function profileOptions(current){const ps=S.pc_profiles||[];return `<option value="">${esc(t('profile_any'))}</option>`+ps.map(p=>`<option value="${esc(p.id)}" ${current===p.id?'selected':''}>${esc(p.name)}${p.connected?' · '+esc(t('profile_connected')):''}</option>`).join('')+(current&&!ps.some(p=>p.id===current)?`<option value="${esc(current)}" selected>${esc(current)} · ${esc(t('profile_disconnected'))}</option>`:'')}
 function accCard(a){const j=jobOf(a),run=j&&!j.done,fail=j&&j.done&&!j.ok&&a.state!=='ready',att=run&&j.attention&&j.attention.kind?j.attention:null;
 let s;if(run)s=att?'needs_you':'learning';else if(a.human)s='needs_you';else if(fail)s='failed';else if(a.state==='ready')s=a.cooling?'cooling':'ready';else if(a.state==='login_required')s='needs_login';else if(a.state==='needs_learning')s='needs_learning';else if(a.state==='learning')s='learning';else s=a.state||'learning';
@@ -29798,7 +30396,7 @@ function togDet(el){const id=el.dataset.id;if(el.open)openDet.add(id);else openD
 function render(){if(!S)return;$('st').textContent=t('running')+S.port;$('sts').textContent=S.stats.requests+' requests · '+S.stats.errors+' '+t('errors');
 $('acc').innerHTML=S.accounts.map(accCard).join('')||`<div class="card mut">${esc(t('no_acc'))}</div>`;
 const profiles=S.pc_profiles||[];$('pc_profile_status').textContent=profiles.length?profiles.map(p=>`${p.name}: ${p.connected?t('profile_connected'):t('profile_disconnected')}`).join(' · '):t('profile_none');
-$('pc_profiles_list').innerHTML=profiles.map(p=>`<div class="pool-item"><b>${esc(p.name)}</b><span class="mut ltr">${esc(p.id.slice(0,12))}</span><span class="b ${p.connected?'ready':'learning'}">${esc(t(p.connected?'profile_connected':'profile_disconnected'))}</span></div>`).join('')||`<p class="mut">${esc(t('profile_none'))}</p>`;
+$('pc_profiles_list').innerHTML=profiles.map(p=>`<div class="pool-item"><b>${esc(p.name)}</b><span class="mut ltr">${esc(p.id.slice(0,12))}</span><span class="b ${p.connected?'ready':'learning'}">${esc(t(p.connected?'profile_connected':'profile_disconnected'))}</span><button class="btn" onclick="delProfileOld(${escJ(p.id)})">\u2715</button></div>`).join('')||`<p class="mut">${esc(t('profile_none'))}</p>`;
 const ap=$('account_profile'),oldProfile=ap.value;ap.innerHTML=profileOptions('');if(oldProfile)ap.value=oldProfile;else if(profiles.length)ap.value=profiles[0].id;
 renderStrategy();
 if(!editing){const ks=$('keysel'),cur=ks.value;ks.innerHTML=S.keys.map(k=>`<option value="${esc(k.key)}">${esc(k.label)}</option>`).join('');if(cur)ks.value=cur;
@@ -29887,7 +30485,7 @@ async function loadStrategy(){try{const r=await api('strategy');const s=$('strat
 async function saveStrategy(){try{await api('strategy','POST',{strategy:$('strat_sel').value,rotate_every:+$('strat_every').value||1,account_min_gap_seconds:+$('strat_gap').value||0});await loadStrategy();$('strat_state').textContent=t('strat_saved')+' '+$('strat_state').textContent}catch(e){$('strat_state').textContent=errMsg(e)}}
 async function loadChromeProfiles(){try{const r=await api('personal-chrome/profiles');const s=$('pc_profile_sel');s.textContent='';for(const p of (r.profiles||[])){const o=document.createElement('option');o.value=p.dir;o.textContent=p.name+(p.email?' - '+p.email:'')+' ('+p.dir+')';s.appendChild(o)}}catch(e){}}
 async function copyPcFolder(){const f=$('pc_folder').textContent;try{await navigator.clipboard.writeText(f);$('pc_open_state').textContent=t('pc_copied')}catch(e){$('pc_open_state').textContent=f}}
-async function openPcExtensions(){const st=$('pc_open_state');const prof=$('pc_profile_sel').value;if(!prof){st.textContent=t('pc_chrome_failed');return}st.textContent=t('pc_opening_chrome');try{const r=await api('personal-chrome/open-extensions','POST',{profile:prof});$('pc_code').textContent=r.code;$('pc_port').textContent=r.port;$('pc_folder').textContent=r.extension_dir;st.textContent=t('pc_chrome_opened')+(r.clipboard?' '+t('pc_clip_ok'):'');pollPcConnect()}catch(e){st.textContent=t('pc_chrome_failed')+errMsg(e)}}
+async function openPcExtensions(){const st=$('pc_open_state');const prof=$('pc_profile_sel').value||'';st.textContent=t('pc_opening_chrome');try{const r=await api('personal-chrome/open-extensions','POST',{profile:prof});$('pc_code').textContent=r.code;$('pc_port').textContent=r.port;$('pc_folder').textContent=r.extension_dir;st.textContent=t('pc_chrome_opened')+(r.clipboard?' '+t('pc_clip_ok'):'');pollPcConnect()}catch(e){st.textContent=t('pc_chrome_failed')+errMsg(e)}}
 function pollPcConnect(){clearInterval(_pcPoll);let n=0;_pcPoll=setInterval(async()=>{n++;try{const r=await api('personal-chrome');const ps=(r.status&&r.status.profiles)||[];if(ps.some(p=>p.connected)&&!(r.status&&r.status.pairing_code_active)){clearInterval(_pcPoll);sessionStorage.removeItem('pair');$('pc_open_state').textContent=t('pc_connected_ok')}}catch(e){}if(n>90)clearInterval(_pcPoll)},2000)}
 async function startPcSetup(){const b=$('pc_start'),s=$('pc_state');b.disabled=true;s.textContent=t('pc_opening');loadChromeProfiles();try{const r=await api('personal-chrome/setup','POST',{});$('pc_code').textContent=r.code;$('pc_port').textContent=r.port;$('pc_folder').textContent=r.extension_dir;$('pc_steps').hidden=false;s.textContent=t('pc_ready')}catch(e){s.textContent=t('pc_error')+errMsg(e)}finally{b.disabled=false}}
 async function copyPcCode(){try{await navigator.clipboard.writeText($('pc_code').textContent);$('pc_state').textContent=t('pc_copied')}catch(e){$('pc_state').textContent=$('pc_code').textContent}}
@@ -36450,7 +37048,7 @@ def run_selftest(quick: bool = False) -> int:
         def test_extension_confirms_and_opens_logins_with_fewer_clicks(self) -> None:
             self.assertIn("autoOpenLogins", PC_BACKGROUND_JS)
             self.assertIn("watchLogin(c.account_id", PC_BACKGROUND_JS)
-            self.assertEqual(PC_VERSION, "1.5.0")
+            self.assertEqual(PC_VERSION, "1.6.0")
 
     FAKE_CLAUDE_PY = r'''
 import sys, os, json, subprocess, time
@@ -36609,6 +37207,7 @@ print(json.dumps({"type": "result", "result": "done", "is_error": False}))
         def test_backend_choice_and_environment(self) -> None:
             os.environ["ANTHROPIC_BASE_URL"] = "http://owner.example"                       # the owner's own Claude Code settings must never leak in
             self.assertEqual(AGENT.backend(), "bridge")                                     # auto + nothing of its own -> the bridge's accounts think
+            AGENT._bridge_can_think = lambda: True                                          # type: ignore[method-assign]   (7.95: an own sign-in only matters when NO bridge account can think)
             e = AGENT.env()
             self.assertEqual(e["ANTHROPIC_BASE_URL"], "http://127.0.0.1:18790")
             self.assertTrue(e["ANTHROPIC_API_KEY"].startswith("sk-bridge-"))
@@ -36624,6 +37223,7 @@ print(json.dumps({"type": "result", "result": "done", "is_error": False}))
             self.assertEqual(AGENT.backend(), "bridge")
             self.cfg.data["agent_backend"] = "auto"
             self.cfg.data["agent_api_key"] = ""
+            del AGENT._bridge_can_think
 
         def test_bridge_backend_failure_pauses_the_agent_and_never_marks_a_login_failed(self) -> None:
             self.cfg.data["agent_backend"] = "bridge"
@@ -36643,12 +37243,12 @@ print(json.dumps({"type": "result", "result": "done", "is_error": False}))
             g.app = self.app
             g.rows["a1"] = {"state": "failed", "rev": 3}
             calls: List[str] = []
-            g._safe_request = lambda aid, seed: calls.append("repair")                      # type: ignore[method-assign]
+            g.request_repair = lambda *a, **k: calls.append("repair")                       # type: ignore[method-assign]
             g._hold_out = lambda aid, seed: calls.append("hold")                            # type: ignore[method-assign]
             g._on = lambda: True                                                            # type: ignore[method-assign]
             g._deferred("a1", {"from_agent": True}, 3, self.app)
             g._deferred("a1", {}, 3, self.app)
-            self.assertEqual(calls, ["hold", "repair"])
+            self.assertEqual(calls, ["hold", "hold"])                                       # 7.95: whoever saw the failure, only the owner's button starts a repair
 
         def _investigate(self, problem: str) -> Dict[str, Any]:
             code, out = inv_start(self.app, problem)
@@ -37008,9 +37608,9 @@ print(json.dumps({"type": "result", "result": "done", "is_error": False}))
         def test_settings_and_endpoints(self) -> None:
             P = self.srv.port
             self.assertEqual(call(P, "POST", "/api/settings", {"advisor_engine": "manual"}, self.A)[0], 200)
-            self.assertFalse(self.cfg.get("guard_enabled"))                                                 # manual = nothing starts by itself
-            self.assertEqual(call(P, "POST", "/api/settings", {"advisor_engine": "agent"}, self.A)[0], 200)
-            self.assertTrue(self.cfg.get("guard_enabled"))
+            self.assertFalse(self.cfg.get("guard_enabled"))                                                 # nothing starts by itself
+            self.assertEqual(call(P, "POST", "/api/settings", {"advisor_engine": "agent", "guard_enabled": True}, self.A)[0], 200)
+            self.assertFalse(self.cfg.get("guard_enabled"))                                                 # 7.95: no engine and no switch turns an automatic repair on
             self.assertEqual(call(P, "POST", "/api/advisor/agent/login", {}, self.A)[0], 200)
             self.assertEqual(call(P, "POST", "/api/advisor/agent/login", {}, {})[0], 401)
             for bad in ({"advisor_engine": "bogus"}, {"agent_max_turns": 9999}, {"agent_permissions": "root"}, {"agent_enabled": "yes"}, {"agent_cli": 5}):
@@ -41234,6 +41834,23 @@ setTimeout(() => process.exit(0), 60000);
             self.assertEqual(self.hub.client_for_token(self.ORIGIN, tok_b), "profile-b")
             self.assertEqual(self.hub.profiles()[1]["name"], "Work")
 
+        def test_auto_pair_window_lets_several_profiles_join_one_after_another(self) -> None:
+            self.assertEqual(self.post("/pc/pair", {"auto": True, "client_id": "aaaa1111"}, origin=self.ORIGIN)[0], 403)                 # no window open: refused
+            self.hub.open_auto_pair(60.0)
+            s1, j1 = self.post("/pc/pair", {"auto": True, "client_id": "aaaa1111", "client_name": "Chrome aaaa1111"}, origin=self.ORIGIN)
+            s2, j2 = self.post("/pc/pair", {"auto": True, "client_id": "bbbb2222", "client_name": "Chrome bbbb2222"}, origin=self.ORIGIN)
+            self.assertEqual((s1, s2), (200, 200))                                                                                       # 1.6: the window stays open after the first one
+            self.assertEqual((j1["name"], j2["name"]), ("Chrome 1", "Chrome 2"))
+            self.assertEqual(len(self.hub.profiles()), 2)
+            self.hub.auto_until = 0.0
+            self.assertEqual(self.post("/pc/pair", {"auto": True, "client_id": "cccc3333"}, origin=self.ORIGIN)[0], 403)
+
+        def test_setup_card_is_two_copy_steps_and_the_popup_adds_a_tab_in_one_click(self) -> None:
+            for needle in ('id="urlCopy"', 'id="pathCopy"', 'id="xLive"', "copyText('chrome://extensions')", "armExt", "chromeLive"):
+                self.assertIn(needle, DASHBOARD2_HTML, needle)
+            self.assertNotIn('id="chromePair"', DASHBOARD2_HTML)
+            self.assertIn("confirmed", PC_BACKGROUND_JS)
+            self.assertIn("window.close()", PC_POPUP_JS)
 
         def test_pairing_rules(self) -> None:
             code = self.hub.new_pairing()
@@ -42293,7 +42910,7 @@ setTimeout(() => process.exit(0), 60000);
             GUARD.rows.clear()
             shutil.rmtree(self.tmp, ignore_errors=True)
 
-        def fail(self, aid: str = "a1", cat: str = "empty_response", partial: bool = False) -> None:
+        def fail_acct(self, aid: str = "a1", cat: str = "empty_response", partial: bool = False) -> None:
             self.g.failed(self.app.acc.get(aid), BridgeError("no answer", "ui", 502), types.SimpleNamespace(category=cat, scope="account"), partial)
 
         def test_row_colours_follow_the_request(self) -> None:
@@ -42305,13 +42922,14 @@ setTimeout(() => process.exit(0), 60000);
             self.assertNotIn("a1", self.g.view()["rows"])        # green fades back to neutral
 
         def test_no_answer_quarantines_but_limits_and_partial_output_do_not(self) -> None:
-            self.fail("a1", "rate_limited_account")
-            self.fail("a1", "empty_response", partial=True)
+            self.fail_acct("a1", "rate_limited_account")
+            self.fail_acct("a1", "empty_response", partial=True)
             self.assertFalse(self.g.blocked("a1"))
-            self.fail("a1", "empty_response")
+            self.fail_acct("a1", "empty_response")
             self.assertTrue(self.g.blocked("a1"))
             v = self.g.view()["rows"]["a1"]
-            self.assertEqual((v["quar"], v["state"]), (True, "repairing"))      # red first, then the repair job takes over
+            self.assertEqual((v["quar"], v["state"]), (True, "failed"))         # 7.95: red + skipped, and NOTHING starts by itself
+            self.assertTrue(self.g.q.empty())
             _GUARD_TLS.allow = "a1"
             try:
                 self.assertFalse(self.g.blocked("a1"))           # only the repair job's own test traffic passes
@@ -42412,7 +43030,7 @@ setTimeout(() => process.exit(0), 60000);
         # ---- 7.88: manual mode, skip at once, pause / resume / cancel -------------------------------------------------------------------
         def test_manual_mode_marks_red_and_skips_but_starts_nothing_by_itself(self) -> None:
             self.cfg.data["guard_enabled"] = False
-            self.fail("a1", "empty_response")
+            self.fail_acct("a1", "empty_response")
             self.assertTrue(self.g.blocked("a1"))                              # skipped: the next account serves
             v = self.g.view()
             self.assertEqual((v["auto"], v["rows"]["a1"]["state"], v["rows"]["a1"]["can_fix"], v["rows"]["a1"]["running"]), (False, "failed", True, False))
@@ -42425,7 +43043,7 @@ setTimeout(() => process.exit(0), 60000);
         def test_a_failed_account_is_skipped_at_once_when_another_can_serve(self) -> None:
             self.cfg.data["guard_red_hold_seconds"] = 30
             self.assertTrue(self.app.acc.usable(self.app.acc.get("a3")))
-            self.fail("a1", "empty_response")
+            self.fail_acct("a1", "empty_response")
             self.assertTrue(self.g.blocked("a1"))                              # not after the 30 s red hold: right now
             self.assertEqual(self.g.view()["rows"]["a1"]["state"], "failed")
 
@@ -42472,8 +43090,10 @@ setTimeout(() => process.exit(0), 60000);
             self.assertFalse(g.blocked("a1"))
             self.assertNotIn("a1", g.view()["rows"])                           # neutral again, nothing red
             g.active.discard("a1")
-            self.fail("a1", "empty_response")                                  # now a real failure: red + automatic repair queued
-            g.cancel_repair("a1")
+            self.fail_acct("a1", "empty_response")                              # now a real failure: red + skipped; 7.95: nothing starts by itself
+            self.assertNotIn("a1", g.active)
+            g.request_repair("a1", manual=True)                                # the owner starts it ...
+            g.cancel_repair("a1")                                              # ... and cancels it before a worker picked it up
             g._repair("a1", False, False)                                      # the worker picks it up and unwinds at once
             g.active.discard("a1")
             v = g.view()["rows"]["a1"]
@@ -43363,7 +43983,236 @@ setTimeout(() => process.exit(0), 60000);
             self.assertIn("INTEGER index", GUARD_DIAG_INSTRUCTION)
             self.assertIn("facts MEASURED", GUARD_DIAG_INSTRUCTION)
 
-    all_cases = (TestAdvisorFix794, TestClaudeCodeFidelity793, TestAccountGuard787, TestConnectionRealTest, TestRelease776, TestFixes725, TestResolver, TestHashing, TestStreamDecoder, TestRouterCore, TestHTTP, TestPersistence, TestSecurityHelpers, TestApiBackend, TestCatalog, TestRouting, TestResolutionCatalog,
+    class TestRepairOwnerOnly795(unittest.TestCase):
+        """7.95: a repair starts ONLY from the owner's button; the owner's cancel is complete; a second Claude Code session; the advisor's own brain when no account can think."""
+        setUp = TestClaudeAgent789.setUp
+        tearDown = TestClaudeAgent789.tearDown
+        calls = TestClaudeAgent789.calls
+
+        def _alone(self) -> "AccountGuard":
+            g = AccountGuard()
+            g.workers = [object()]                                      # no background threads
+            g.app = self.app
+            return g
+
+        def _fail(self, g: "AccountGuard", aid: str = "a1") -> None:
+            g.failed(self.app.acc.get(aid), BridgeError("no answer", "ui", 502), types.SimpleNamespace(category="empty_response", scope="account"), False)
+
+        def test_a_failure_never_starts_a_repair_even_with_every_old_switch_on(self) -> None:
+            self.cfg.data.update({"guard_enabled": True, "advisor_engine": "auto", "guard_red_hold_seconds": 0})
+            g = self._alone()
+            self._fail(g)
+            time.sleep(0.3)
+            self.assertTrue(g.q.empty())
+            self.assertNotIn("a1", g.active)
+            self.assertEqual(g.view()["rows"]["a1"]["state"], "failed")
+            self.assertTrue(g.blocked("a1"))                            # still red and SKIPPED: the next account serves
+            self.assertEqual((g.view()["auto"], g._on()), (False, False))
+            g._resume()
+            g.resume_auto()
+            self.assertTrue(g.q.empty())
+            made: List[Any] = []
+            real = threading.Timer
+            threading.Timer = lambda *a, **k: (made.append(a), real(*a, **k))[1]      # type: ignore[assignment,misc]
+            self.cfg.data["guard_auto_retry_minutes"] = 1
+            try:
+                g._unsolved("a1", "alpha.test", "Alpha", {"id": "P-795", "attempts": []}, ["attempt 1: nothing worked"])
+            finally:
+                threading.Timer = real                                  # type: ignore[assignment,misc]
+            self.assertEqual(made, [])                                  # no retry timer exists any more
+            self.assertTrue(g.q.empty())
+
+        def test_a_restart_keeps_a_red_account_red_and_starts_nothing(self) -> None:
+            g = self._alone()
+            g.quar["a1"] = {"since": 1, "problem": "P-1"}
+            g._save_state()
+            g2 = AccountGuard()
+            g2.workers = [object()]
+            g2.bind(self.app)
+            self.assertIn("a1", g2.quar)
+            self.assertEqual(g2.view()["rows"]["a1"]["state"], "failed")
+            time.sleep(0.2)
+            self.assertTrue(g2.q.empty())
+
+        def test_io_returns_within_a_second_of_a_cancel(self) -> None:
+            g = self._alone()
+            c = g._ctl("a1")
+            res: Dict[str, Any] = {}
+
+            def run() -> None:
+                try:
+                    g._io("a1", lambda: time.sleep(20))
+                except GuardCancelled:
+                    res["cancelled"] = time.time()
+            th = threading.Thread(target=run, daemon=True)
+            th.start()
+            time.sleep(0.4)
+            t0 = time.time()
+            c["cancel"].set()
+            th.join(3)
+            self.assertFalse(th.is_alive())
+            self.assertLess(res["cancelled"] - t0, 1.0)
+
+        def test_cancel_kills_claude_code_and_returns_fast(self) -> None:
+            os.environ["FAKE_MODE"] = "hang"
+            GUARD.quar["a1"] = {"since": 1}
+            GUARD.request_repair("a1", manual=True)
+
+            def job() -> None:
+                try:
+                    GUARD._repair("a1", False, True)
+                finally:
+                    GUARD.active.discard("a1")
+            th = threading.Thread(target=job, daemon=True)
+            th.start()
+            end = time.time() + 15
+            while time.time() < end and not AGENT.procs:
+                time.sleep(0.1)
+            self.assertTrue(AGENT.procs, "the fake Claude Code never started")
+            procs = list(AGENT.procs)
+            t0 = time.time()
+            res = GUARD.cancel_repair("a1")
+            self.assertTrue(res["stopped"], res)
+            self.assertLess(time.time() - t0, 5.0)
+            th.join(5)
+            self.assertFalse(th.is_alive())
+            self.assertTrue(all(p.poll() is not None for p in procs))             # the process (and what it started) is gone
+            self.assertEqual(list(AGENT.procs), [])
+            self.assertEqual(AGENT_JOBS, {})
+            self.assertEqual(AGENT.last_error, "")                                # a cancel is not a failure of Claude Code
+            self.assertEqual(AGENT.bridge_failed_at, 0.0)
+            v = GUARD.view()["rows"]["a1"]
+            self.assertEqual((v["state"], v["held"], v["quar"]), ("failed", True, True))      # red until the owner presses start again, not retried by itself
+            self.assertEqual(GUARD.cand, {})
+
+        def test_a_toolkit_call_that_was_already_running_cannot_arm_a_fix_after_the_cancel(self) -> None:
+            GUARD.request_repair("a1", manual=True)
+            job = AgentJob("a1", "alpha.test", "Alpha", self.tmp / "job795", {}, 5)
+            job.dir.mkdir(parents=True, exist_ok=True)
+            with _AGENT_JOBS_LOCK:
+                AGENT_JOBS[job.id] = job
+            tk = AgentToolkit(GUARD, self.app)
+            GUARD._ctl("a1")["cancel"].set()
+            plan = {"selectors": {"input": "textarea"}, "steps": [], "prepare_js": "", "root_cause": "unknown"}
+            with self.assertRaises(GuardCancelled):
+                tk._arm(job, plan)
+            self.assertFalse(job.armed)
+            self.assertFalse(SITE_UI.sel("alpha.test", "input"))
+            self.assertNotIn("alpha.test", GUARD.cand)
+            code, body = tk.handle(job.id, job.token, "scan", {})
+            self.assertEqual(code, 409)
+            self.assertTrue(body.get("cancelled"))
+            GUARD._stop_everything("a1")
+            self.assertTrue(job.closed)
+            self.assertEqual(tk.handle(job.id, job.token, "scan", {})[0], 410)
+            with _AGENT_JOBS_LOCK:
+                AGENT_JOBS.pop(job.id, None)
+
+        def test_a_one_shot_question_dies_with_the_cancel(self) -> None:
+            GUARD.request_repair("a1", manual=True)
+            out: Dict[str, Any] = {}
+
+            def talk() -> None:
+                _GUARD_TLS.owner = "a1"
+                out["r"] = AGENT._run_text([sys.executable, "-c", "import time; time.sleep(60)"], "", 60.0)
+                out["done"] = time.time()
+            th = threading.Thread(target=talk, daemon=True)
+            th.start()
+            end = time.time() + 10
+            while time.time() < end and not AGENT.owner_of:
+                time.sleep(0.05)
+            self.assertEqual(list(AGENT.owner_of.values()), ["a1"])
+            t0 = time.time()
+            GUARD._ctl("a1")["cancel"].set()
+            self.assertEqual(AGENT.stop_owner("a1"), 1)
+            th.join(5)
+            self.assertFalse(th.is_alive())
+            self.assertLess(out["done"] - t0, 4.0)
+            self.assertNotEqual(out["r"][2], 0)
+            self.assertEqual(AGENT.owner_of, {})
+            res: List[str] = []
+
+            def again() -> None:
+                _GUARD_TLS.owner = "a1"
+                res.append(AGENT.oneshot("hello", count=False))             # the repair is cancelled: nothing new is started and nothing is marked failed
+            t2 = threading.Thread(target=again, daemon=True)
+            t2.start()
+            t2.join(5)
+            self.assertEqual(res, [""])
+            self.assertEqual(AGENT.last_error, "")
+
+        def _rounds(self, causes: List[str], verdicts: List[str]) -> List[int]:
+            os.environ["FAKE_MODE"] = "ok"
+            GUARD.quar["a1"] = {"since": 1}
+            GUARD.request_repair("a1", manual=True)
+            seen: List[int] = []
+
+            def fake_round(aid: str, host: str, label: str, rec: Dict[str, Any], seed: Dict[str, Any], history: List[str], scan: Any, n: int) -> str:
+                k = len(seen)
+                seen.append(n)
+                rec["attempts"].append({"n": n + 1, "root_cause": causes[min(k, len(causes) - 1)]})
+                history.append(f"attempt {n + 1} (Claude Code): did not pass")
+                return verdicts[min(k, len(verdicts) - 1)]
+            GUARD._agent_round = fake_round                                 # type: ignore[method-assign]
+            AGENT.usable = lambda: True                                     # type: ignore[method-assign]
+            try:
+                GUARD._repair("a1", False, True)
+            finally:
+                del GUARD._agent_round
+                del AGENT.usable
+                GUARD.active.discard("a1")
+            return seen
+
+        def test_a_second_claude_code_session_starts_after_a_failed_first_one(self) -> None:
+            self.assertEqual(self._rounds(["unknown"], ["failed"]), [0, 1])           # two sessions, then the repair ends unsolved
+            self.assertEqual(GUARD.view()["rows"]["a1"]["state"], "failed")
+            GUARD.quar.pop("a1", None)
+            GUARD.rows.clear()
+
+        def test_a_cause_only_the_owner_can_remove_ends_the_repair_after_one_session(self) -> None:
+            self.assertEqual(self._rounds(["login_needed"], ["failed"]), [0])
+
+        def test_the_second_session_can_pass(self) -> None:
+            self.assertEqual(self._rounds(["unknown", "unknown"], ["failed", "passed"]), [0, 1])
+
+        def test_the_task_carries_the_playbook_and_the_site_knowledge(self) -> None:
+            job = AgentJob("a1", "alpha.test", "Alpha", self.tmp / "j2", {"category": "empty_response", "kind": "ui", "message": "no answer"}, 5)
+            txt = agent_task_text(job, job.seed, [], VERSION, "bridge.py")
+            for needle in ("How to work", "knowledge.json", "--root-cause", "Do not give up early", "The owner pressed repair"):
+                self.assertIn(needle, txt)
+            self.assertNotIn("An interrupted repair was resumed", txt)
+
+        def test_the_advisor_thinks_with_its_own_sign_in_only_when_no_bridge_account_can(self) -> None:
+            AGENT_OWN_BACKEND_TEST[0] = False
+            self.cfg.data["agent_backend"] = "auto"
+            self.cfg.data["agent_api_key"] = "own-key-123456789"
+            AGENT._bridge_can_think = lambda: False                         # type: ignore[method-assign]
+            try:
+                self.assertEqual(self.cfg.get("agent_own_fallback"), False)
+                self.assertEqual(AGENT.backend(), "bridge")                 # default: the owner's rotation / gap rules ALWAYS apply, even with no account that can think
+            finally:
+                del AGENT._bridge_can_think
+            self.cfg.data["agent_own_fallback"] = True
+            self.cfg.data["agent_api_key"] = "own-key-123456789"
+            try:
+                AGENT._bridge_can_think = lambda: True                      # type: ignore[method-assign]
+                self.assertEqual(AGENT.backend(), "bridge")                 # an account can think: through the bridge, as before (rotation / gap rules apply)
+                AGENT._bridge_can_think = lambda: False                     # type: ignore[method-assign]
+                self.assertEqual(AGENT.backend(), "own")                    # the only account is the broken one: its own sign-in takes over
+                e = AGENT.env()
+                self.assertEqual(e["ANTHROPIC_API_KEY"], "own-key-123456789")
+                self.assertNotIn("127.0.0.1", e.get("ANTHROPIC_BASE_URL", ""))
+                self.cfg.data["agent_backend"] = "bridge"                   # the owner can still forbid it
+                self.assertEqual(AGENT.backend(), "bridge")
+                self.cfg.data["agent_backend"] = "auto"
+                self.cfg.data["agent_api_key"] = ""
+                self.assertEqual(AGENT.backend(), "bridge")                 # no own sign-in: nothing changes
+            finally:
+                del AGENT._bridge_can_think
+                self.cfg.data["agent_api_key"] = ""
+
+
+    all_cases = (TestRepairOwnerOnly795, TestAdvisorFix794, TestClaudeCodeFidelity793, TestAccountGuard787, TestConnectionRealTest, TestRelease776, TestFixes725, TestResolver, TestHashing, TestStreamDecoder, TestRouterCore, TestHTTP, TestPersistence, TestSecurityHelpers, TestApiBackend, TestCatalog, TestRouting, TestResolutionCatalog,
                  TestErrorsAndLimits, TestTaskStateAndFailover, TestContextEngine, TestSubmission, TestGroupO, TestGroupOSetup, TestGroupOCapture, TestGroupO5, TestGroupO17, TestGroupO18, TestGroupO19, TestGroupO8, TestGroupO9, TestGroupO9Supervisor, TestGroupO827, TestGroupO827b, TestGroupO21Link, TestGroupO21Grammar, TestGroupO21CallGraph, TestGroupO29Diversity, TestGroupO5Origins, TestGroupO26Tools, TestGroupO14, TestGroupO13, TestGroupO15, TestGroupO25, TestGroupO26, TestGroupO27, TestGroupO28, TestWorkspaceAndOptionalLearning, TestServingModesAndEvidence, TestAutomaticDependencySetup, TestReportInSync, TestFixes732, TestGroupO12Dash, TestGroupO11, TestLogFile, TestAccessAndDashboardLog, TestPersonalChrome, TestToolCallParser, TestUIWait, TestUIAnswerReader, TestReliability771, TestDashboard786, TestClaudeAgent789, TestAgentBackend790, TestQuickSmoke)
     only = os.environ.get("BRIDGE_SELFTEST_ONLY", "")             # lean workflow (section 0A): BRIDGE_SELFTEST_ONLY=TestSubmission,TestContextEngine runs just those classes
     for case in ((TestQuickSmoke, TestToolCallParser, TestUIWait, TestRelease776) if quick else tuple(c for c in all_cases if not only or c.__name__ in only.split(","))):
