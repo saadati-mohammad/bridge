@@ -28,6 +28,17 @@ PERSONAL CHROME (7.24)
   talks to the extension over an authenticated loopback channel (pinned extension origin + token), and Chrome shows its own "is debugging this browser" bar while a tab is inspected.
   `python bridge.py --pc-status` prints what is and is not equivalent to the old Playwright browser. BRIDGE_BROWSER=playwright selects the old separate browser explicitly; nothing falls back to it silently.
 
+FIXES (7.96)
+  7.96: (1) tabs.json / every atomic file replace survives the Windows sharing violation (WinError 32): `replace_with_retry`, one lock + a private temp name for tabs.json, and a failure there is logged
+  instead of killing the pc-revalidate thread; (2) a FREE-PLAN / usage-cap alert on the chat page ("You've reached your daily limit ...") now rests that account until the site's own reset time
+  (usage_cap_account) before any advisor question or 502; (3) the repair scan's limit / blocked hints no longer read the chat text (prompt echo gave false "limit"/"blocked");
+  (4) the "answer selector matches no element" warning is once per site per 30 minutes instead of once per request.
+  (5) ChatGPT: promo / "Sponsored" text is removed from the reply (DOM + text), anything after the end marker is dropped, an altered marker ([END], **⟦END⟧** ...) is recognised, and full prompts end
+  with a reminder of the tool format + end marker + "no advertisements" (`ui_clean_reply`, `_PROMO_LINE_RE`).
+  (6) tool calls written in the wrong shape are still understood when they are the LAST thing in the reply and name a real tool: a whole-reply bare JSON, ChatGPT's tool_uses /
+  recipient_name, `Read({...})` / `functions.Read({...})`, `Tool: X / Arguments: {...}`, a bare `tool_call` label line, curly quotes; a lead-in sentence + bare JSON stays refused (injection guard) but is asked again, and so is a reply that only ANNOUNCES an action ("I'll read the file:")
+  ONCE more (soft problem: a plain answer the second time is accepted as final - no error note, no fresh-chat rescue, no extra retries).
+
 CLAUDE CODE FIDELITY (7.93)
   7.93: closer to the real Anthropic API for Claude Code. Streams send `ping` every `sse_ping_seconds` (10) while the site is still generating (the stream starts at the first ping; before that an error is still a real
   HTTP status); stop_reason is end_turn | tool_use | max_tokens | stop_sequence; usage always carries the four official counters and count_tokens uses the SAME estimator; every answer has `request-id`,
@@ -215,7 +226,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-VERSION = "7.95"
+VERSION = "7.96"
 SCHEMA_VERSION = 2
 SCRIPT = Path(__file__).resolve() if "__file__" in globals() else Path.cwd() / "bridge.py"
 HOME = Path(os.environ.get("BRIDGE_HOME") or SCRIPT.parent / "bridge_data")
@@ -774,6 +785,22 @@ def backoff_delay(attempt: int, base: float, cap: float, rng: random.Random, ret
 # ----------------------------------------------------------------------------
 # persistent store (atomic JSON)
 # ----------------------------------------------------------------------------
+def replace_with_retry(src: Any, dst: Any, attempts: int = 12, delay: float = 0.05) -> None:
+    """7.96: os.replace that survives the Windows sharing violation (WinError 32 / 5: antivirus, indexer, another thread still holds the target).
+    Retries with a short growing pause; on the last attempt the original error is raised, so a real problem is never hidden."""
+    for i in range(max(1, attempts)):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i >= attempts - 1:
+                raise
+            time.sleep(min(0.5, delay * (1 + i)))
+
+
+PC_TABS_FILE_LOCK = threading.RLock()
+
+
 class Store:
     def __init__(self, home: Path):
         self.home = home
@@ -819,7 +846,7 @@ class Store:
                     f.write(data)
                     f.flush()
                     os.fsync(f.fileno())
-                os.replace(tmp, p)
+                replace_with_retry(tmp, p)
             finally:
                 try:
                     tmp.unlink()
@@ -2827,7 +2854,7 @@ def pc_extract(root: Path) -> Dict[str, Any]:
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix(p.suffix + ".tmp")
             tmp.write_bytes(data)
-            os.replace(tmp, p)
+            replace_with_retry(tmp, p)
             changed.append(rel)
     for rel, h in hashes.items():                                   # verify what is on disk
         if hashlib.sha256((ext / rel).read_bytes()).hexdigest() != h:
@@ -2945,7 +2972,7 @@ class PCHub:
                 bak.unlink()
         except Exception:
             pass
-        os.replace(tmp, p)
+        replace_with_retry(tmp, p)
 
     def new_pairing(self) -> str:
         """Create a one-time code for adding one independent Chrome profile."""
@@ -4248,12 +4275,25 @@ class PCContext:
     def _write_state(self) -> None:
         if not self.acct_id:
             return
-        with self._lock:
-            st = self._read_state()
-            st[self.acct_id] = [{"tab": p.tab_id, "host": (urllib.parse.urlsplit(p._url).hostname or ""), "client_id": self.client_id} for p in self._pages.values() if not p._closed]
-            tmp = self._state_path().with_suffix(".tmp")
-            tmp.write_text(json.dumps(st), "utf-8")
-            os.replace(tmp, self._state_path())
+        # 7.96: tabs.json is shared by every account of the hub. It used to be written through ONE fixed `tabs.tmp` under a per-account lock, so two accounts (or
+        # a revalidate and a send) raced on that file and the loser died with WinError 32 in the pc-revalidate thread. Now: one lock for the file, a private temp name,
+        # a retrying replace, and a failure here is logged - tab bookkeeping must never take a worker thread down.
+        with PC_TABS_FILE_LOCK, self._lock:
+            tmp = None
+            try:
+                st = self._read_state()
+                st[self.acct_id] = [{"tab": p.tab_id, "host": (urllib.parse.urlsplit(p._url).hostname or ""), "client_id": self.client_id} for p in self._pages.values() if not p._closed]
+                tmp = self._state_path().with_name(f"tabs.{os.getpid()}.{threading.get_ident()}.tmp")
+                tmp.write_text(json.dumps(st), "utf-8")
+                replace_with_retry(tmp, self._state_path())
+            except OSError as e:
+                log(f"personal chrome: could not save tabs.json ({type(e).__name__}: {e}); will be rewritten at the next change", "warn")
+            finally:
+                if tmp is not None:
+                    try:
+                        tmp.unlink()
+                    except OSError:
+                        pass
 
     def _adopt(self) -> None:
         """After a bridge restart the tabs this account opened earlier are re-adopted - only if the browser still has them, they are still bridge-owned, and the site matches."""
@@ -5348,6 +5388,27 @@ UI_NO_TEXT_MAX_S = float(os.environ.get("BRIDGE_UI_NO_TEXT_MAX", "420"))        
 UI_STALL_S = float(os.environ.get("BRIDGE_UI_STALL", "240"))                         # 7.74: answer text exists but has not changed for this long, even though the page still claims to be generating -> take it as finished
 _UI_ERR_RE = re.compile(r"too frequent|slow down|server (is )?busy|too many (requests|messages)|rate.?limit|too long|exceed|length limit|start a new (chat|conversation)|something went wrong|network error|try again|"
                         r"服务器繁忙|过长|超出|上限|请稍后|重新开始|新对话", re.I)
+# 7.96: a FREE-PLAN / usage cap ("You've reached your daily limit", "You've hit the free plan limit, resets at 5 PM", "upgrade to continue") is not a page
+# bug and not "too frequent": the account is done until the site's own reset time. It used to fall into the generic "the chat site shows an error" branch
+# (HTTP 502, account NOT rested, so the router kept sending requests to it) and could even start an advisor question first. Alerts only - never the chat text.
+_UI_CAP_RE = re.compile(r"(?:reached|hit|exceeded|used up|ran out of|maxed out)\b[^.\n]{0,50}\b(?:limit|cap|quota|allowance|messages)\b|"
+                        r"\b(?:daily|weekly|monthly|usage|message|free[- ]?plan|free[- ]?tier)\s+(?:limit|cap|quota)\b|"
+                        r"\blimit\s+(?:reached|exceeded|resets?)\b|\bupgrade\s+(?:to|your|now)\b|\bout of (?:free )?(?:messages|prompts|credits)\b|"
+                        r"\bcome back (?:later|tomorrow|at)\b|"
+                        r"\u0633\u0642\u0641|\u0645\u062d\u062f\u0648\u062f\u06cc\u062a (?:\u0627\u0633\u062a\u0641\u0627\u062f\u0647|\u0631\u0648\u0632\u0627\u0646\u0647)|\u0628\u0647 \u062d\u062f (?:\u0645\u062c\u0627\u0632|\u0645\u0627\u0632)|"
+                        r"\u989d\u5ea6|\u4e0a\u9650", re.I)
+_UI_NOT_CAP_RE = re.compile(r"too\s+frequent|slow\s+down|too\s+many\s+(?:requests|messages)|too long|length limit|context", re.I)
+
+
+def ui_usage_cap_text(alerts: Any) -> str:
+    """7.96: the first page ALERT that says the account hit a usage / free-plan cap, '' when none. Pure. 'Too frequent' and 'too long' are other situations."""
+    for a in alerts or []:
+        t = str(a or "").strip()
+        if t and _UI_CAP_RE.search(t) and not _UI_NOT_CAP_RE.search(t):
+            return t[:200]
+    return ""
+
+
 # 7.81: DeepSeek (and others) print "Messages too frequent. Try again later." as a plain line under the user's message, with a small round retry button next to it.
 # That line is not in a role=alert element, so it used to be invisible to the bridge and the request just hung. This finds it anywhere on the page and, when asked,
 # presses the retry control that sits next to the user's message (found by label, or by its orange colour + svg icon, close to the notice).
@@ -5394,6 +5455,7 @@ _UI_NOTICE_JS = r"""() => {
   }
   return out;
 }"""
+_UI_FALLBACK_WARNED: Dict[str, float] = {}      # 7.96: site -> monotonic time of the last "selector matches nothing" warning
 _UI_FREQ_STRIKES: Dict[str, int] = {}      # per site: how many times in a row the site said "too frequent" (reset by a good answer); drives the cooldown length
 
 
@@ -6390,7 +6452,7 @@ def ui_fallback_answer(body: str, before: Set[str], prompt: str) -> str:
     out: List[str] = []
     for ln in lines:
         s = ln.strip()
-        if len(s) < 90 and _UI_FOOT_RE.search(s):
+        if len(s) < 140 and (_UI_FOOT_RE.search(s) or _PROMO_LINE_RE.search(s)):
             if out:
                 break
             continue
@@ -6413,6 +6475,9 @@ UI_ANSWER_JS = r"""(a) => {
     for (let i = from; i < els.length; i++) {
       const c = els[i].cloneNode(true);
       c.querySelectorAll('button,[role=button],svg,style,script').forEach(x => x.remove());
+      // 7.96: sponsored / promo blocks the site renders INSIDE or next to the answer element are not part of the answer
+      c.querySelectorAll('[aria-label*="sponsor" i],[aria-label="Ad" i],[data-testid*="sponsor" i],[data-testid*="-ad-" i],[data-testid^="ad" i],[data-testid*="promo" i],[data-testid*="upsell" i],[data-testid*="upgrade" i],[class*="sponsor" i],[class*="upsell" i],[class*="promo-" i],a[rel~="sponsored"]').forEach(x => x.remove());
+      Array.from(c.querySelectorAll('div,span,p,aside,section')).filter(x => /^(sponsored|ad|advertisement)$/i.test((x.textContent || '').trim()) && x.children.length === 0).forEach(x => { const b = x.closest('aside,section,article,[role=group],div'); const host = (b && b !== c && (b.textContent || '').length < 700) ? b : x; host.remove(); });
       // A page that renders raw <invoke name=".."><parameter ..> as HTML makes them unknown elements and innerText silently drops the tags (only the values
       // survive). Turn every such element back into its source text, innermost first, so the parser sees the real call.
       Array.from(c.querySelectorAll('*')).filter(x => x instanceof HTMLUnknownElement && !x.closest('pre')).reverse().forEach(x => {
@@ -6706,6 +6771,14 @@ class UIBackend:
             return n0
 
         def read(ctx: Any) -> Tuple[int, str, str, bool]:
+            r_ = read_inner(ctx)
+            try:
+                c_ = ui_clean_reply(r_[1], mk) if r_[1] else r_[1]          # 7.96: altered marker -> exact marker, nothing after it, no promo lines
+            except Exception:
+                c_ = r_[1]
+            return (r_[0], c_, r_[2], r_[3]) if c_ != r_[1] else r_
+
+        def read_inner(ctx: Any) -> Tuple[int, str, str, bool]:
             res = read_sel(ctx)
             if res[0] > 0 or res[1] or int(state.get("n0") or 0) > 0:
                 state.pop("empty_t0", None)
@@ -6720,7 +6793,14 @@ class UIBackend:
                 return res
             if not state.get("fb_logged"):
                 state["fb_logged"] = True
-                log(f"UI: the answer selector matches no element on {(urllib.parse.urlsplit(base).hostname or base)}, but the page shows the reply - reading the page text instead", "warn")
+                _h_ = urllib.parse.urlsplit(base).hostname or base
+                _t_ = time.monotonic()
+                if _t_ - _UI_FALLBACK_WARNED.get(_h_, -1e9) > 1800:     # 7.96: it was one warning per REQUEST (47 in one hour) - now one per site per 30 minutes, the rest at debug level
+                    _UI_FALLBACK_WARNED[_h_] = _t_
+                    log(f"UI: the answer selector matches no element on {_h_}, but the page shows the reply - reading the page text instead "
+                        f"(the site's markup changed; press repair on the account to learn the new selector; further notices for this site are hidden for 30 minutes)", "warn")
+                else:
+                    log(f"UI: answer read from the page text on {_h_} (selector matches nothing)", "debug")
             return 1, normalize_ui_tool_call_chrome(fb), res[2], res[3]
 
         def read_sel(ctx: Any) -> Tuple[int, str, str, bool]:
@@ -6845,6 +6925,10 @@ class UIBackend:
                         last_progress = _now                            # the page is alive (thinking text / stop button / streaming elsewhere)
                     body_sig = d.get("sig") or body_sig
                     bad = [a for a in d.get("alerts", []) if _UI_ERR_RE.search(a)]
+                    cap_txt = ui_usage_cap_text(d.get("alerts", [])) if not d.get("gen") and first_text_at is None else ""
+                    if cap_txt:                                         # 7.96: free-plan / usage cap: rest THIS account until the site's reset time, no advisor request, no 502
+                        log(f"UI: the site says this account hit its usage limit ('{cap_txt[:90]}') - resting the account; the next account serves", "warn")
+                        raise _limited(f"usage limit reached on this account: {cap_txt}", None, "text")
                     log(f"UI waiting for answer: {int(_now - t0)}s n={n} n0={n0} generating={d.get('gen')} composer_chars={d.get('composer')} "
                         f"alerts={d.get('alerts')} page_tail={d.get('tail', '')!r}", "warn")
                     if not d.get("gen") and first_text_at is None and advice_calls < 3 and not getattr(_ADV_TLS, "active", False) and ADVISOR:
@@ -19473,11 +19557,64 @@ def strip_marker(text: str, marker: str) -> Tuple[str, bool]:
     return (before.rstrip() + after if not after.strip() else before + after), True
 
 
+# 7.96: CHATGPT REPLY CLEANING. ChatGPT (free plan) prints promotional blocks ("Sponsored", "Upgrade to Plus", "Try ChatGPT Go" ...) next to / after the answer, and Claude Code
+# showed that text as if the model had written it. It also sometimes renders the end marker in another shape ([END], [[END]], **⟦END⟧**, ⟦ END ⟧), so the marker was "never seen"
+# and every reply waited for the silence timer. Both are fixed on the PAGE TEXT before anything else looks at it: (1) an altered marker is turned back into the exact marker;
+# (2) the model was told NOTHING may follow the marker, so everything after the last marker line is dropped; (3) promo lines at the end of a reply (and "Sponsored" blocks) are removed.
+_PROMO_LINE_RE = re.compile(
+    r"^(?:sponsored|ad|ads|advertisement|promoted|suggested|تبلیغ(?:ات)?|اسپانسر(?:ی)?)\b[ :·\-•]*$|"
+    r"^(?:upgrade\b|try (?:chatgpt )?(?:plus|go|pro|team|free)\b|get (?:chatgpt )?(?:plus|go|pro)\b|unlock (?:more|higher|extra)\b|get (?:smarter|faster|more)\b.{0,60}$|"
+    r"start (?:a )?free trial\b|try it free\b|learn more\b|you'?re on the free plan\b|you have \d+ .{0,30}(?:left|remaining)\b|want more\b.{0,40}\?|"
+    r"download the (?:chatgpt )?app\b|sign up (?:for|to) (?:chatgpt )?(?:plus|go|pro)\b|see (?:plans|pricing)\b|view plans\b)", re.I)
+_MARK_VARIANT_RE_CACHE: Dict[str, Any] = {}
+
+
+def ui_marker_variants_re(mk: str) -> Any:
+    """Regex that finds the marker in the shapes a chat page may render it: other bracket kinds, doubled brackets, spaces, markdown emphasis around it. Cached per marker."""
+    r = _MARK_VARIANT_RE_CACHE.get(mk)
+    if r is None:
+        core = re.sub(r"^[^\w]+|[^\w]+$", "", mk or "")
+        if not core:
+            r = re.compile(r"(?!x)x")
+        else:
+            op, cl = "[\\[⟦〚【(<{«]{1,3}", "[\\]⟧〛】)>}»]{1,3}"
+            r = re.compile(r"[*_`~]*" + op + r"\s*" + re.escape(core) + r"\s*" + cl + r"[*_`~]*")
+        _MARK_VARIANT_RE_CACHE[mk] = r
+    return r
+
+
+def ui_clean_reply(txt: str, mk: str) -> str:
+    """Pure. The reply text as the model meant it: exact end marker, nothing after it, no trailing promo lines. Text without a marker keeps everything except trailing promo lines."""
+    if not txt:
+        return txt
+    if mk:
+        rx = ui_marker_variants_re(mk)
+        ms = [m for m in rx.finditer(txt)]
+        # only a marker that closes a line (end of text, or followed by a line break) counts; one quoted in the middle of a sentence is left alone
+        def _own_line(m: Any) -> bool:                  # the exact marker may close a line; an ALTERED shape counts only when it is alone on its line
+            a = txt.rfind("\n", 0, m.start()) + 1
+            b = txt.find("\n", m.end())
+            before, after = txt[a:m.start()].strip(), txt[m.end():b if b >= 0 else len(txt)].strip()
+            if m.group(0) == mk:
+                return not after
+            return not before and not after
+        ends = [m for m in ms if _own_line(m)]
+        if ends:
+            last = ends[-1]
+            return (txt[:last.start()].rstrip() + "\n" + mk).strip("\n") if txt[:last.start()].strip() else mk
+    lines = txt.split("\n")
+    while lines and (not lines[-1].strip() or (len(lines[-1].strip()) < 140 and _PROMO_LINE_RE.search(lines[-1].strip()))):
+        lines.pop()
+        # a "Sponsored" label owns the short block under it: also remove up to 3 short lines that sit directly above a trailing label
+    out = "\n".join(lines)
+    return out if out.strip() else txt
+
+
 def ui_decide_end(txt: str, mk: str, since_text: float, generating: bool, seen_generating: bool, quiet: float, marker_trusted: bool, grace: float, net_ok: bool) -> str:
     """One pure decision per poll of the UI tier: '' keep waiting | 'marker' | 'network' | 'stop' | 'quiet'.
     The marker (the model's own explicit end) and a finished network stream that agrees with the page beat any silence timer; the silence timer is the last resort and
     waits `grace` longer on sites whose model has been following the marker rule."""
-    if mk and txt.rstrip().endswith(mk) and since_text >= 0.35:
+    if mk and since_text >= 0.35 and ui_clean_reply(txt, mk).rstrip().endswith(mk):       # 7.96: the cleaned text (altered marker / promo after it)
         return "marker"
     if net_ok and since_text >= 0.2 and not ui_tool_call_open(txt):      # 7.75: a stream that "finished" in the middle of a tool call is a cut, not an end
         return "network"
@@ -20323,7 +20460,7 @@ class ReplayStore:
                 self.dir.mkdir(parents=True, exist_ok=True)
                 tmp = p.with_name(p.name + ".tmp")
                 tmp.write_text(json.dumps(case, ensure_ascii=False), "utf-8")
-                os.replace(tmp, p)
+                replace_with_retry(tmp, p)
                 files = sorted(self.dir.glob("*.json"), key=lambda f: f.stat().st_mtime)
                 for old in files[:max(0, len(files) - self.max_cases)]:
                     try:
@@ -20774,7 +20911,12 @@ def build_prompt(req: NormReq, cfg: Config, fenced: bool, delta_from: Optional[i
         note = (f"[{plan.omitted} earlier messages are not sent in full; the bridge extracted this digest from them]\n{plan.digest}\n\n" +
                 (f"[model-written summary - generated, may be incomplete]\n{neutralise(summary)}\n\n" if summary else ""))
     conv = "<conversation>\n" + note + "\n\n".join(plan.rendered) + "\n</conversation>"
-    out = "\n\n".join(head + [conv, "Reply now as the assistant to the last message."])
+    _mk2 = end_marker()
+    _close = "Reply now as the assistant to the last message."
+    if req.tools and _mk2 and fmt != "dsml":      # 7.96: the rules sit at the START of a long prompt; models (ChatGPT) forget them - the last lines are what they obey
+        _close += (" Use ONLY the tool-call format defined at the top of this message. Do not add advertisements, promotions, upgrade offers or follow-up suggestions. "
+                   f"The very last line of the reply must be exactly {_mk2} and nothing may follow it.")
+    out = "\n\n".join(head + [conv, _close])
     if trace is not None:
         trace["tools_shown"] = list(shown_) if req.tools else None
         red = list(plan.reductions) + ([{"kind": "tool_descriptions_compacted", "chars_before": len(full_tools), "chars_after": len(tt)}] if compact else [])
@@ -21031,7 +21173,7 @@ def _call_objs(v: Any) -> List[Dict[str, Any]]:
 
 def _obj_to_call(obj: Dict[str, Any], tools: Dict[str, Dict[str, Any]], lower: Dict[str, str], canon: Dict[str, str]) -> Tuple[Optional[str], Any, bool]:
     """(resolved tool name or None, args, explicit) - `explicit` = the object had an arguments/input/parameters key."""
-    name = obj.get("name") or obj.get("tool") or obj.get("tool_name") or obj.get("function_name") or ""
+    name = obj.get("name") or obj.get("tool") or obj.get("tool_name") or obj.get("function_name") or obj.get("recipient_name") or ""     # 7.96: recipient_name = ChatGPT's own tool_uses shape
     real = _resolve_tool(name, tools, lower, canon)
     for k in ("arguments", "input", "parameters", "args", "params"):
         if k in obj:
@@ -21109,7 +21251,47 @@ def _only_closing_tags_after_last_param(body: str) -> bool:
     return bool(last) and _ONLY_CLOSERS_RE.match(body, last.end()) is not None
 
 
+_CURLY_RE = re.compile("[\u201c\u201d\u201e\u201f\u2033]")
+_SOFT = "(soft) "
+_STALL_RE = re.compile(r"^(?:ok(?:ay)?[,.!]?\s+|sure[,.!]?\s+|now[,]?\s+|next[,]?\s+)?(?:i'?ll|i will|let me|i'?m going to|i am going to|i can now)\b", re.I)
+_STALL_VERB_RE = re.compile(r"\b(?:read|run|execute|open|check|search|list|edit|write|look|inspect|view|create|update|fix|call|use|grep|find|fetch)\b", re.I)
+
+
+def tool_intent_problem(text: str, tools: Dict[str, Dict[str, Any]]) -> str:
+    """7.96: '' or a SOFT problem when a reply with no usable call clearly announced one: (a) JSON that names a real tool + arguments but sits in a shape the parser cannot use,
+    (b) the last line says "I'll read the file:" and stops. Soft = asked ONCE more; a plain answer the second time is accepted (it may really be a final answer)."""
+    t = text or ""
+    mk = end_marker()
+    if mk:
+        t = t.replace(mk, "")
+    t = t.strip()
+    if not t:
+        return ""
+    low = {n.lower() for n in tools}
+    for m in re.finditer(r"[\"'](?:name|tool|tool_name|recipient_name)[\"']\s*:\s*[\"'](?:functions[./])?([\w\-.]+)[\"']", t):
+        if m.group(1).lower() in low and re.search(r"[\"'](?:arguments|parameters|input|args)[\"']\s*:", t[m.end():m.end() + 400]):
+            return _SOFT + f"a call of the tool '{m.group(1)}' was written in a shape that cannot be executed; use exactly the required tool-call block"
+    last = [ln.strip() for ln in t.splitlines() if ln.strip()][-1] if t.splitlines() else ""
+    if last and len(last) <= 220 and "?" not in last and last[-1:] in ":.\u2026" and _STALL_RE.match(last) and (_STALL_VERB_RE.search(last) or any(n in last.lower() for n in low)):
+        return _SOFT + "the reply announces an action but contains no tool call; if an action is needed, make the call now in the required block, otherwise repeat the final answer"
+    return ""
+
+
 def parse_tool_calls(text: str, tools: Dict[str, Dict[str, Any]], seed: str = "") -> Tuple[str, List[Dict[str, Any]], List[str]]:
+    clean, calls, problems = _parse_tool_calls_core(text, tools, seed)
+    if tools and not calls and _CURLY_RE.search(text or "") and any("could not parse" in p for p in problems):           # 7.96: curly quotes from the page's typography
+        fixed = _CURLY_RE.sub('"', text)
+        c2, calls2, p2 = _parse_tool_calls_core(fixed, tools, seed)
+        if calls2:
+            return c2, calls2, p2
+    if tools and not calls and not problems:
+        ip = tool_intent_problem(text, tools)
+        if ip:
+            problems = [ip]
+    return clean, calls, problems
+
+
+def _parse_tool_calls_core(text: str, tools: Dict[str, Dict[str, Any]], seed: str = "") -> Tuple[str, List[Dict[str, Any]], List[str]]:
     if not tools:
         return text, [], []
     lower = {n.lower(): n for n in tools}
@@ -21269,6 +21451,14 @@ def parse_tool_calls(text: str, tools: Dict[str, Dict[str, Any]], seed: str = ""
             found.append((m.start(), m.end(), real, args, m.group(0)))
 
     # 4) last resort: a bare JSON object that names a real tool and carries explicit arguments
+    def _only_end(t: str) -> bool:
+        """7.96: nothing but the end marker / whitespace / closing punctuation follows."""
+        t = t.strip().strip("`)").strip(" ;")
+        mk_ = end_marker()
+        if mk_ and t.endswith(mk_):
+            t = t[:-len(mk_)].strip()
+        return not t.strip("`)").strip(" ;")
+
     if not found and not problems and "{" in text:
         i, tried = 0, 0
         while tried < 40:
@@ -21284,11 +21474,50 @@ def parse_tool_calls(text: str, tools: Dict[str, Dict[str, Any]], seed: str = ""
             except ValueError:
                 i += 1
                 continue
-            if not text[:i].strip() and not text[e:].strip() and add_json(i, e, val, text[i:e], False):      # injection guard: only a reply that IS the call
+            # (7.96: the "JSON object inside prose is not a call" injection guard is KEPT; a lead-in sentence + bare JSON is handled by the soft retry in tool_intent_problem instead)
+            if not text[:i].strip() and _only_end(text[e:]) and add_json(i, e, val, text[i:e], False):
                 spans.append((i, e))
                 i = e
             else:
                 i += 1
+
+    # 4b) 7.96: other shapes a chat model uses instead of the requested block - recognised only when the call is the LAST thing in the reply and names a real tool
+    if not found and not problems:
+        def _loose_add(start: int, name: str, jstart: int, closer: bool) -> bool:
+            real_ = _resolve_tool(name, tools, lower, canon)
+            if real_ is None or inside(jstart):
+                return False
+            try:
+                val_, e_ = _json_at(text, jstart)
+            except ValueError:
+                return False
+            if closer:
+                m_ = re.match(r"\s*\)\s*;?", text[e_:])
+                if m_:
+                    e_ += m_.end()
+            if not _only_end(text[e_:]) or not isinstance(val_, dict):
+                return False
+            found.append((start, e_, real_, val_, text[start:e_]))
+            spans.append((start, e_))
+            return True
+        for m in re.finditer(r"(?<![\w.])(?:functions[./]|tools[./]|default_api[./])?([A-Za-z_][\w\-]*)[ \t]*\([ \t\r\n]*(?=\{)", text):          # Read({...}) / functions.Read({...})
+            if _loose_add(m.start(), m.group(1), m.end(), True):
+                break
+        if not found:
+            for m in re.finditer(r"(?im)^[ \t>*_`-]*(?:tool(?:[ _]name)?|function|name|recipient_name)[ \t]*[:=][ \t]*[`\"']?([\w./\-]+)[`\"']?[ \t]*\r?\n[ \t>*_`-]*"
+                                 r"(?:arguments|args|input|parameters|params)[ \t]*[:=][ \t]*(?=\{)", text):                                             # Tool: Read / Arguments: {...}
+                if _loose_add(m.start(), m.group(1), m.end(), False):
+                    break
+        if not found:
+            for m in re.finditer(r"(?im)^[ \t]*tool_call[ \t]*\r?\n(?=[ \t\r\n]*\{)", text):                                                         # a bare "tool_call" label line (code-block chrome without fences)
+                k = text.find("{", m.end())
+                try:
+                    val_, e_ = _json_at(text, k)
+                except ValueError:
+                    continue
+                if _only_end(text[e_:]) and add_json(m.start(), e_, val_, text[k:e_], False):
+                    spans.append((m.start(), e_))
+                    break
 
     # 5) validate + build
     calls: List[Dict[str, Any]] = []
@@ -21841,8 +22070,15 @@ _GUARD_DEEP_JS = r"""() => {
   const t = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ');
   out.body_tail = t.slice(-700);
   const hosts = out.iframes.map(i => i.host).join(' ');
+  // 7.96: limit / blocked are judged on what the SITE says (alerts, dialogs, toasts, banners) - or on the whole page only when it is a short error page. The chat itself
+  // (the bridge's own prompt echo, the model's answer, old conversations) used to be searched too, so a page that merely CONTAINED the words "usage limit" or
+  // "suspended" was reported as limited / blocked and could make a repair give up for a cause that did not exist.
+  const sys = Array.from(document.querySelectorAll('[role=alert],[role=alertdialog],[role=dialog],[aria-live=assertive],[class*=toast i],[class*=snackbar i],[class*=notice i],[class*=banner i],[class*=modal i]'))
+    .filter(e => !e.closest('[data-message-author-role],[class*=message i],[class*=markdown i],pre,code') && ((e.innerText || '').length < 600))
+    .map(e => (e.innerText || '').replace(/\s+/g, ' ')).join(' | ').slice(0, 1500);
+  const sysT = t.length < 1200 ? (sys + ' ' + t) : sys;
   out.hints = {captcha: /captcha|turnstile|verify you are human|just a moment/i.test(t.slice(0, 1500) + ' ' + hosts), login: out.passwords > 0 || /log in|sign in|sign up/i.test(t.slice(0, 600)),
-               limit: /too many|rate limit|try again later|limit reached|usage limit/i.test(t), blocked: /suspended|banned|has been disabled|violat/i.test(t)};
+               limit: /too many|rate limit|try again later|limit reached|usage limit|reached your .{0,30}limit|daily limit/i.test(sysT), blocked: /suspended|banned|has been disabled|violat/i.test(sysT)};
   return out;
 }"""
 
@@ -26881,6 +27117,9 @@ class Router:
             except BridgeError:
                 break
             c2, calls2, problems2 = parse_tool_calls(t2, req.tools, seed)
+            if not calls and not calls2 and not problems2 and problems and all(p_.startswith(_SOFT) for p_ in problems):
+                problems = []                                                    # 7.96: a soft doubt, asked once, answered in plain text = it was a final answer
+                break
             have = {call_key(c_["name"], c_["input"]) for c_ in calls}
             calls2 = [c_ for c_ in calls2 if call_key(c_["name"], c_["input"]) not in have]      # a model that repeats the whole list must not run a call twice
             acc2, pre2 = precheck_calls(req, calls2, self.cfg, earlier=calls) if calls2 else ([], [])
@@ -26899,6 +27138,8 @@ class Router:
             problems = []
             log(f"pre-check released {len(held)} call(s) after {retries} retry(ies): the model insisted", "debug")
         rescued = False
+        if problems and not calls and all(p_.startswith(_SOFT) for p_ in problems):
+            problems = []                                                        # 7.96: soft doubts never trigger the fresh-chat rescue or an error note
         if problems and not calls and req.tools and getattr(backend, "tier", "") == "ui" and use_cont:
             # 7.78: the chat has stopped following the format and the retries did not help. Re-ask ONCE in a fresh chat that gets the full instructions again,
             # instead of handing Claude Code a reply without a tool call (which ends its turn). Nothing was executed yet, so asking again is safe.
@@ -31985,7 +32226,7 @@ def run_selftest(quick: bool = False) -> int:
             self.assertIsInstance(backend, UIBackend)
             self.assertTrue(backend.fenced_tools)
             self.assertTrue(backend.unlearned_ui)
-            self.assertEqual(backend.sel, '[data-message-author-role="assistant"]')
+            self.assertEqual(backend.sel, '[data-message-author-role="assistant"], [data-turn="assistant"]')
             self.assertFalse(backend.diff)
             self.assertFalse(backend.recipe["continuity"])
 
@@ -31995,7 +32236,7 @@ def run_selftest(quick: bool = False) -> int:
             a.update(state="needs_learning", type="browser", serving_mode="browser", url="https://chatgpt.com/", host="chatgpt.com")
             with mock.patch.object(self.acc, "browser", return_value=object()):
                 backend = self.acc.backend(a)
-            self.assertEqual(backend.sel, '[data-message-author-role="assistant"]')
+            self.assertEqual(backend.sel, '[data-message-author-role="assistant"], [data-turn="assistant"]')
             self.assertFalse(backend.diff)
             self.assertIn("cloneNode(true)", UI_STATE_JS)
             self.assertIn("e.textContent = ''", UI_STATE_JS)
@@ -42769,6 +43010,27 @@ setTimeout(() => process.exit(0), 60000);
             self.assertEqual([c["name"] for c in out.calls], ["Edit"])                         # released: the real tool is the judge
             out2, prompts2 = self.run_site([same], hist, {"fix_retries": 0})
             self.assertEqual((len(prompts2), len(out2.calls)), (1, 1))                         # no retry budget: nothing to wait for, nothing lost
+
+        def test_796_an_announcement_without_a_call_is_asked_once_and_the_call_is_taken(self) -> None:
+            hist = [{"role": "user", "content": [{"type": "text", "text": "read it"}]}]
+            good = self.fence("Read", {"file_path": "/p/f.py"})
+            out, prompts = self.run_site(["I'll read the file now:", good + "\n" + end_marker()], hist)
+            self.assertEqual(len(prompts), 2)
+            self.assertEqual([c["name"] for c in out.calls], ["Read"])
+            self.assertIn("announces an action", prompts[1])
+
+        def test_796_a_soft_doubt_answered_in_plain_text_is_a_final_answer_no_note_no_rescue(self) -> None:
+            hist = [{"role": "user", "content": [{"type": "text", "text": "read it"}]}]
+            out, prompts = self.run_site(["Let me check the config.", "The config is fine, nothing to change."], hist)
+            self.assertEqual(len(prompts), 2)                                                  # asked ONCE (free-plan messages are precious), not fix_retries times
+            self.assertEqual(out.calls, [])
+            self.assertNotIn("(bridge:", out.text)
+
+        def test_796_a_chatgpt_shaped_call_is_understood_without_any_retry(self) -> None:
+            hist = [{"role": "user", "content": [{"type": "text", "text": "read it"}]}]
+            out, prompts = self.run_site(['Reading it:\nfunctions.Read({"file_path": "/p/f.py"})\n' + end_marker()], hist)
+            self.assertEqual(len(prompts), 1)
+            self.assertEqual([(c["name"], c["input"]) for c in out.calls], [("Read", {"file_path": "/p/f.py"})])
 
         def test_778_a_chat_that_keeps_breaking_the_format_is_rescued_in_a_fresh_chat(self) -> None:
             tmp, _store, _cfg, app = mk_env({"cache_seconds": 0, "continuity": True})
